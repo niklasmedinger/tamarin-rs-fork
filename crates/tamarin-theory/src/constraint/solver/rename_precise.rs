@@ -352,19 +352,30 @@ pub fn rename_precise_system(sys: &mut System) {
         sys.invalidate_node_max_cache();
         let nodes =
             std::sync::Arc::unwrap_or_clone(std::mem::take(&mut sys.content_mut_untracked().nodes));
+        // Compute the new max var idx while mapping the nodes, so we don't have to re-walk the nodes after the rename.
+        let mut max_var_idx : u64 = 0;
+        let mut map_var_and_update_max = |v: LVar| -> LVar {
+            let new_v = map_var(v);
+            if new_v.idx > max_var_idx {
+                max_var_idx = new_v.idx;
+            }
+            new_v
+        };
         let mut renamed: Vec<(
             crate::constraint::constraints::NodeId,
             crate::rule::RuleACInst,
         )> = nodes
             .into_iter()
             .map(|(id, rule)| {
-                let new_id = map_var(id);
-                let new_rule = rule.map_free(&mut |v| map_var(v));
+                let new_id = map_var_and_update_max(id);
+                let new_rule = rule.map_free(&mut |v| map_var_and_update_max(v));
                 (new_id, new_rule)
             })
             .collect();
         renamed.sort_by_key(|a| a.0);
         sys.content_mut_untracked().nodes = std::sync::Arc::new(renamed);
+        // Update the node-component max var idx cache with the new max after the rename.
+        sys.node_max_cache.set(Some(max_var_idx));
     }
 
     // 2. Edges.
