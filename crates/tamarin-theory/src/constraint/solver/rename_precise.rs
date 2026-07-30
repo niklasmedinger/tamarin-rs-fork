@@ -353,7 +353,7 @@ pub fn rename_precise_system(sys: &mut System) {
         let nodes =
             std::sync::Arc::unwrap_or_clone(std::mem::take(&mut sys.content_mut_untracked().nodes));
         // Compute the new max var idx while mapping the nodes, so we don't have to re-walk the nodes after the rename.
-        let mut max_var_idx : u64 = 0;
+        let mut max_var_idx: u64 = 0;
         let mut map_var_and_update_max = |v: LVar| -> LVar {
             let new_v = map_var(v);
             if new_v.idx > max_var_idx {
@@ -374,8 +374,11 @@ pub fn rename_precise_system(sys: &mut System) {
             .collect();
         renamed.sort_by_key(|a| a.0);
         sys.content_mut_untracked().nodes = std::sync::Arc::new(renamed);
-        // Update the node-component max var idx cache with the new max after the rename.
-        sys.node_max_cache.set(Some(max_var_idx));
+
+        if !crate::constraint::reduction::bounds_max_disable_enabled() {
+            // Update the node-component max var idx cache with the new max after the rename.
+            sys.node_max_cache.set(Some(max_var_idx));
+        }
     }
 
     // 2. Edges.
@@ -836,6 +839,9 @@ fn parser_sort_to_lsort(s: tamarin_parser::ast::SortHint) -> tamarin_term::lterm
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fact::{in_fact, out_fact};
+    use crate::rule::{IntrRuleACInfo, Rule, RuleInfo};
+    use tamarin_term::builtin::msg_var;
     use tamarin_term::lterm::{LSort, LVar};
 
     fn node(name: &str, idx: u64) -> LVar {
@@ -872,5 +878,40 @@ mod tests {
         assert_eq!(a.less_atoms[0].larger, b.less_atoms[0].larger);
         // The two distinct node names should still differ.
         assert_ne!(a.less_atoms[0].smaller, a.less_atoms[0].larger);
+    }
+
+    #[test]
+    fn rename_computes_correct_max_var_cache_for_nodes() {
+        let mut sys = System::empty();
+
+        // Two node ids at different timepoints.
+        let n1 = node("i", 10);
+        let n2 = node("i", 30);
+
+        // Random rules. Proto vs Intruder roule does not matter.
+        let r1 = Rule::new(
+            RuleInfo::Intr(IntrRuleACInfo::Coerce),
+            vec![in_fact(msg_var("m", 40))],
+            vec![out_fact(msg_var("m", 40))],
+            vec![],
+        );
+        let r2 = Rule::new(
+            RuleInfo::Intr(IntrRuleACInfo::ISend),
+            vec![],
+            vec![out_fact(msg_var("n", 25))],
+            vec![],
+        );
+
+        sys.add_node(n1, r1);
+        sys.add_node(n2, r2);
+
+        rename_precise_system(&mut sys);
+
+        // Uncached bounds max for nodes
+        let expected = crate::constraint::solver::reduction::bounds_max_nodes(&sys);
+        // The node_max_cache should be set to the expected value after renaming.
+        assert_eq!(sys.node_max_cache.get(), Some(expected));
+        // Expected value is `1` because `i` and `m` occur twice.
+        assert_eq!(sys.node_max_cache.get(), Some(1));
     }
 }

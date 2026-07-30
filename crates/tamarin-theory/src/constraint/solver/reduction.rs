@@ -4797,7 +4797,7 @@ fn verify_fact_unchanged(
 }
 
 #[inline]
-fn bounds_max_disable_enabled() -> bool {
+pub(crate) fn bounds_max_disable_enabled() -> bool {
     tamarin_utils::env_gate!("TAM_RS_DISABLE_BOUNDS_CACHE")
 }
 
