@@ -459,7 +459,24 @@ pub fn exec_proof_method(
             // empty stable_vars (HS passes `[]`).  Runs BEFORE the
             // single-case `sys' /= cleanup sys` check, matching HS's order
             // (the check inspects the post-dedup `M.toList cases`).
-            let cleaned: Vec<System> = remove_redundant_cases_ctx(ctx, |s: &System| s, cleaned);
+
+            // HS-faithful naming: `distinguish n` (ProofMethod.hs)
+            // with empty case name renders as `show i` ("1", "2", "3", ...)
+            // with NO `_case_` prefix and NO zero-padding (the `pad`
+            // call only runs in the else branch when the prefix is
+            // non-empty).
+            //
+            // Inner duplicate detection: HS's `M.fromListWith (error
+            // "case names not unique")` plus `uniqueListBy` dedups
+            // exact-name duplicates structurally; for our empty-name
+            // case all siblings get unique numeric names so no real
+            // dedup is needed.
+            let mut cleaned: Vec<(String, System)> =
+                remove_redundant_cases_ctx(ctx, |s: &System| s, cleaned)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, s)| ((i + 1).to_string(), s))
+                    .collect();
             // Empty case-map: `simplifySystem` mzero'd every branch (the
             // restriction / formula set is contradictory).  HS's `Simplify`
             // arm (ProofMethod.hs:421-427) inspects `M.toList cases`; the
@@ -480,28 +497,13 @@ pub fn exec_proof_method(
                 // checks whether the simplified system equals the cleaned
                 // input — if so, the method "failed" and we return None.
                 // Multi-case fan-out trivially can't satisfy that condition.
-                if cleaned[0] == cleaned_input {
+                let (_, single_sys) = cleaned.pop().unwrap();
+                if single_sys == cleaned_input {
                     return None;
                 }
-                return Some(vec![("".to_string(), cleaned.into_iter().next().unwrap())]);
+                return Some(vec![("".to_string(), single_sys)]);
             }
-            // HS-faithful naming: `distinguish n` (ProofMethod.hs)
-            // with empty case name renders as `show i` ("1", "2", "3", ...)
-            // with NO `_case_` prefix and NO zero-padding (the `pad`
-            // call only runs in the else branch when the prefix is
-            // non-empty).
-            //
-            // Inner duplicate detection: HS's `M.fromListWith (error
-            // "case names not unique")` plus `uniqueListBy` dedups
-            // exact-name duplicates structurally; for our empty-name
-            // case all siblings get unique numeric names so no real
-            // dedup is needed.
-            let out: Vec<(String, System)> = cleaned
-                .into_iter()
-                .enumerate()
-                .map(|(i, s)| ((i + 1).to_string(), s))
-                .collect();
-            Some(out)
+            Some(cleaned)
         }
         ProofMethod::SolveGoal(g) => {
             // State snapshot BEFORE dispatch — paired with HS's
@@ -538,7 +540,11 @@ pub fn exec_proof_method(
             // the case once per arm.  Our `simplify_system_with_fanout`
             // mirrors that, returning N systems.  Each is then cleaned
             // (renamePrecise + clear subst) per HS's `cleanup`.
-            let simplify = |sys: System, seed: u64| -> Vec<System> {
+            fn simplify(
+                sys: System,
+                ctx: &ProofContext,
+                seed: u64,
+            ) -> impl ExactSizeIterator<Item = System> + Clone {
                 let raw_systems: Vec<System> =
                     crate::constraint::solver::simplify::simplify_system_with_fanout_seeded(
                         ctx, sys, seed,
@@ -547,8 +553,8 @@ pub fn exec_proof_method(
                 // `cleanup` (ProofMethod.hs):
                 //   cleanup s = L.set sSubst emptySubst
                 //                       (renamePrecise s)
-                raw_systems.into_iter().map(|s| s.cleanup()).collect()
-            };
+                raw_systems.into_iter().map(|s| s.cleanup())
+            }
             // Filter cases the same way Haskell's `runReduction` does:
             // when a CR-rule called `contradictoryIf` during simplify
             // (e.g. solveFactEqs / solveRuleEqs / solveSubstEqs hitting
@@ -600,20 +606,20 @@ pub fn exec_proof_method(
             // identically-named siblings would let the exists-trace DFS
             // commit to `otc=('one'++'zero')` (14 steps) instead of HS's
             // `_case_2` (`otc='zero'`, 10 steps).
-            let cases: Vec<(String, System, u64)> = match outcome {
-                GoalCases::Linear => vec![("".to_string(), r.sys, adopted_counter)],
-                GoalCases::LinearNamed(name) => vec![(name, r.sys, adopted_counter)],
-                GoalCases::Cases(cases) => cases
-                    .into_iter()
-                    .enumerate()
-                    .map(|(ci, (n, s))| {
+            let cases: Box<dyn Iterator<Item = (String, System, u64)>> = match outcome {
+                GoalCases::Linear => Box::new(std::iter::once(("".into(), r.sys, adopted_counter))),
+                GoalCases::LinearNamed(name) => {
+                    Box::new(std::iter::once((name, r.sys, adopted_counter)))
+                }
+                GoalCases::Cases(cases) => {
+                    Box::new(cases.into_iter().enumerate().map(|(ci, (n, s))| {
                         let seed = goal_case_counters
                             .get(ci)
                             .copied()
                             .unwrap_or(adopted_counter);
                         (n, s, seed)
-                    })
-                    .collect(),
+                    }))
+                }
                 GoalCases::Contradictory => return Some(Vec::new()),
             };
             {
@@ -638,7 +644,6 @@ pub fn exec_proof_method(
                 // iteration order (rule order in `joinAllRules`).
                 // simplify can fan out per case — flat-map.
                 let kept_raw: Vec<(String, System)> = cases
-                    .into_iter()
                     .flat_map(|(name, sys, seed)| {
                         // `TAM_RS_TRACE_CASE_SIMP=1`: bracket each
                         // per-case simplify so interleaved trace hooks
@@ -652,14 +657,16 @@ pub fn exec_proof_method(
                                 crate::constraint::solver::trace::case_path_string()
                             );
                         }
-                        let systems = simplify(sys, seed);
+                        let systems = simplify(sys, ctx, seed);
                         let n_arms = systems.len();
-                        let out: Vec<(String, System)> = systems
-                            .into_iter()
-                            .filter(|s| keep(s, &name))
-                            .map(|s| (name.clone(), s))
-                            .collect();
+                        let keep_name = name.clone();
+                        let map_name = name.clone();
+                        let out = systems
+                            .filter(move |s| keep(s, &keep_name))
+                            .map(move |s| (map_name.clone(), s));
                         if dbg {
+                            // Clone the iterator to avoid consuming it
+                            let out: Vec<(String, System)> = out.clone().collect();
                             eprintln!(
                                 "[CASE_SIMP] end name={} arms={} kept={}",
                                 name,
