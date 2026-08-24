@@ -1,6 +1,8 @@
 //! Term language for the Tamarin prover (Rust port).
 //!
 //! Modules ported (mapping to Haskell):
+//! - [`alpha_eq_ac`] ← (no HS analog) canonization of terms for
+//!   $\alphaeqac$, per `work.tex`'s "Canonization of Constraint Systems"
 //! - [`function_symbols`] ← `Term.Term.FunctionSymbols`
 //! - [`term`] ← `Term.Term.Raw` (raw term type + AC-normalising smart constructors)
 //! - [`vterm`] ← `Term.VTerm` (`Lit<C, V>` and helpers)
@@ -33,6 +35,7 @@
 //!   (variant computation as a standalone module; the variant-unification
 //!   entry point Tamarin needs lives in [`maude_proc`])
 
+pub mod alpha_eq_ac;
 pub mod builtin;
 pub mod function_symbols;
 pub mod intern;

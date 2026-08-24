@@ -98,6 +98,10 @@ where
         self.map.len()
     }
 
+    pub fn contains_var(&self, v: &V) -> bool {
+        self.map.contains_key(v)
+    }
+
     /// `restrict vars`: keep only mappings whose key is in `vars`.
     pub fn restrict(&self, vars: &[V]) -> Self
     where
