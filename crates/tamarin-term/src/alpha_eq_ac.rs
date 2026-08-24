@@ -18,7 +18,7 @@
 //! algorithm is implemented.
 
 use crate::{
-    lterm::{LNTerm, LVar, Name},
+    lterm::{LNTerm, LSort, LVar, Name},
     subst::Subst,
     vterm::Lit,
 };
@@ -377,6 +377,29 @@ pub mod position {
 
 use position::{PosStep, Position};
 
+/// Struct modeling a bucket with `count` uncanonized literals of `sort`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BucketKey {
+    /// The number of uncanonized literals at a position.
+    count: usize,
+    /// The sort of the uncanonized literals counted in this bucket.
+    sort: LSort,
+}
+
+impl PartialOrd for BucketKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BucketKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.count
+            .cmp(&other.count)
+            .then_with(|| self.sort.cmp(&other.sort))
+    }
+}
+
 /// The dynamic scheduling structure driving Algorithm 1 (`CAN_alphaeqac`):
 /// a bucket queue keyed by how many literals at a position are still
 /// uncanonized, i.e. work.tex's `[(LitPos(p), p) | p in Pos(t)]` worklist
@@ -386,15 +409,30 @@ use position::{PosStep, Position};
 /// uncanonized changes as the algorithm progresses, so canonizing one
 /// literal only needs to relocate the (typically few) positions it
 /// actually occurs in, via `occurs_in`, instead of re-sorting every entry.
-struct Worklist {
-    /// `count -> positions currently having exactly that many uncanonized
-    /// literals`, in ascending key order. A `BTreeMap` rather than an array
-    /// of buckets so the smallest nonempty count is a single lookup
-    /// regardless of how wide any single AC application's arity is, and so
-    /// a position's count can drop by more than one bucket in a single
-    /// step (when several of its literals are canonized together)
-    /// without breaking a monotonic-cursor assumption.
-    buckets: BTreeMap<usize, BTreeSet<Position>>,
+struct Canonizer {
+    /// The term to canonize
+    term: LNTerm,
+    /// The current canonical labelling of literals, i.e., a sort-respeting bijection from the literals of `term` to a canonical set of fresh literals.
+    subst: Subst<LNLit, LNLit>,
+
+    /// The next fresh literal of the msg sort to be used in the canonical labelling.
+    fresh_msg: u64,
+    /// The next fresh literal of the pub sort to be used in the canonical labelling.
+    fresh_pub: u64,
+    /// The next fresh literal of the fresh sort to be used in the canonical labelling.
+    fresh_fresh: u64,
+    /// The next fresh literal of the nat sort to be used in the canonical labelling.
+    fresh_nat: u64,
+    /// The next fresh literal of the node sort to be used in the canonical labelling.
+    fresh_node: u64,
+    /// `(count, sort) -> positions currently having exactly that many
+    /// uncanonized literals of that sort`, in ascending key order. A
+    /// `BTreeMap` rather than an array of buckets so the smallest nonempty
+    /// count is a single lookup regardless of how wide any single AC
+    /// application's arity is, and so a position's count can drop by more
+    /// than one bucket in a single step (when several of its literals are
+    /// canonized together) without breaking a monotonic-cursor assumption.
+    buckets: BTreeMap<BucketKey, BTreeSet<Position>>,
     /// The literals still uncanonized at each position currently tracked
     /// in `buckets`, i.e. work.tex's `LitPos(t,p) \ dom(\theta)`.
     remaining: HashMap<Position, BTreeSet<LNLit>>,
@@ -403,7 +441,7 @@ struct Worklist {
     occurs_in: HashMap<LNLit, Vec<Position>>,
 }
 
-impl Worklist {
+impl Canonizer {
     /// Builds the initial worklist for `t`: every position of `t` paired
     /// with its literal set, bucketed by set size and indexed by literal.
     /// Positions with no literals (e.g. an AC-group position selecting only
@@ -417,7 +455,7 @@ impl Worklist {
     }
 
     fn new_inner(t: &LNTerm, subst: Subst<LNLit, LNLit>) -> Self {
-        let mut buckets: BTreeMap<usize, BTreeSet<Position>> = BTreeMap::new();
+        let mut buckets: BTreeMap<BucketKey, BTreeSet<Position>> = BTreeMap::new();
         let mut remaining: HashMap<Position, BTreeSet<LNLit>> = HashMap::new();
         let mut occurs_in: HashMap<LNLit, Vec<Position>> = HashMap::new();
 
@@ -433,18 +471,36 @@ impl Worklist {
                 .into_iter()
                 .filter(|l| !subst.contains_var(l))
                 .collect();
-            buckets
-                .entry(uncanonicalized_lits.len())
-                .or_default()
-                .insert(p.clone());
+            let mut sort_counts: BTreeMap<LSort, usize> = BTreeMap::new();
+            for l in &uncanonicalized_lits {
+                *sort_counts.entry(l.sort()).or_default() += 1;
+            }
+            for (sort, count) in sort_counts {
+                buckets
+                    .entry(BucketKey { count, sort })
+                    .or_default()
+                    .insert(p.clone());
+            }
             remaining.insert(p, uncanonicalized_lits);
         }
 
-        Worklist {
+        Canonizer {
+            term: t.clone(),
+            fresh_fresh: 0,
+            fresh_msg: 0,
+            fresh_pub: 0,
+            fresh_nat: 0,
+            fresh_node: 0,
+            subst,
             buckets,
             remaining,
             occurs_in,
         }
+    }
+
+    // Computes the canonical form of `self.term` under the given canonicalizing substitution, returning the canonicalized term and the final substitution.
+    fn canonize(&mut self) -> (LNTerm, Subst<LNLit, LNLit>) {
+        unimplemented!()
     }
 }
 
@@ -737,16 +793,40 @@ mod tests {
     #[test]
     fn worklist_new_buckets_by_literal_count() {
         let t = xor(v("a", LSort::Msg), v("b", LSort::Msg));
-        let wl = Worklist::new(&t);
+        let wl = Canonizer::new(&t);
 
-        assert_eq!(wl.buckets.keys().copied().collect::<Vec<_>>(), vec![2]);
-        let group_pos = wl.buckets[&2].iter().next().unwrap().clone();
+        let key = BucketKey {
+            count: 2,
+            sort: LSort::Msg,
+        };
+        assert_eq!(wl.buckets.keys().copied().collect::<Vec<_>>(), vec![key]);
+        let group_pos = wl.buckets[&key].iter().next().unwrap().clone();
         assert_eq!(wl.remaining[&group_pos].len(), 2);
         assert_eq!(
             wl.occurs_in[&lit_of(&v("a", LSort::Msg))],
             vec![group_pos.clone()]
         );
         assert_eq!(wl.occurs_in[&lit_of(&v("b", LSort::Msg))], vec![group_pos]);
+    }
+
+    #[test]
+    fn worklist_new_buckets_by_literal_count_per_sort() {
+        let t = xor(
+            xor(v("a", LSort::Msg), v("b", LSort::Pub)),
+            v("c", LSort::Fresh),
+        );
+        let wl = Canonizer::new(&t);
+
+        assert_eq!(wl.buckets.len(), 3);
+        for sort in [LSort::Msg, LSort::Pub, LSort::Fresh] {
+            assert!(wl.buckets.contains_key(&BucketKey { count: 1, sort }));
+        }
+
+        let group_pos = vec![PosStep::AcGroup(None)];
+        for positions in wl.buckets.values() {
+            assert_eq!(positions, &BTreeSet::from([group_pos.clone()]));
+        }
+        assert_eq!(wl.remaining[&group_pos].len(), 3);
     }
 
     // -- 16) A literal shared across two positions (\Cref{ex:ac_canon}'s
@@ -762,7 +842,7 @@ mod tests {
             vec![xor(c.clone(), d), xor(a.clone(), c.clone()), a.clone()],
         );
 
-        let wl = Worklist::new(&t);
+        let wl = Canonizer::new(&t);
 
         // `c` occurs under the first `xor`'s AC group (with `d`) and the
         // second `xor`'s AC group (with `a`).

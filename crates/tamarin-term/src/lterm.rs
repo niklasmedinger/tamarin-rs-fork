@@ -34,11 +34,11 @@ use tamarin_utils::cow::cow_map_vec;
 /// `LSortNode` is incomparable to the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LSort {
-    Pub,
-    Fresh,
-    Msg,
-    Node,
-    Nat,
+    Pub = 2,
+    Fresh = 1,
+    Msg = 0,
+    Node = 3,
+    Nat = 4,
 }
 
 /// Partial-order comparison on sorts. Returns `None` for incomparable sorts.
@@ -226,6 +226,22 @@ pub type NodeId = LVar;
 pub type LTerm<C> = VTerm<C, LVar>;
 /// `LNTerm` — `LTerm<Name>`.
 pub type LNTerm = LTerm<Name>;
+
+impl Lit<Name, LVar> {
+    pub fn is_var(&self) -> bool {
+        matches!(self, Lit::Var(_))
+    }
+    pub fn is_con(&self) -> bool {
+        matches!(self, Lit::Con(_))
+    }
+
+    pub fn sort(&self) -> LSort {
+        match self {
+            Lit::Con(n) => sort_of_name(n),
+            Lit::Var(v) => v.sort,
+        }
+    }
+}
 
 /// `freshLVar`: pull a fresh per-name index from the supplied state.
 pub fn fresh_lvar(
