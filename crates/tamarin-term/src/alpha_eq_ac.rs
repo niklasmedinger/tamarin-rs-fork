@@ -16,7 +16,6 @@
 //! This module is under active development (see TODO.md); the tests below
 //! are written test-first and pin down the required equivalences before the
 //! algorithm is implemented.
-
 use crate::{
     lterm::{LNTerm, LSort, LVar, Name},
     subst::Subst,
@@ -375,7 +374,7 @@ pub mod position {
     }
 }
 
-use position::{PosStep, Position};
+use position::Position;
 
 /// Struct modeling a bucket with `count` uncanonized literals of `sort`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -512,10 +511,14 @@ pub fn canonicalize_alpha_eq_ac(_t: &LNTerm, _subst: Subst<LNLit, LNLit>) -> LNT
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::BTreeSet;
+
+    use crate::alpha_eq_ac::position::PosStep;
+    use crate::alpha_eq_ac::*;
     use crate::builtin::{emap, xor};
     use crate::function_symbols::{Constructability, NoEqSym, Privacy};
-    use crate::lterm::{fresh_term, LSort, LVar};
+    use crate::lterm::{fresh_term, LNTerm, LSort, LVar};
+    use crate::subst::Subst;
     use crate::term::{f_app_no_eq, Term};
     use crate::vterm::var_term;
 
