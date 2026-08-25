@@ -16,7 +16,7 @@ use crate::FastMap;
 // =============================================================================
 
 /// Single-counter fresh-name supply (`Control.Monad.Trans.FastFresh`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct FastFreshState {
     next: u64,
 }

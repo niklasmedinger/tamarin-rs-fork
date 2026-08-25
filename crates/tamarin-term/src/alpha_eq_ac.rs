@@ -522,6 +522,7 @@ impl Canonizer {
             remaining.insert(p, uncanonicalized_lits);
         }
 
+        // Some boilerplate to get the fresh literal generators to start at the right place, so that the canonicalization of a term with a non-empty initial substitution doesn't produce fresh literals that collide with the substitution's image.
         let image: Vec<_> = subst
             .values()
             .copied()
@@ -532,11 +533,11 @@ impl Canonizer {
 
         Canonizer {
             term: t.clone(),
-            fresh_fresh: crate::lterm::avoid(t),
-            fresh_msg: crate::lterm::avoid(t),
-            fresh_pub: crate::lterm::avoid(t),
-            fresh_nat: crate::lterm::avoid(t),
-            fresh_node: crate::lterm::avoid(t),
+            fresh_fresh: fresh_state,
+            fresh_msg: fresh_state,
+            fresh_pub: fresh_state,
+            fresh_nat: fresh_state,
+            fresh_node: fresh_state,
             subst: vec![subst],
             buckets,
             remaining,
@@ -545,8 +546,7 @@ impl Canonizer {
     }
 
     /// Get the next literal to be canonized, i.e. the literal of the smallest sort that occurs in the most positions with the fewest remaining uncanonized literals.
-    ///
-    ///
+    /// Assumes that the returned literals are canonized immediately afterwards and updates internal data structures accordingly.
     fn next_literals(&mut self) -> Option<Vec<LNLit>> {
         let (k, mut candidate_positions) = self.buckets.pop_first()?;
         assert!(
@@ -556,15 +556,25 @@ impl Canonizer {
         );
 
         // SAFETY: Safe to unwrap since !candidate_positions.is_empty() is asserted above.
-        let next_position = candidate_positions.pop_first().unwrap();
-        let next_lits = self.remaining.remove(&next_position);
+        let next_pos = candidate_positions.pop_first().unwrap();
+        // Get the literals of the next position. Can still contain literals that are not of the sort of the bucket key.
+        let next_pos_all_lits = self.remaining.get(&next_pos);
         assert!(
-            next_lits.is_some(),
+            next_pos_all_lits.is_some(),
             "remaining invariant violated: position {:?} not found",
-            next_position
+            next_pos
         );
-        // SAFETY: Safe to unwrap since next_lits is asserted to be Some above.
-        let next_lits = next_lits.unwrap();
+
+        // SAFETY: Safe to unwrap since it is asserted to be Some above.
+        let next_pos_all_lits = next_pos_all_lits.unwrap();
+        // Filter by sort to get the next literal to canonize.
+        let next_lits = next_pos_all_lits
+            .iter()
+            .filter(|l| l.sort() == k.sort)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(k.count == next_lits.len(), "bucket queue invariant violated: position {:?} has {} uncanonized literals of sort {:?} but bucket key has count {}", next_pos, next_lits.len(), k.sort, k.count);
+
         for lit in next_lits.iter() {
             assert!(
                 self.occurs_in.contains_key(lit),
@@ -572,34 +582,53 @@ impl Canonizer {
                 lit
             );
             assert!(
-                self.occurs_in[lit].contains(&next_position),
+                self.occurs_in[lit].contains(&next_pos),
                 "occurs_in invariant violated: position {:?} contains lit {:?}
                 but it is not in occurs_in[lit] = {:?}",
-                next_position,
+                next_pos,
                 lit,
                 self.occurs_in[lit]
             );
-            assert!(
-                !self.occurs_in[lit].is_empty(),
-                "occurs_in invariant violated: literal {:?} has empty occurrence list",
-                lit
-            );
             assert!(k.sort == lit.sort(), "bucket queue invariant violated: literal {:?} has sort {:?} but bucket key has sort {:?}", lit, lit.sort(), k.sort);
+
+            // We assume that each literal will be immediately canonized, so we remove the literal from the remaining uncanonized literals of the positions it occurs in.
+            // SAFETY: The existence of the position in the occurs_in index is asserted above, so we can safely unwrap here.
+            let positions = self.occurs_in.get(lit).unwrap();
+            for position in positions.iter() {
+                let remaining = self.remaining.get_mut(position);
+                assert!(
+                    remaining.is_some(),
+                    "remaining invariant violated: position {:?} not found",
+                    position
+                );
+                let remaining = remaining.unwrap();
+                let was_present = remaining.remove(lit);
+                assert!(
+                    was_present,
+                    "remaining invariant violated: literal {:?} not found in position {:?}'s remaining uncanonized literals when trying to remove it",
+                    lit,
+                    position
+                );
+            }
         }
-        // Allocate the next fresh indices for the sort
-        let next_idx = self.allocate_fresh_indices(k.sort, next_lits.len() as u64);
-        // Take the current substs to avoid one clone later on
-        let current_substs = std::mem::take(&mut self.subst);
-        for permutation in next_lits.iter().permutations(next_lits.len()) {}
-        // TODO: We now compute the permutations of the literals, can we locally check which one is the best/minimum
-        // or do we need to keep all around and only pick the best at the end?
-        // TODO: Need to reinsert k with the updated candidate_positions if it's not empty
-        todo!()
+
+        // TODO: Need to reinsert k with the updated candidate_positions if it's not empty todo!() } /// Canonizes a single literal, updating the canonicalizing substitution and the worklist of positions accordingly.
+        None
     }
 
-    /// Canonizes a single literal, updating the canonicalizing substitution and the worklist of positions accordingly.
+    /// Updates the buckets and remaining uncanonized literals after canonizing the given literals.
+    /// First, updates the remaining uncanonized literals for each position that contains any of the canonized literals, deleting the position from the map if it has no remaining uncanonized literals.
+    /// Then, it updates the buckets of positions by removing the position from its old bucket and inserting it into its new bucket, if it still has remaining uncanonized literals.
+    fn update_buckets_and_remaining(&mut self, lits: &[LNLit]) {}
+
     fn canonize_literal(&mut self, lit: &LNLit) {
-        unimplemented!()
+        unimplemented!();
+        // // Allocate the next fresh indices for the sort
+        // let next_idx = self.allocate_fresh_indices(k.sort, next_lits.len() as u64);
+        // // Take the current substs to avoid one clone later on
+        // let current_substs = std::mem::take(&mut self.subst);
+        // for permutation in next_lits.iter().permutations(next_lits.len()) {}
+        // for i in 0..next_lits.len() {}
     }
 
     /// Allocate `n` fresh indices for the given sort, returning the first allocated index.
