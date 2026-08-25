@@ -1,7 +1,3 @@
-// Currently GPL 3.0 until granted permission by the upstream authors
-// of the tamarin-prover sources this file cites; list them with:
-//   scripts/gen_license_headers.py --authors <this file>
-
 //! Canonization of terms for alpha equivalence modulo AC ($\alphaeqac$), as
 //! developed in `work.tex` §"Canonization of Constraint Systems" /
 //! "Canonization of Terms".
@@ -17,11 +13,16 @@
 //! are written test-first and pin down the required equivalences before the
 //! algorithm is implemented.
 use crate::{
+    function_symbols::FunSym,
     lterm::{LNTerm, LSort, LVar, Name},
     subst::Subst,
     vterm::Lit,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use itertools::Itertools;
+#[allow(clippy::disallowed_types)]
+use std::collections::{BTreeMap, BTreeSet};
+use tamarin_utils::fresh::FastFreshState;
 
 type LNLit = Lit<Name, LVar>;
 
@@ -43,15 +44,18 @@ pub mod position {
     /// here the crossed symbol is implicit (it is `t`'s head at the point
     /// the step is applied), so a step only needs to carry the selector.
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[repr(u32)]
+    // Explicit repr and descriminants to ensure that positions of non-AC symbols
+    // are _less_ than positions of AC symbols
     pub enum PosStep {
         /// `p = f \cdot i \cdot p'`: the `i`-th argument of a fixed-order
         /// (non-AC) application.
-        Arg(usize),
+        Arg(usize) = 0,
         /// Crossing an AC application: `None` is `p = f \cdot \epsilon`
         /// (select the whole flattened argument multiset — always the
         /// last step of a position); `Some(sym)` is `p = f \cdot g \cdot p'`
         /// (select the flattened arguments headed by `sym`, then continue).
-        AcGroup(Option<FunSym>),
+        AcGroup(Option<FunSym>) = 1,
     }
 
     /// A position: a sequence of [`PosStep`]s. The empty position `ε`
@@ -212,6 +216,11 @@ pub mod position {
             Term::App(FunSym::List, vec![group, d].into())
         }
 
+        /// Put another list on top. Everything should still work as expected.
+        fn example_term_double_list_head() -> LNTerm {
+            Term::App(FunSym::List, vec![example_term()].into())
+        }
+
         #[test]
         fn positions_match_example() {
             let t = example_term();
@@ -225,6 +234,36 @@ pub mod position {
                 vec![PosStep::Arg(0), PosStep::AcGroup(Some(g)), PosStep::Arg(0)],
                 vec![PosStep::Arg(0), PosStep::AcGroup(Some(g)), PosStep::Arg(1)],
                 vec![PosStep::Arg(1)],
+            ]
+            .into_iter()
+            .collect();
+            assert_eq!(got, want);
+        }
+
+        #[test]
+        fn positions_double_list_head_example_term() {
+            let t = example_term_double_list_head();
+            let g = FunSym::NoEq(no_eq_sym("g", 2));
+            let got: BTreeSet<_> = positions(&t).into_iter().collect();
+            let want: BTreeSet<Position> = [
+                vec![],
+                vec![PosStep::Arg(0)],
+                vec![PosStep::Arg(0), PosStep::Arg(0)],
+                vec![PosStep::Arg(0), PosStep::Arg(0), PosStep::AcGroup(None)],
+                vec![PosStep::Arg(0), PosStep::Arg(0), PosStep::AcGroup(Some(g))],
+                vec![
+                    PosStep::Arg(0),
+                    PosStep::Arg(0),
+                    PosStep::AcGroup(Some(g)),
+                    PosStep::Arg(0),
+                ],
+                vec![
+                    PosStep::Arg(0),
+                    PosStep::Arg(0),
+                    PosStep::AcGroup(Some(g)),
+                    PosStep::Arg(1),
+                ],
+                vec![PosStep::Arg(0), PosStep::Arg(1)],
             ]
             .into_iter()
             .collect();
@@ -411,19 +450,19 @@ impl Ord for BucketKey {
 struct Canonizer {
     /// The term to canonize
     term: LNTerm,
-    /// The current canonical labelling of literals, i.e., a sort-respeting bijection from the literals of `term` to a canonical set of fresh literals.
-    subst: Subst<LNLit, LNLit>,
+    /// The current candidate canonical labellings of literals, i.e., sort-respeting renamings of the literals of `term` to a canonical set of fresh literals.
+    subst: Vec<BTreeMap<LNLit, LNLit>>,
 
     /// The next fresh literal of the msg sort to be used in the canonical labelling.
-    fresh_msg: u64,
+    fresh_msg: FastFreshState,
     /// The next fresh literal of the pub sort to be used in the canonical labelling.
-    fresh_pub: u64,
+    fresh_pub: FastFreshState,
     /// The next fresh literal of the fresh sort to be used in the canonical labelling.
-    fresh_fresh: u64,
+    fresh_fresh: FastFreshState,
     /// The next fresh literal of the nat sort to be used in the canonical labelling.
-    fresh_nat: u64,
+    fresh_nat: FastFreshState,
     /// The next fresh literal of the node sort to be used in the canonical labelling.
-    fresh_node: u64,
+    fresh_node: FastFreshState,
     /// `(count, sort) -> positions currently having exactly that many
     /// uncanonized literals of that sort`, in ascending key order. A
     /// `BTreeMap` rather than an array of buckets so the smallest nonempty
@@ -434,10 +473,10 @@ struct Canonizer {
     buckets: BTreeMap<BucketKey, BTreeSet<Position>>,
     /// The literals still uncanonized at each position currently tracked
     /// in `buckets`, i.e. work.tex's `LitPos(t,p) \ dom(\theta)`.
-    remaining: HashMap<Position, BTreeSet<LNLit>>,
+    remaining: BTreeMap<Position, BTreeSet<LNLit>>,
     /// Inverted index: the positions a literal occurs in, so canonizing it
     /// only touches those entries. Static once built.
-    occurs_in: HashMap<LNLit, Vec<Position>>,
+    occurs_in: BTreeMap<LNLit, Vec<Position>>,
 }
 
 impl Canonizer {
@@ -446,17 +485,17 @@ impl Canonizer {
     /// Positions with no literals (e.g. an AC-group position selecting only
     /// compound subterms) are omitted, since they are never popped.
     fn new(t: &LNTerm) -> Self {
-        Self::new_inner(t, Subst::empty())
+        Self::new_inner(t, BTreeMap::new())
     }
 
-    fn new_with_subst(t: &LNTerm, subst: Subst<LNLit, LNLit>) -> Self {
+    fn new_with_subst(t: &LNTerm, subst: BTreeMap<LNLit, LNLit>) -> Self {
         Self::new_inner(t, subst)
     }
 
-    fn new_inner(t: &LNTerm, subst: Subst<LNLit, LNLit>) -> Self {
+    fn new_inner(t: &LNTerm, subst: BTreeMap<LNLit, LNLit>) -> Self {
         let mut buckets: BTreeMap<BucketKey, BTreeSet<Position>> = BTreeMap::new();
-        let mut remaining: HashMap<Position, BTreeSet<LNLit>> = HashMap::new();
-        let mut occurs_in: HashMap<LNLit, Vec<Position>> = HashMap::new();
+        let mut remaining: BTreeMap<Position, BTreeSet<LNLit>> = BTreeMap::new();
+        let mut occurs_in: BTreeMap<LNLit, Vec<Position>> = BTreeMap::new();
 
         for p in position::positions(t) {
             let lits = position::lit_pos(t, &p);
@@ -468,7 +507,7 @@ impl Canonizer {
             }
             let uncanonicalized_lits: BTreeSet<_> = lits
                 .into_iter()
-                .filter(|l| !subst.contains_var(l))
+                .filter(|l| !subst.contains_key(l))
                 .collect();
             let mut sort_counts: BTreeMap<LSort, usize> = BTreeMap::new();
             for l in &uncanonicalized_lits {
@@ -483,21 +522,98 @@ impl Canonizer {
             remaining.insert(p, uncanonicalized_lits);
         }
 
+        let image: Vec<_> = subst
+            .values()
+            .copied()
+            .map(|l| crate::term::lit(l))
+            .collect();
+        let tmp = crate::term::Term::App(FunSym::List, image.into());
+        let fresh_state = crate::lterm::avoid(&tmp);
+
         Canonizer {
             term: t.clone(),
-            fresh_fresh: 0,
-            fresh_msg: 0,
-            fresh_pub: 0,
-            fresh_nat: 0,
-            fresh_node: 0,
-            subst,
+            fresh_fresh: crate::lterm::avoid(t),
+            fresh_msg: crate::lterm::avoid(t),
+            fresh_pub: crate::lterm::avoid(t),
+            fresh_nat: crate::lterm::avoid(t),
+            fresh_node: crate::lterm::avoid(t),
+            subst: vec![subst],
             buckets,
             remaining,
             occurs_in,
         }
     }
 
-    // Computes the canonical form of `self.term` under the given canonicalizing substitution, returning the canonicalized term and the final substitution.
+    /// Get the next literal to be canonized, i.e. the literal of the smallest sort that occurs in the most positions with the fewest remaining uncanonized literals.
+    ///
+    ///
+    fn next_literals(&mut self) -> Option<Vec<LNLit>> {
+        let (k, mut candidate_positions) = self.buckets.pop_first()?;
+        assert!(
+            !candidate_positions.is_empty(),
+            "bucket queue invariant violated: empty bucket for key {:?}",
+            k
+        );
+
+        // SAFETY: Safe to unwrap since !candidate_positions.is_empty() is asserted above.
+        let next_position = candidate_positions.pop_first().unwrap();
+        let next_lits = self.remaining.remove(&next_position);
+        assert!(
+            next_lits.is_some(),
+            "remaining invariant violated: position {:?} not found",
+            next_position
+        );
+        // SAFETY: Safe to unwrap since next_lits is asserted to be Some above.
+        let next_lits = next_lits.unwrap();
+        for lit in next_lits.iter() {
+            assert!(
+                self.occurs_in.contains_key(lit),
+                "occurs_in invariant violated: literal {:?} not found",
+                lit
+            );
+            assert!(
+                self.occurs_in[lit].contains(&next_position),
+                "occurs_in invariant violated: position {:?} contains lit {:?}
+                but it is not in occurs_in[lit] = {:?}",
+                next_position,
+                lit,
+                self.occurs_in[lit]
+            );
+            assert!(
+                !self.occurs_in[lit].is_empty(),
+                "occurs_in invariant violated: literal {:?} has empty occurrence list",
+                lit
+            );
+            assert!(k.sort == lit.sort(), "bucket queue invariant violated: literal {:?} has sort {:?} but bucket key has sort {:?}", lit, lit.sort(), k.sort);
+        }
+        // Allocate the next fresh indices for the sort
+        let next_idx = self.allocate_fresh_indices(k.sort, next_lits.len() as u64);
+        // Take the current substs to avoid one clone later on
+        let current_substs = std::mem::take(&mut self.subst);
+        for permutation in next_lits.iter().permutations(next_lits.len()) {}
+        // TODO: We now compute the permutations of the literals, can we locally check which one is the best/minimum
+        // or do we need to keep all around and only pick the best at the end?
+        // TODO: Need to reinsert k with the updated candidate_positions if it's not empty
+        todo!()
+    }
+
+    /// Canonizes a single literal, updating the canonicalizing substitution and the worklist of positions accordingly.
+    fn canonize_literal(&mut self, lit: &LNLit) {
+        unimplemented!()
+    }
+
+    /// Allocate `n` fresh indices for the given sort, returning the first allocated index.
+    fn allocate_fresh_indices(&mut self, sort: LSort, n: u64) -> u64 {
+        match sort {
+            LSort::Pub => self.fresh_pub.fresh_idents(n),
+            LSort::Fresh => self.fresh_fresh.fresh_idents(n),
+            LSort::Msg => self.fresh_msg.fresh_idents(n),
+            LSort::Node => self.fresh_node.fresh_idents(n),
+            LSort::Nat => self.fresh_nat.fresh_idents(n),
+        }
+    }
+
+    /// Computes the canonical form of `self.term` under the given canonicalizing substitution, returning the canonicalized term and the final substitution.
     fn canonize(&mut self) -> (LNTerm, Subst<LNLit, LNLit>) {
         unimplemented!()
     }

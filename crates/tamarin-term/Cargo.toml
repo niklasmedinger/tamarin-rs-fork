@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Term language for the Tamarin prover (Rust port)."
 
 [dependencies]
+itertools = "0.15.0"
 tamarin-utils = { workspace = true }
 
 [lints]
