@@ -34,11 +34,11 @@ use tamarin_utils::cow::cow_map_vec;
 /// `LSortNode` is incomparable to the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LSort {
-    Pub = 2,
-    Fresh = 1,
-    Msg = 0,
-    Node = 3,
-    Nat = 4,
+    Pub,
+    Fresh,
+    Msg,
+    Node,
+    Nat,
 }
 
 /// Partial-order comparison on sorts. Returns `None` for incomparable sorts.

@@ -9,13 +9,14 @@
 //! and 2) bringing the result into `CAN_AC` normal form. See Algorithm 1
 //! (`CAN_alphaeqac`) and Theorem `thm:can_alphaeqac` in `work.tex`.
 //!
-//! This module is under active development (see TODO.md); the tests below
-//! are written test-first and pin down the required equivalences before the
-//! algorithm is implemented.
+//! This module is under active development (see TODO.md); lifting
+//! canonization to facts, rule instances, and constraint systems is still
+//! outstanding.
 use crate::{
     function_symbols::FunSym,
-    lterm::{LNTerm, LSort, LVar, Name},
+    lterm::{LNTerm, LSort, LVar, Name, NameTag},
     subst::Subst,
+    term::{f_app, Term},
     vterm::Lit,
 };
 
@@ -55,6 +56,10 @@ pub mod position {
         /// (select the whole flattened argument multiset — always the
         /// last step of a position); `Some(sym)` is `p = f \cdot g \cdot p'`
         /// (select the flattened arguments headed by `sym`, then continue).
+        ///
+        /// We do not have an own variant for C symbols because their positions
+        /// behave just as AC symbols' positions do. The only difference is that
+        /// C symbols are not flattened.
         AcGroup(Option<FunSym>) = 1,
     }
 
@@ -73,7 +78,7 @@ pub mod position {
     fn collect_positions(t: &LNTerm, prefix: &mut Position, out: &mut Vec<Position>) {
         match t {
             Term::Lit(_) => {}
-            Term::App(FunSym::Ac(_), args) => {
+            Term::App(FunSym::Ac(_), args) | Term::App(FunSym::C(_), args) => {
                 // `p = f . \epsilon`: the whole flattened argument multiset.
                 prefix.push(PosStep::AcGroup(None));
                 out.push(prefix.clone());
@@ -123,7 +128,7 @@ pub mod position {
                     collect_subterms_at(a, rest, out);
                 }
             }
-            (PosStep::AcGroup(filter), Term::App(f, args)) if f.is_ac() => {
+            (PosStep::AcGroup(filter), Term::App(f, args)) if f.is_ac() || f.is_c() => {
                 for a in args.iter() {
                     let matches = match (filter, a) {
                         (None, _) => true,
@@ -477,6 +482,9 @@ struct Canonizer {
     /// Inverted index: the positions a literal occurs in, so canonizing it
     /// only touches those entries. Static once built.
     occurs_in: BTreeMap<LNLit, Vec<Position>>,
+    /// The number of permutations of the terms literals that were considered during canonization. This is the number of substitutions that were generated and stored in `self.subst`.
+    /// This field only exists to support testing and is not used in the canonization algorithm itself.
+    considered_permutations: usize,
 }
 
 impl Canonizer {
@@ -542,7 +550,13 @@ impl Canonizer {
             buckets,
             remaining,
             occurs_in,
+            considered_permutations: 0,
         }
+    }
+
+    /// Returns the amount of permutations of the terms literals that were considered during canonization. This is the number of substitutions that were generated and stored in `self.subst`.
+    fn considered_permutations(&self) -> usize {
+        self.considered_permutations
     }
 
     /// Get the next literal to be canonized, i.e. the literal of the smallest sort that occurs in the most positions with the fewest remaining uncanonized literals.
@@ -687,14 +701,69 @@ impl Canonizer {
         }
     }
 
-    fn canonize_literal(&mut self, lit: &LNLit) {
-        unimplemented!();
-        // // Allocate the next fresh indices for the sort
-        // let next_idx = self.allocate_fresh_indices(k.sort, next_lits.len() as u64);
-        // // Take the current substs to avoid one clone later on
-        // let current_substs = std::mem::take(&mut self.subst);
-        // for permutation in next_lits.iter().permutations(next_lits.len()) {}
-        // for i in 0..next_lits.len() {}
+    /// Canonically renames a batch of literals of one sort sharing a
+    /// position (as returned by [`Self::next_literals`]): extends every
+    /// current candidate renaming in `self.subst` by every permutation of
+    /// the batch, per Algorithm 1 (`CAN_alphaeqac`)'s `perms` / crossproduct
+    /// step.
+    ///
+    /// A sort-respecting renaming never turns a name into a variable or vice
+    /// versa (`work.tex`'s naming scheme reserves disjoint canonical
+    /// families, e.g. `fn_i` vs `fv_i`), so the batch is first split into its
+    /// names and variables and permuted independently; the two permutation
+    /// sets are then combined via cross product, exactly like `perms(lits)`
+    /// would if it only ever permuted within each category.
+    fn canonize_literals(&mut self, lits: &[LNLit]) {
+        let sort = lits[0].sort();
+        for lit in lits.iter() {
+            assert!(
+                lit.sort() == sort,
+                "canonize_literal invariant violated: all lits must have the same sort, but {:?} has sort {:?} while the first has sort {:?}",
+                lit,
+                lit.sort(),
+                sort
+            );
+        }
+
+        let mut names: Vec<Name> = Vec::new();
+        let mut vars: Vec<LVar> = Vec::new();
+        for l in lits {
+            match l {
+                Lit::Con(n) => names.push(*n),
+                Lit::Var(v) => vars.push(*v),
+            }
+        }
+
+        // Names and variables of the same sort share one fresh-index
+        // counter: the canonical families never collide (`fn_i` vs `fv_i`),
+        // so there is no need to keep the counters separate.
+        let name_idx = self.allocate_fresh_indices(sort, names.len() as u64);
+        let canonical_names: Vec<Name> = (0..names.len() as u64)
+            .map(|i| canonical_name(sort, name_idx + i))
+            .collect();
+        let var_idx = self.allocate_fresh_indices(sort, vars.len() as u64);
+        let canonical_vars: Vec<LVar> = (0..vars.len() as u64)
+            .map(|i| canonical_var(sort, var_idx + i))
+            .collect();
+
+        let current_substs = std::mem::take(&mut self.subst);
+        let mut new_substs =
+            Vec::with_capacity(current_substs.len() * names.len().max(1) * vars.len().max(1));
+        for name_perm in names.iter().permutations(names.len()) {
+            for var_perm in vars.iter().permutations(vars.len()) {
+                for existing in &current_substs {
+                    let mut ext = existing.clone();
+                    for (&orig, canon) in name_perm.iter().zip(canonical_names.iter()) {
+                        ext.insert(Lit::Con(*orig), Lit::Con(*canon));
+                    }
+                    for (&orig, canon) in var_perm.iter().zip(canonical_vars.iter()) {
+                        ext.insert(Lit::Var(*orig), Lit::Var(*canon));
+                    }
+                    new_substs.push(ext);
+                }
+            }
+        }
+        self.subst = new_substs;
     }
 
     /// Allocate `n` fresh indices for the given sort, returning the first allocated index.
@@ -708,16 +777,86 @@ impl Canonizer {
         }
     }
 
-    /// Computes the canonical form of `self.term` under the given canonicalizing substitution, returning the canonicalized term and the final substitution.
-    fn canonize(&mut self) -> (LNTerm, Subst<LNLit, LNLit>) {
-        unimplemented!()
+    /// Computes the canonical form of `self.term`: drives [`Self::next_literals`]
+    /// / [`Self::canonize_literal`] to exhaustion to build every candidate
+    /// renaming, then applies each renaming and keeps the lexicographically
+    /// smallest result, which is automatically in `CAN_AC` normal form since
+    /// [`apply_literal_renaming`] rebuilds through the term's smart
+    /// constructors (Algorithm 1, `CAN_alphaeqac`, `work.tex`).
+    fn canonize(&mut self) -> (LNTerm, BTreeMap<LNLit, LNLit>) {
+        while let Some(lits) = self.next_literals() {
+            self.canonize_literals(&lits);
+        }
+
+        let term = self.term.clone();
+        let candidates = std::mem::take(&mut self.subst);
+        self.considered_permutations = candidates.len();
+        candidates
+            .into_iter()
+            .map(|subst| {
+                let canon_term = apply_literal_renaming(&term, &subst);
+                (canon_term, subst)
+            })
+            .min_by(|(a, _), (b, _)| a.cmp(b))
+            .expect("Canonizer::subst always holds at least one candidate renaming")
+    }
+}
+
+/// The canonical variable of `sort` at index `idx`, per `work.tex`'s naming
+/// scheme (`mv_i`/`fv_i`/`pv_i`/`tv_i`/`nv_i` for msg/fresh/pub/node/nat).
+fn canonical_var(sort: LSort, idx: u64) -> LVar {
+    let name = match sort {
+        LSort::Msg => "mv",
+        LSort::Fresh => "fv",
+        LSort::Pub => "pv",
+        LSort::Node => "tv",
+        LSort::Nat => "nv",
+    };
+    LVar::new(name, sort, idx)
+}
+
+/// The canonical name of `sort` at index `idx`, per `work.tex`'s naming
+/// scheme (`fn_i`/`pn_i`/`tn_i`/`nn_i` for fresh/pub/node/nat names). Since
+/// `Name` has no separate index field like `LVar` does, the index is baked
+/// into the name string. Msg-sorted names only arise from the `Abbrev` tag,
+/// which never occurs in a parsed or solved term; the `mn_i` case is
+/// included only for totality.
+fn canonical_name(sort: LSort, idx: u64) -> Name {
+    let (tag, prefix) = match sort {
+        LSort::Fresh => (NameTag::Fresh, "fn"),
+        LSort::Pub => (NameTag::Pub, "pn"),
+        LSort::Node => (NameTag::Node, "tn"),
+        LSort::Nat => (NameTag::Nat, "nn"),
+        LSort::Msg => (NameTag::Abbrev, "mn"),
+    };
+    Name::new(tag, format!("{prefix}{idx}"))
+}
+
+/// Applies a literal-to-literal renaming to `t`, rebuilding through the
+/// term's smart constructors ([`f_app`]) so the result stays in `CAN_AC`
+/// normal form. Literals outside `ren`'s domain are left unchanged.
+fn apply_literal_renaming(t: &LNTerm, ren: &BTreeMap<LNLit, LNLit>) -> LNTerm {
+    match t {
+        Term::Lit(l) => Term::Lit(*ren.get(l).unwrap_or(l)),
+        Term::App(sym, args) => {
+            let mapped: Vec<LNTerm> = args
+                .iter()
+                .map(|a| apply_literal_renaming(a, ren))
+                .collect();
+            f_app(*sym, mapped)
+        }
     }
 }
 
 /// Canonize `t` with respect to $\alphaeqac$: two terms are $\alphaeqac$ iff
 /// their canonical forms are syntactically equal (`thm:can_alphaeqac_can2`).
-pub fn canonicalize_alpha_eq_ac(_t: &LNTerm, _subst: Subst<LNLit, LNLit>) -> LNTerm {
-    unimplemented!()
+///
+/// `subst` is reserved for seeding the canonization with literals already
+/// canonized elsewhere (needed to lift this to facts and rule instances that
+/// share a labelling across several terms, per TODO.md); it is not yet wired
+/// up, so it is currently ignored.
+pub fn canonicalize_alpha_eq_ac(t: &LNTerm, _subst: Subst<LNLit, LNLit>) -> LNTerm {
+    Canonizer::new(t).canonize().0
 }
 
 #[cfg(test)]
@@ -744,10 +883,48 @@ mod tests {
         NoEqSym::new(name, arity, Privacy::Public, Constructability::Constructor)
     }
 
+    /// Canonizes `t1` and `t2` independently and asserts that each
+    /// considered exactly its expected number of candidate permutations
+    /// (`expected_perms1` for `t1`, `expected_perms2` for `t2` —
+    /// `considered_permutations()` is a pure function of a term's worklist
+    /// shape (position/sort structure), not of the literals' names, so two
+    /// terms only ever agree on this count when their worklist shapes
+    /// agree, which is not implied by them being alpha-eq-AC or not: e.g.
+    /// two non-alpha-eq-AC terms can still land in the same-size AC group
+    /// and so need the same count, per `noeq_position_sort_mismatch_not_alpha_eq`).
+    /// Returns the two canonical forms so callers still make their own
+    /// `assert_eq!`/`assert_ne!` call on them, matching whichever
+    /// equivalence the test is pinning down.
+    fn canonize_and_assert_perms(
+        t1: &LNTerm,
+        t2: &LNTerm,
+        expected_perms1: usize,
+        expected_perms2: usize,
+    ) -> (LNTerm, LNTerm) {
+        let mut c1 = Canonizer::new(t1);
+        let mut c2 = Canonizer::new(t2);
+        let (ct1, _) = c1.canonize();
+        let (ct2, _) = c2.canonize();
+        assert_eq!(
+            c1.considered_permutations(),
+            expected_perms1,
+            "t1 considered {} permutations, expected {}",
+            c1.considered_permutations(),
+            expected_perms1
+        );
+        assert_eq!(
+            c2.considered_permutations(),
+            expected_perms2,
+            "t2 considered {} permutations, expected {}",
+            c2.considered_permutations(),
+            expected_perms2
+        );
+        (ct1, ct2)
+    }
+
     // -- 1) NoEq-only terms: renaming variables of the same sort is alpha
     //    equivalent, no AC involved. --------------------------------------
     #[test]
-    #[ignore = "canonicalize_alpha_eq_ac not yet implemented"]
     fn noeq_vars_renamed_are_alpha_eq() {
         let f = no_eq_sym("f", 2);
         let t1 = f_app_no_eq(
@@ -770,84 +947,75 @@ mod tests {
                 v("u", LSort::Node),
             ],
         );
-        assert_eq!(
-            canonicalize_alpha_eq_ac(&t1, Subst::empty()),
-            canonicalize_alpha_eq_ac(&t2, Subst::empty())
-        );
+        // Perms: 1 both
+        let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 1, 1);
+        assert_eq!(ct1, ct2);
     }
 
     // -- 2) Same as 1) but the outer symbol is AC (`xor`, work.tex's
     //    `\oplus`). Cf. \Cref{ex:ex1canon}: `xor(a,b)` and `xor(x,y)` (all
     //    `msg`) are $\alphaeqac$ via `{a -> y, b -> x}`. ---------------------
     #[test]
-    #[ignore = "canonicalize_alpha_eq_ac not yet implemented"]
     fn ac_vars_renamed_are_alpha_eq() {
         let t1 = xor(v("a", LSort::Msg), v("b", LSort::Msg));
         let t2 = xor(v("x", LSort::Msg), v("y", LSort::Msg));
-        assert_eq!(
-            canonicalize_alpha_eq_ac(&t1, Subst::empty()),
-            canonicalize_alpha_eq_ac(&t2, Subst::empty())
-        );
+        // Perms: 2 both
+        let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 2, 2);
+        assert_eq!(ct1, ct2);
     }
 
     // -- 3) Same as 1) but the outer symbol is C (`emap`), i.e. commutative
     //    but not associative. ----------------------------------------------
     #[test]
-    #[ignore = "canonicalize_alpha_eq_ac not yet implemented"]
     fn c_vars_renamed_are_alpha_eq() {
         let t1 = emap(v("x", LSort::Msg), v("y", LSort::Msg));
         let t2 = emap(v("a", LSort::Msg), v("b", LSort::Msg));
-        assert_eq!(
-            canonicalize_alpha_eq_ac(&t1, Subst::empty()),
-            canonicalize_alpha_eq_ac(&t2, Subst::empty())
-        );
+        // Perms: 2 both
+        let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 2, 2);
+        assert_eq!(ct1, ct2);
     }
 
     // -- 4) NoEq: same shape as 1) but the sort at each position differs
     //    between the two terms, so no sort-respecting renaming can make them
     //    equal — positions matter for a non-AC symbol. ----------------------
     #[test]
-    #[ignore = "canonicalize_alpha_eq_ac not yet implemented"]
     fn noeq_position_sort_mismatch_not_alpha_eq() {
         let f = no_eq_sym("f", 2);
         let t1 = f_app_no_eq(f, vec![v("x", LSort::Msg), v("y", LSort::Fresh)]);
         let t2 = f_app_no_eq(f, vec![v("a", LSort::Fresh), v("b", LSort::Msg)]);
-        assert_ne!(
-            canonicalize_alpha_eq_ac(&t1, Subst::empty()),
-            canonicalize_alpha_eq_ac(&t2, Subst::empty())
-        );
+        // Perms: 1 both
+        let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 1, 1);
+        assert_ne!(ct1, ct2);
     }
 
     // -- 5) AC: swapping argument ORDER never breaks $\alphaeqac$ (that is
     //    the whole point of AC canonization), so the mismatch has to come
     //    from a different MULTISET of sorts: `{msg, msg}` vs `{msg, fresh}`.
     #[test]
-    #[ignore = "canonicalize_alpha_eq_ac not yet implemented"]
     fn ac_sort_multiset_mismatch_not_alpha_eq() {
         let t1 = xor(v("x", LSort::Msg), v("y", LSort::Msg));
         let t2 = xor(v("a", LSort::Msg), v("b", LSort::Fresh));
-        assert_ne!(
-            canonicalize_alpha_eq_ac(&t1, Subst::empty()),
-            canonicalize_alpha_eq_ac(&t2, Subst::empty())
-        );
+        // Perms: 2 for t1, 1 for t2 — t1 is the same shape as
+        // `ac_vars_renamed_are_alpha_eq`'s term (2 same-sort vars in one AC
+        // group, hence 2!), while t2's differing sorts split into two
+        // singleton buckets (no permutation choice each).
+        let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 2, 1);
+        assert_ne!(ct1, ct2);
     }
 
     // -- 6) Same reasoning as 5) for a C symbol. -----------------------------
     #[test]
-    #[ignore = "canonicalize_alpha_eq_ac not yet implemented"]
     fn c_sort_multiset_mismatch_not_alpha_eq() {
         let t1 = emap(v("x", LSort::Msg), v("y", LSort::Msg));
         let t2 = emap(v("a", LSort::Msg), v("b", LSort::Fresh));
-        assert_ne!(
-            canonicalize_alpha_eq_ac(&t1, Subst::empty()),
-            canonicalize_alpha_eq_ac(&t2, Subst::empty())
-        );
+        // Perms: 2 for t1, 1 for t2 — same reasoning as 5).
+        let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 2, 1);
+        assert_ne!(ct1, ct2);
     }
 
     // -- 7) Idempotence (\Cref{can1} / \Cref{thm:can_alphaeqac_can1}), on the
     //    worked AC example \Cref{ex:ac_canon}: `f(xor(c,d), xor(a,c), a)`.
     #[test]
-    #[ignore = "canonicalize_alpha_eq_ac not yet implemented"]
     fn canon_is_idempotent() {
         let f = no_eq_sym("f", 3);
         let a = v("a", LSort::Msg);
@@ -855,8 +1023,12 @@ mod tests {
         let d = v("d", LSort::Msg);
         let t = f_app_no_eq(f, vec![xor(c.clone(), d), xor(a.clone(), c), a]);
         let once = canonicalize_alpha_eq_ac(&t, Subst::empty());
-        let twice = canonicalize_alpha_eq_ac(&once, Subst::empty());
-        assert_eq!(once, twice);
+        // Perms: 1 both — "both" here means both applications of `canonize`
+        // (on `t` and on its canonical form `once`), since idempotence is
+        // about one term's canonization being a fixed point, not a
+        // comparison between two different terms.
+        let (ct, ct_once) = canonize_and_assert_perms(&t, &once, 1, 1);
+        assert_eq!(ct, ct_once);
     }
 
     // -- 8) \Cref{ex:wrong_ac_canon}: `f(xor(a,b), a)` and `f(xor(x,y), y)`
@@ -866,7 +1038,6 @@ mod tests {
     //    discussion right after the example). This regression-tests that
     //    our implementation propagates the renaming of `a` correctly.
     #[test]
-    #[ignore = "canonicalize_alpha_eq_ac not yet implemented"]
     fn wrong_ac_canon_example_propagates_shared_literal() {
         let f = no_eq_sym("f", 2);
         let a = v("a", LSort::Msg);
@@ -875,17 +1046,15 @@ mod tests {
         let y = v("y", LSort::Msg);
         let t1 = f_app_no_eq(f, vec![xor(a.clone(), b), a]);
         let t2 = f_app_no_eq(f, vec![xor(x, y.clone()), y]);
-        assert_eq!(
-            canonicalize_alpha_eq_ac(&t1, Subst::empty()),
-            canonicalize_alpha_eq_ac(&t2, Subst::empty())
-        );
+        // Perms: 1 both
+        let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 1, 1);
+        assert_eq!(ct1, ct2);
     }
 
     // -- 9) AC associativity/flattening interacting with renaming: two
     //    different nestings of the same three (differently named) literals
     //    under `xor` flatten to the same multiset and must canonize equal.
     #[test]
-    #[ignore = "canonicalize_alpha_eq_ac not yet implemented"]
     fn ac_associativity_flattening_alpha_eq() {
         let t1 = xor(
             xor(v("a", LSort::Msg), v("b", LSort::Msg)),
@@ -895,25 +1064,22 @@ mod tests {
             v("x", LSort::Msg),
             xor(v("y", LSort::Msg), v("z", LSort::Msg)),
         );
-        assert_eq!(
-            canonicalize_alpha_eq_ac(&t1, Subst::empty()),
-            canonicalize_alpha_eq_ac(&t2, Subst::empty())
-        );
+        // Perms: 6 both
+        let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 6, 6);
+        assert_eq!(ct1, ct2);
     }
 
     // -- 10) Literals are names ($\mathcal{N}$) as well as variables
     //    ($\mathcal{V}$); renaming a fresh NAME constant must be handled the
     //    same way as renaming a variable.
     #[test]
-    #[ignore = "canonicalize_alpha_eq_ac not yet implemented"]
     fn fresh_names_renamed_are_alpha_eq() {
         let f = no_eq_sym("f", 1);
         let t1 = f_app_no_eq(f, vec![fresh_term("n")]);
         let t2 = f_app_no_eq(f, vec![fresh_term("m")]);
-        assert_eq!(
-            canonicalize_alpha_eq_ac(&t1, Subst::empty()),
-            canonicalize_alpha_eq_ac(&t2, Subst::empty())
-        );
+        // Perms: 1 both
+        let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 1, 1);
+        assert_eq!(ct1, ct2);
     }
 
     // -- 11) A name and a variable of the SAME sort are not interchangeable:
@@ -922,47 +1088,40 @@ mod tests {
     //    families, e.g. `fn_i` for fresh names vs `fv_i` for fresh
     //    variables), so the two terms below must canonize differently.
     #[test]
-    #[ignore = "canonicalize_alpha_eq_ac not yet implemented"]
     fn name_and_variable_of_same_sort_not_interchangeable() {
         let f = no_eq_sym("f", 1);
         let t1 = f_app_no_eq(f, vec![fresh_term("n")]);
         let t2 = f_app_no_eq(f, vec![v("x", LSort::Fresh)]);
-        assert_ne!(
-            canonicalize_alpha_eq_ac(&t1, Subst::empty()),
-            canonicalize_alpha_eq_ac(&t2, Subst::empty())
-        );
+        // Perms: 1 both
+        let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 1, 1);
+        assert_ne!(ct1, ct2);
     }
 
     // -- 12) AC: the same MULTISET of sorts at swapped argument positions —
     //    i.e. commutativity itself, not just a per-position rename — must
     //    still canonize equal: `xor(a:msg, b:pub) ~ xor(f:pub, g:msg)`.
     #[test]
-    #[ignore = "canonicalize_alpha_eq_ac not yet implemented"]
     fn ac_swap_position_with_matching_sorts_alpha_eq() {
         let t1 = xor(v("a", LSort::Msg), v("b", LSort::Pub));
         let t2 = xor(v("f", LSort::Pub), v("g", LSort::Msg));
-        assert_eq!(
-            canonicalize_alpha_eq_ac(&t1, Subst::empty()),
-            canonicalize_alpha_eq_ac(&t2, Subst::empty())
-        );
+        // Perms: 1 both
+        let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 1, 1);
+        assert_eq!(ct1, ct2);
     }
 
     // -- 13) Same commutativity property for a C symbol (`emap`). -----------
     #[test]
-    #[ignore = "canonicalize_alpha_eq_ac not yet implemented"]
     fn c_swap_position_with_matching_sorts_alpha_eq() {
         let t1 = emap(v("a", LSort::Msg), v("b", LSort::Pub));
         let t2 = emap(v("f", LSort::Pub), v("g", LSort::Msg));
-        assert_eq!(
-            canonicalize_alpha_eq_ac(&t1, Subst::empty()),
-            canonicalize_alpha_eq_ac(&t2, Subst::empty())
-        );
+        // Perms: 1 both
+        let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 1, 1);
+        assert_eq!(ct1, ct2);
     }
 
     // -- 14) An AC term covering all five `LSort`s at once, permuted in both
     //    argument order and literal naming between `t1` and `t2`.
     #[test]
-    #[ignore = "canonicalize_alpha_eq_ac not yet implemented"]
     fn ac_all_sorts_alpha_eq() {
         use crate::function_symbols::AcSym;
         use crate::term::f_app_ac;
@@ -987,10 +1146,9 @@ mod tests {
                 v("z", LSort::Msg),
             ],
         );
-        assert_eq!(
-            canonicalize_alpha_eq_ac(&t1, Subst::empty()),
-            canonicalize_alpha_eq_ac(&t2, Subst::empty())
-        );
+        // Perms: 1 both
+        let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 1, 1);
+        assert_eq!(ct1, ct2);
     }
 
     /// Extracts the literal out of a term built by [`v`] (a bare variable).
@@ -1158,5 +1316,74 @@ mod tests {
         assert_eq!(got, vec![vec![lit_of(&c)], vec![lit_of(&a), lit_of(&b)]]);
         assert!(canon.buckets.is_empty());
         assert!(canon.remaining.is_empty());
+    }
+
+    /// A canonical msg variable `mv_idx`, per `work.tex`'s naming scheme
+    /// (indices here are 0-based, matching [`Canonizer`]'s fresh-index
+    /// counters, rather than the chapter's 1-based `mv_1, mv_2, ...`).
+    fn mv(idx: u64) -> LNTerm {
+        var_term(LVar::new("mv", LSort::Msg, idx))
+    }
+
+    // -- 20) `Canonizer::canonize`, pinned to \Cref{table:canon_ex1}'s exact
+    //    execution of $t = f(\oplus(a, b, g(c, d)), d)$: `c` and `d` are
+    //    singletons canonized first (in that order, per `next_literals`'
+    //    already-tested schedule), leaving `{a, b}` as the only AC group
+    //    still needing a permutation choice. Both permutations collapse to
+    //    the same `CAN_AC`-sorted result here since `a`/`b` occur nowhere
+    //    else in `t`, so the canonical form is pinned exactly (0-based
+    //    counterpart of the table's `f(\oplus(mv_3, mv_4, g(mv_1, mv_2)),
+    //    mv_2)`).
+    #[test]
+    fn canonize_follows_work_tex_table_example() {
+        let g = no_eq_sym("g", 2);
+        let f = no_eq_sym("f", 2);
+        let (a, b) = (v("a", LSort::Msg), v("b", LSort::Msg));
+        let (c, d) = (v("c", LSort::Msg), v("d", LSort::Msg));
+        let inner_g = f_app_no_eq(g, vec![c, d.clone()]);
+        let group = xor(xor(a, b), inner_g);
+        let t = f_app_no_eq(f, vec![group, d]);
+
+        let mut canon = Canonizer::new(&t);
+        let (canon_term, subst) = canon.canonize();
+
+        let want = f_app_no_eq(
+            f,
+            vec![
+                xor(xor(mv(2), mv(3)), f_app_no_eq(g, vec![mv(0), mv(1)])),
+                mv(1),
+            ],
+        );
+        assert_eq!(canon_term, want);
+        assert_eq!(subst.len(), 4);
+        // Perms: 2
+        assert_eq!(canon.considered_permutations(), 2);
+    }
+
+    // -- 21) `Canonizer::canonize`, pinned to \Cref{ex:ac_canon}: $t =
+    //    f(\oplus(c, d), \oplus(a, c), a)$. `a` is canonized first (it is a
+    //    singleton at position `f2`), which shrinks `\oplus(a, c)` to the
+    //    singleton `c`, which in turn shrinks `\oplus(c, d)` to the
+    //    singleton `d` — no permutation is ever considered, matching the
+    //    chapter's point that tracking remaining-literal counts per position
+    //    avoids the combinatorial fallback from \Cref{ex:naive_ac_canon}.
+    //    0-based counterpart of the chapter's `f(\oplus(mv_2, mv_3),
+    //    \oplus(mv_1, mv_2), mv_1)`.
+    #[test]
+    fn canonize_follows_work_tex_ac_canon_example() {
+        let f = no_eq_sym("f", 3);
+        let a = v("a", LSort::Msg);
+        let c = v("c", LSort::Msg);
+        let d = v("d", LSort::Msg);
+        let t = f_app_no_eq(f, vec![xor(c.clone(), d), xor(a.clone(), c), a]);
+
+        let mut canon = Canonizer::new(&t);
+        let (canon_term, subst) = canon.canonize();
+
+        let want = f_app_no_eq(f, vec![xor(mv(1), mv(2)), xor(mv(0), mv(1)), mv(0)]);
+        assert_eq!(canon_term, want);
+        assert_eq!(subst.len(), 3);
+        // Perms: 1
+        assert_eq!(canon.considered_permutations(), 1);
     }
 }
