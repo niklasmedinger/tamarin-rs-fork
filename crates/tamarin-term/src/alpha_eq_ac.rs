@@ -557,6 +557,14 @@ impl Canonizer {
 
         // SAFETY: Safe to unwrap since !candidate_positions.is_empty() is asserted above.
         let next_pos = candidate_positions.pop_first().unwrap();
+        // Put the rest of the bucket back before updating, so the update pass
+        // sees every still-bucketed position and can relocate the ones it
+        // affects. `next_pos` stays detached: it is fully canonized for
+        // `k.sort` and must not re-enter a bucket of that sort.
+        if !candidate_positions.is_empty() {
+            self.buckets.insert(k, candidate_positions);
+        }
+
         // Get the literals of the next position. Can still contain literals that are not of the sort of the bucket key.
         let next_pos_all_lits = self.remaining.get(&next_pos);
         assert!(
@@ -590,36 +598,94 @@ impl Canonizer {
                 self.occurs_in[lit]
             );
             assert!(k.sort == lit.sort(), "bucket queue invariant violated: literal {:?} has sort {:?} but bucket key has sort {:?}", lit, lit.sort(), k.sort);
-
-            // We assume that each literal will be immediately canonized, so we remove the literal from the remaining uncanonized literals of the positions it occurs in.
-            // SAFETY: The existence of the position in the occurs_in index is asserted above, so we can safely unwrap here.
-            let positions = self.occurs_in.get(lit).unwrap();
-            for position in positions.iter() {
-                let remaining = self.remaining.get_mut(position);
-                assert!(
-                    remaining.is_some(),
-                    "remaining invariant violated: position {:?} not found",
-                    position
-                );
-                let remaining = remaining.unwrap();
-                let was_present = remaining.remove(lit);
-                assert!(
-                    was_present,
-                    "remaining invariant violated: literal {:?} not found in position {:?}'s remaining uncanonized literals when trying to remove it",
-                    lit,
-                    position
-                );
-            }
         }
 
-        // TODO: Need to reinsert k with the updated candidate_positions if it's not empty todo!() } /// Canonizes a single literal, updating the canonicalizing substitution and the worklist of positions accordingly.
-        None
+        self.update_buckets_and_remaining(&next_lits, k.sort, &next_pos);
+
+        Some(next_lits)
     }
 
     /// Updates the buckets and remaining uncanonized literals after canonizing the given literals.
     /// First, updates the remaining uncanonized literals for each position that contains any of the canonized literals, deleting the position from the map if it has no remaining uncanonized literals.
     /// Then, it updates the buckets of positions by removing the position from its old bucket and inserting it into its new bucket, if it still has remaining uncanonized literals.
-    fn update_buckets_and_remaining(&mut self, lits: &[LNLit]) {}
+    ///
+    /// All of `lits` have sort `sort`, so only buckets of that sort change.
+    /// `popped` was already detached from its bucket by the caller and is
+    /// therefore only updated in `remaining`.
+    fn update_buckets_and_remaining(&mut self, lits: &[LNLit], sort: LSort, popped: &Position) {
+        // `occurs_in` is what keeps this cheap: a position can only change
+        // bucket if it mentions one of the canonized literals, so there is
+        // no need to scan the buckets of `sort` for stale entries.
+        let affected: BTreeSet<Position> = lits
+            .iter()
+            .flat_map(|l| self.occurs_in.get(l).into_iter().flatten().cloned())
+            .collect();
+
+        for p in affected {
+            let remaining = self.remaining.get_mut(&p);
+            assert!(
+                remaining.is_some(),
+                "remaining invariant violated: position {:?} not found",
+                p
+            );
+            // SAFETY: Safe to unwrap since it is asserted to be Some above.
+            let remaining = remaining.unwrap();
+
+            // The position's bucket key is a function of `remaining`, so the
+            // count before removal identifies the bucket it currently sits in.
+            let old_count = remaining.iter().filter(|l| l.sort() == sort).count();
+            for lit in lits {
+                remaining.remove(lit);
+            }
+            let new_count = remaining.iter().filter(|l| l.sort() == sort).count();
+            let now_empty = remaining.is_empty();
+            assert!(
+                new_count < old_count,
+                "occurs_in invariant violated: position {:?} was reported to contain one of {:?} but none was removed",
+                p,
+                lits
+            );
+
+            if now_empty {
+                self.remaining.remove(&p);
+            }
+
+            if p != *popped {
+                let old_key = BucketKey {
+                    count: old_count,
+                    sort,
+                };
+                let old_bucket = self.buckets.get_mut(&old_key);
+                assert!(
+                    old_bucket.is_some(),
+                    "bucket queue invariant violated: no bucket {:?} for position {:?}",
+                    old_key,
+                    p
+                );
+                // SAFETY: Safe to unwrap since it is asserted to be Some above.
+                let old_bucket = old_bucket.unwrap();
+                let was_present = old_bucket.remove(&p);
+                assert!(
+                    was_present,
+                    "bucket queue invariant violated: position {:?} not found in its bucket {:?}",
+                    p, old_key
+                );
+                if old_bucket.is_empty() {
+                    self.buckets.remove(&old_key);
+                }
+            }
+
+            if new_count > 0 {
+                self.buckets
+                    .entry(BucketKey {
+                        count: new_count,
+                        sort,
+                    })
+                    .or_default()
+                    .insert(p);
+            }
+        }
+    }
 
     fn canonize_literal(&mut self, lit: &LNLit) {
         unimplemented!();
@@ -1007,5 +1073,90 @@ mod tests {
 
         assert_eq!(wl.occurs_in[&lit_of(&c)], c_positions);
         assert_eq!(wl.occurs_in[&lit_of(&a)], a_positions);
+    }
+
+    // -- 17) Driving `next_literals` to exhaustion on \Cref{table:canon_ex1}'s
+    //    `t = f(xor(a, b, g(c,d)), d)` must reproduce that table's execution:
+    //    `c` first (singleton at the lexicographically smallest position),
+    //    then `d`, then the pair `{a, b}` at the AC group. -------------------
+    #[test]
+    fn next_literals_follows_work_tex_example() {
+        let g = no_eq_sym("g", 2);
+        let f = no_eq_sym("f", 2);
+        let (a, b) = (v("a", LSort::Msg), v("b", LSort::Msg));
+        let (c, d) = (v("c", LSort::Msg), v("d", LSort::Msg));
+        let inner_g = f_app_no_eq(g, vec![c.clone(), d.clone()]);
+        let group = xor(xor(a.clone(), b.clone()), inner_g);
+        let t = f_app_no_eq(f, vec![group, d.clone()]);
+
+        let mut canon = Canonizer::new(&t);
+        let mut got = Vec::new();
+        while let Some(lits) = canon.next_literals() {
+            got.push(lits);
+        }
+
+        assert_eq!(
+            got,
+            vec![
+                vec![lit_of(&c)],
+                vec![lit_of(&d)],
+                vec![lit_of(&a), lit_of(&b)],
+            ]
+        );
+        assert!(canon.buckets.is_empty());
+        assert!(canon.remaining.is_empty());
+    }
+
+    // -- 18) The relocation path: on \Cref{ex:wrong_ac_canon}'s
+    //    `f(xor(a, b), a)`, canonizing `a` at the singleton position `f1`
+    //    drops the AC group from 2 uncanonized msg literals to 1, so that
+    //    position must MOVE from bucket `(2, Msg)` to `(1, Msg)` rather
+    //    than be dropped. ----------------------------------------------------
+    #[test]
+    fn next_literals_relocates_position_to_smaller_bucket() {
+        let f = no_eq_sym("f", 2);
+        let (a, b) = (v("a", LSort::Msg), v("b", LSort::Msg));
+        let t = f_app_no_eq(f, vec![xor(a.clone(), b.clone()), a.clone()]);
+
+        let mut canon = Canonizer::new(&t);
+        assert_eq!(canon.next_literals(), Some(vec![lit_of(&a)]));
+
+        // `a` was shared, so the AC group relocated instead of vanishing.
+        let group_pos = vec![PosStep::Arg(0), PosStep::AcGroup(None)];
+        assert_eq!(
+            canon.buckets,
+            BTreeMap::from([(
+                BucketKey {
+                    count: 1,
+                    sort: LSort::Msg
+                },
+                BTreeSet::from([group_pos])
+            )])
+        );
+
+        assert_eq!(canon.next_literals(), Some(vec![lit_of(&b)]));
+        assert_eq!(canon.next_literals(), None);
+        assert!(canon.remaining.is_empty());
+    }
+
+    // -- 19) One position, two sorts: it sits in a `Fresh` and a `Msg`
+    //    bucket at once, so it survives the first pop (which only clears
+    //    its `Fresh` literal) and is popped again for its `Msg` ones. -------
+    #[test]
+    fn next_literals_drains_one_position_per_sort() {
+        let (a, b) = (v("a", LSort::Msg), v("b", LSort::Msg));
+        let c = v("c", LSort::Fresh);
+        let t = xor(xor(a.clone(), b.clone()), c.clone());
+
+        let mut canon = Canonizer::new(&t);
+        let mut got = Vec::new();
+        while let Some(lits) = canon.next_literals() {
+            got.push(lits);
+        }
+
+        // `(1, Fresh)` sorts before `(2, Msg)`: count first, then sort.
+        assert_eq!(got, vec![vec![lit_of(&c)], vec![lit_of(&a), lit_of(&b)]]);
+        assert!(canon.buckets.is_empty());
+        assert!(canon.remaining.is_empty());
     }
 }
