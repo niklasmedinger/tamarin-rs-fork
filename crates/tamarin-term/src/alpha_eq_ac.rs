@@ -856,6 +856,7 @@ fn apply_literal_renaming(t: &LNTerm, ren: &BTreeMap<LNLit, LNLit>) -> LNTerm {
 /// share a labelling across several terms, per TODO.md); it is not yet wired
 /// up, so it is currently ignored.
 pub fn canonicalize_alpha_eq_ac(t: &LNTerm, _subst: Subst<LNLit, LNLit>) -> LNTerm {
+    // TODO: Return the canonical substitution too if we need it
     Canonizer::new(t).canonize().0
 }
 

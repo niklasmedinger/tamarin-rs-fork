@@ -46,6 +46,9 @@
 //! - [`auto_sources`] ← `OpenTheory` `addAutoSourcesLemma` (`--auto-sources`)
 //! - [`module`] ← `Theory.Module` (the `--output-module` selector)
 //! - [`state_trace`] ← solver state tracing
+//! - [`canon`] ← (no HS analog) lifts `tamarin_term::alpha_eq_ac`'s
+//!   canonization of terms for $\alphaeqac$ to facts and rules, per
+//!   `work.tex`'s "Canonization of Facts and Rule Instances"
 //!
 //! The `.spthy` parser lives in the sibling `tamarin-parser` crate.
 //!
@@ -54,6 +57,7 @@
 
 pub mod atom;
 pub mod auto_sources;
+pub mod canon;
 pub mod check_terms;
 pub mod close_rule;
 pub mod constraint;
