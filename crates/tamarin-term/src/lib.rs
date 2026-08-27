@@ -3,6 +3,9 @@
 //! Modules ported (mapping to Haskell):
 //! - [`alpha_eq_ac`] ← (no HS analog) canonization of terms for
 //!   $\alphaeqac$, per `work.tex`'s "Canonization of Constraint Systems"
+//! - [`fingerprint`] ← (no HS analog) deterministic content fingerprinting
+//!   of an already-canonical term, so a proof search can keep a compact
+//!   stand-in instead of the full object
 //! - [`function_symbols`] ← `Term.Term.FunctionSymbols`
 //! - [`term`] ← `Term.Term.Raw` (raw term type + AC-normalising smart constructors)
 //! - [`vterm`] ← `Term.VTerm` (`Lit<C, V>` and helpers)
@@ -38,6 +41,7 @@
 #[allow(dead_code)]
 pub mod alpha_eq_ac;
 pub mod builtin;
+pub mod fingerprint;
 pub mod function_symbols;
 pub mod intern;
 pub mod lterm;

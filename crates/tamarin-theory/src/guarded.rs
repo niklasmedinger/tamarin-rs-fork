@@ -531,7 +531,7 @@ fn term_class(t: &GTerm) -> (u8, u8) {
 /// Mirrors HS's `MaudeSig`-attribute classification: Mult, Union, Xor,
 /// NatPlus and the user-declared `[AC]` symbols are AC; Exp is NOT
 /// (right-associative algebraic).
-fn is_ac_binop(o: &p::BinOp) -> bool {
+pub(crate) fn is_ac_binop(o: &p::BinOp) -> bool {
     use p::BinOp::*;
     matches!(o, Mult | Union | Xor | NatPlus | AcFct(_))
 }
@@ -541,7 +541,7 @@ fn is_ac_binop(o: &p::BinOp) -> bool {
 /// Non-matching outer terms are pushed verbatim (no recursion into
 /// nested non-Union/non-same-op subtrees).  Borrowing keeps the hot
 /// `cmp_term` AC branch allocation-free per operand.
-fn flatten_ac_binop<'a>(op: &p::BinOp, t: &'a GTerm, out: &mut Vec<&'a GTerm>) {
+pub(crate) fn flatten_ac_binop<'a>(op: &p::BinOp, t: &'a GTerm, out: &mut Vec<&'a GTerm>) {
     match t {
         GTerm::BinOp(inner_op, l, r) if inner_op == op => {
             flatten_ac_binop(op, l, out);
@@ -1301,7 +1301,7 @@ fn term_var_keys(t: &p::Term, temporal: bool, out: &mut Vec<VarKey>) {
 /// quantifier blocks, and traversal order.  Guards of a `GGuarded` are
 /// mapped — and the body recursed — at `depth + vars.len()`, so an atom
 /// under `n` binders is always handed `depth == n`.
-fn map_guarded_atoms<F: FnMut(u32, &GAtom) -> GAtom>(g: &Guarded, f: &mut F) -> Guarded {
+pub(crate) fn map_guarded_atoms<F: FnMut(u32, &GAtom) -> GAtom>(g: &Guarded, f: &mut F) -> Guarded {
     fn rec<F: FnMut(u32, &GAtom) -> GAtom>(g: &Guarded, depth: u32, f: &mut F) -> Guarded {
         match g {
             Guarded::Atom(a) => Guarded::Atom(f(depth, a)),

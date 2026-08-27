@@ -16,6 +16,7 @@ pub mod dot;
 /// `#[macro_export]`; this (private) module just holds its definition.
 mod env_gate;
 pub mod env_tracer;
+pub mod fingerprint;
 pub mod fresh;
 pub mod logic;
 pub mod misc;

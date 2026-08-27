@@ -860,6 +860,12 @@ pub fn canonicalize_alpha_eq_ac(t: &LNTerm, _subst: Subst<LNLit, LNLit>) -> LNTe
     Canonizer::new(t).canonize().0
 }
 
+// `Fingerprint`/`fingerprint_term` now live in `crate::fingerprint` (SHA-256,
+// a Merkle hash over the term's structure — no seed, so it's reproducible
+// across processes/runs, unlike `std`'s default hasher family). Re-exported
+// here under their original path so existing callers/tests are unaffected.
+pub use crate::fingerprint::{fingerprint_term, Fingerprint};
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -951,6 +957,7 @@ mod tests {
         // Perms: 1 both
         let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 1, 1);
         assert_eq!(ct1, ct2);
+        assert_eq!(fingerprint_term(&ct1), fingerprint_term(&ct2));
     }
 
     // -- 2) Same as 1) but the outer symbol is AC (`xor`, work.tex's
@@ -963,6 +970,7 @@ mod tests {
         // Perms: 2 both
         let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 2, 2);
         assert_eq!(ct1, ct2);
+        assert_eq!(fingerprint_term(&ct1), fingerprint_term(&ct2));
     }
 
     // -- 3) Same as 1) but the outer symbol is C (`emap`), i.e. commutative
@@ -974,6 +982,7 @@ mod tests {
         // Perms: 2 both
         let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 2, 2);
         assert_eq!(ct1, ct2);
+        assert_eq!(fingerprint_term(&ct1), fingerprint_term(&ct2));
     }
 
     // -- 4) NoEq: same shape as 1) but the sort at each position differs
@@ -1030,6 +1039,7 @@ mod tests {
         // comparison between two different terms.
         let (ct, ct_once) = canonize_and_assert_perms(&t, &once, 1, 1);
         assert_eq!(ct, ct_once);
+        assert_eq!(fingerprint_term(&ct), fingerprint_term(&ct_once));
     }
 
     // -- 8) \Cref{ex:wrong_ac_canon}: `f(xor(a,b), a)` and `f(xor(x,y), y)`
@@ -1050,6 +1060,7 @@ mod tests {
         // Perms: 1 both
         let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 1, 1);
         assert_eq!(ct1, ct2);
+        assert_eq!(fingerprint_term(&ct1), fingerprint_term(&ct2));
     }
 
     // -- 9) AC associativity/flattening interacting with renaming: two
@@ -1068,6 +1079,7 @@ mod tests {
         // Perms: 6 both
         let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 6, 6);
         assert_eq!(ct1, ct2);
+        assert_eq!(fingerprint_term(&ct1), fingerprint_term(&ct2));
     }
 
     // -- 10) Literals are names ($\mathcal{N}$) as well as variables
@@ -1081,6 +1093,7 @@ mod tests {
         // Perms: 1 both
         let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 1, 1);
         assert_eq!(ct1, ct2);
+        assert_eq!(fingerprint_term(&ct1), fingerprint_term(&ct2));
     }
 
     // -- 11) A name and a variable of the SAME sort are not interchangeable:
@@ -1108,6 +1121,7 @@ mod tests {
         // Perms: 1 both
         let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 1, 1);
         assert_eq!(ct1, ct2);
+        assert_eq!(fingerprint_term(&ct1), fingerprint_term(&ct2));
     }
 
     // -- 13) Same commutativity property for a C symbol (`emap`). -----------
@@ -1118,6 +1132,7 @@ mod tests {
         // Perms: 1 both
         let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 1, 1);
         assert_eq!(ct1, ct2);
+        assert_eq!(fingerprint_term(&ct1), fingerprint_term(&ct2));
     }
 
     // -- 14) An AC term covering all five `LSort`s at once, permuted in both
@@ -1150,6 +1165,7 @@ mod tests {
         // Perms: 1 both
         let (ct1, ct2) = canonize_and_assert_perms(&t1, &t2, 1, 1);
         assert_eq!(ct1, ct2);
+        assert_eq!(fingerprint_term(&ct1), fingerprint_term(&ct2));
     }
 
     /// Extracts the literal out of a term built by [`v`] (a bare variable).
@@ -1356,6 +1372,7 @@ mod tests {
             ],
         );
         assert_eq!(canon_term, want);
+        assert_eq!(fingerprint_term(&canon_term), fingerprint_term(&want));
         assert_eq!(subst.len(), 4);
         // Perms: 2
         assert_eq!(canon.considered_permutations(), 2);
@@ -1383,6 +1400,7 @@ mod tests {
 
         let want = f_app_no_eq(f, vec![xor(mv(1), mv(2)), xor(mv(0), mv(1)), mv(0)]);
         assert_eq!(canon_term, want);
+        assert_eq!(fingerprint_term(&canon_term), fingerprint_term(&want));
         assert_eq!(subst.len(), 3);
         // Perms: 1
         assert_eq!(canon.considered_permutations(), 1);
