@@ -49,6 +49,10 @@
 //! - [`canon`] ← (no HS analog) lifts `tamarin_term::alpha_eq_ac`'s
 //!   canonization of terms for $\alphaeqac$ to facts and rules, per
 //!   `work.tex`'s "Canonization of Facts and Rule Instances"
+//! - [`canon_graph`] ← (no HS analog) extracts work.tex's graph part
+//!   `gp(Γ) = (V, E, c)` (vertices + structural edges; coloring is a
+//!   later stage) from a constraint `System`, per `work.tex`'s
+//!   "Canonization of Graphs of Rule Instances"
 //!
 //! The `.spthy` parser lives in the sibling `tamarin-parser` crate.
 //!
@@ -58,6 +62,8 @@
 pub mod atom;
 pub mod auto_sources;
 pub mod canon;
+pub mod canon_color;
+pub mod canon_graph;
 pub mod check_terms;
 pub mod close_rule;
 pub mod constraint;
@@ -89,6 +95,7 @@ pub mod rule_restriction;
 pub mod sapic;
 pub mod signature;
 pub mod state_trace;
+pub mod system_import;
 pub mod tactic;
 #[cfg(test)]
 pub(crate) mod test_maude;

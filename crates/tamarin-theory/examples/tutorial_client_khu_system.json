@@ -1,0 +1,314 @@
+{
+    "edges": [
+        {
+            "src": "#vf",
+            "srcIdx": 0,
+            "tgt": "#i",
+            "tgtIdx": 1
+        },
+        {
+            "src": "#vl",
+            "srcIdx": 0,
+            "tgt": "#vk",
+            "tgtIdx": 0
+        },
+        {
+            "src": "#vr",
+            "srcIdx": 0,
+            "tgt": "#i",
+            "tgtIdx": 0
+        },
+        {
+            "src": "#vf.1",
+            "srcIdx": 0,
+            "tgt": "#vr",
+            "tgtIdx": 0
+        },
+        {
+            "src": "#vr.1",
+            "srcIdx": 1,
+            "tgt": "#vr",
+            "tgtIdx": 1
+        },
+        {
+            "src": "#vf.2",
+            "srcIdx": 0,
+            "tgt": "#vr.1",
+            "tgtIdx": 0
+        },
+        {
+            "src": "#vr.2",
+            "srcIdx": 0,
+            "tgt": "#vl",
+            "tgtIdx": 0
+        },
+        {
+            "src": "#vf.3",
+            "srcIdx": 0,
+            "tgt": "#vr.2",
+            "tgtIdx": 1
+        },
+        {
+            "src": "#vr.3",
+            "srcIdx": 0,
+            "tgt": "#vr.2",
+            "tgtIdx": 0
+        },
+        {
+            "src": "#vf.4",
+            "srcIdx": 0,
+            "tgt": "#vr.3",
+            "tgtIdx": 0
+        }
+    ],
+    "eqStore": {
+        "conj": [],
+        "subst": []
+    },
+    "formulas": [
+        "∀ #r. (LtkReveal( $S ) @ #r) ⇒ ⊥"
+    ],
+    "lastAtom": null,
+    "lemmas": [
+        "∀ x y #i. (Eq( x, y ) @ #i) ⇒ x = y"
+    ],
+    "less": [
+        {
+            "larger": "#vf",
+            "reason": "Adversary",
+            "smaller": "#vk"
+        },
+        {
+            "larger": "#vk",
+            "reason": "NormalForm",
+            "smaller": "#vl"
+        },
+        {
+            "larger": "#i",
+            "reason": "Fresh",
+            "smaller": "#vr"
+        },
+        {
+            "larger": "#j",
+            "reason": "Fresh",
+            "smaller": "#vr"
+        },
+        {
+            "larger": "#vf",
+            "reason": "Fresh",
+            "smaller": "#vr"
+        },
+        {
+            "larger": "#vk",
+            "reason": "Fresh",
+            "smaller": "#vr"
+        },
+        {
+            "larger": "#vl",
+            "reason": "Fresh",
+            "smaller": "#vr"
+        },
+        {
+            "larger": "#vr.2",
+            "reason": "Fresh",
+            "smaller": "#vr"
+        },
+        {
+            "larger": "#vf.3",
+            "reason": "Fresh",
+            "smaller": "#vr"
+        },
+        {
+            "larger": "#j",
+            "reason": "Adversary",
+            "smaller": "#vk.1"
+        },
+        {
+            "larger": "#vr",
+            "reason": "Fresh",
+            "smaller": "#vr.1"
+        },
+        {
+            "larger": "#vf.3",
+            "reason": "Adversary",
+            "smaller": "#vk.2"
+        },
+        {
+            "larger": "#vr.2",
+            "reason": "Fresh",
+            "smaller": "#vr.3"
+        },
+        {
+            "larger": "#vf.3",
+            "reason": "Fresh",
+            "smaller": "#vr.3"
+        }
+    ],
+    "nodes": [
+        {
+            "actions": [
+                "SessKeyC( $S, ~k )"
+            ],
+            "conclusions": [],
+            "id": "#i",
+            "premises": [
+                "Client_1( $S, ~k )",
+                "In( h(~k) )"
+            ],
+            "ruleName": "Client_2"
+        },
+        {
+            "actions": [
+                "K( ~k )"
+            ],
+            "conclusions": [
+                "In( ~k )"
+            ],
+            "id": "#j",
+            "premises": [
+                "!KU( ~k )"
+            ],
+            "ruleName": "Send"
+        },
+        {
+            "actions": [
+                "K( h(~k) )"
+            ],
+            "conclusions": [
+                "In( h(~k) )"
+            ],
+            "id": "#vf",
+            "premises": [
+                "!KU( h(~k) )"
+            ],
+            "ruleName": "Send"
+        },
+        {
+            "actions": [
+                "!KU( h(~k) )"
+            ],
+            "conclusions": [
+                "!KU( h(~k) )"
+            ],
+            "id": "#vk",
+            "premises": [
+                "!KD( h(~k) )"
+            ],
+            "ruleName": "Coerce"
+        },
+        {
+            "actions": [],
+            "conclusions": [
+                "!KD( h(~k) )"
+            ],
+            "id": "#vl",
+            "premises": [
+                "Out( h(~k) )"
+            ],
+            "ruleName": "Recv"
+        },
+        {
+            "actions": [],
+            "conclusions": [
+                "Client_1( $S, ~k )",
+                "Out( aenc(<'1', ~k>, pk(~ltk)) )"
+            ],
+            "id": "#vr",
+            "premises": [
+                "Fr( ~k )",
+                "!Pk( $S, pk(~ltk) )"
+            ],
+            "ruleName": "Client_1"
+        },
+        {
+            "actions": [],
+            "conclusions": [
+                "Fr( ~k )"
+            ],
+            "id": "#vf.1",
+            "premises": [],
+            "ruleName": "FreshRule"
+        },
+        {
+            "actions": [],
+            "conclusions": [
+                "!Ltk( $S, ~ltk )",
+                "!Pk( $S, pk(~ltk) )"
+            ],
+            "id": "#vr.1",
+            "premises": [
+                "Fr( ~ltk )"
+            ],
+            "ruleName": "Register_pk"
+        },
+        {
+            "actions": [],
+            "conclusions": [
+                "Fr( ~ltk )"
+            ],
+            "id": "#vf.2",
+            "premises": [],
+            "ruleName": "FreshRule"
+        },
+        {
+            "actions": [
+                "Eq( '1', '1' )",
+                "AnswerRequest( $S.1, ~k )"
+            ],
+            "conclusions": [
+                "Out( h(~k) )"
+            ],
+            "id": "#vr.2",
+            "premises": [
+                "!Ltk( $S.1, ~ltkS )",
+                "In( aenc(<'1', ~k>, pk(~ltkS)) )"
+            ],
+            "ruleName": "Serv_1"
+        },
+        {
+            "actions": [
+                "K( aenc(<'1', ~k>, pk(~ltkS)) )"
+            ],
+            "conclusions": [
+                "In( aenc(<'1', ~k>, pk(~ltkS)) )"
+            ],
+            "id": "#vf.3",
+            "premises": [
+                "!KU( aenc(<'1', ~k>, pk(~ltkS)) )"
+            ],
+            "ruleName": "Send"
+        },
+        {
+            "actions": [],
+            "conclusions": [
+                "!Ltk( $S.1, ~ltkS )",
+                "!Pk( $S.1, pk(~ltkS) )"
+            ],
+            "id": "#vr.3",
+            "premises": [
+                "Fr( ~ltkS )"
+            ],
+            "ruleName": "Register_pk"
+        },
+        {
+            "actions": [],
+            "conclusions": [
+                "Fr( ~ltkS )"
+            ],
+            "id": "#vf.4",
+            "premises": [],
+            "ruleName": "FreshRule"
+        }
+    ],
+    "solvedFormulas": [
+        "'1' = '1'",
+        "∃ S k #i #j.\n (SessKeyC( S, k ) @ #i) ∧ (K( k ) @ #j)\n∧\n ∀ #r. (LtkReveal( S ) @ #r) ⇒ ⊥"
+    ],
+    "subtermStore": {
+        "contradictory": false,
+        "negSubterms": [],
+        "oldNegSubterms": [],
+        "solvedSubterms": [],
+        "subterms": []
+    }
+}
