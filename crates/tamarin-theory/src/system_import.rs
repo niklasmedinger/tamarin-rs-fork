@@ -43,8 +43,8 @@ use crate::fact::LNFact;
 use crate::guarded::{formula_to_guarded, GAtom, Guarded};
 use crate::guarded_types::gfact_to_fact;
 use crate::rule::{
-    ConcIdx, PremIdx, ProtoRuleACInstInfo, ProtoRuleName, Rule, RuleACInst, RuleAttributes,
-    RuleInfo,
+    ConcIdx, IntrRuleACInfo, PremIdx, ProtoRuleACInstInfo, ProtoRuleName, Rule, RuleACInst,
+    RuleAttributes, RuleInfo,
 };
 use crate::tools::equation_store::{EqDisj, EquationStore, LNSubst, LNSubstVFresh, SplitId};
 use crate::tools::subterm_store::{SortedPairSet, SubtermConstraint, SubtermStore};
@@ -82,30 +82,9 @@ pub fn system_from_json(json: &Value) -> Res<System> {
         let premises = parse_fact_array(n, "premises")?;
         let actions = parse_fact_array(n, "actions")?;
         let conclusions = parse_fact_array(n, "conclusions")?;
-        // KNOWN GAP, found via `canon_color`'s real-data testing: every
-        // reconstructed node is built as `RuleInfo::Proto`, even when the
-        // ORIGINAL rule was actually a built-in intruder rule
-        // (`RuleInfo::Intr`, e.g. `ISend`/`IRecv`) -- because the JSON
-        // schema's `"ruleName"` field is `getRuleName ru`
-        // (`Web/Handler.hs`), a FLATTENED string that renders both cases
-        // identically (a user protocol rule literally named `"Send"` and
-        // the built-in `ISend` rule both serialize as `"ruleName": "Send"`
-        // -- see `canon_color.rs`'s own doc comments for why this
-        // ambiguity matters for vertex coloring). A real captured system
-        // hit exactly this: NSLPK3's `Send`-named node is structurally
-        // the built-in ISend rule (premises `!KU(s)`, conclusion `In(s)`,
-        // action `K(s)`), but reconstructs here as a Proto rule, so
-        // `ColorTable::rule_color` colors it as if the theory itself
-        // declared a rule named `"Send"` rather than as the built-in.
-        // Fixing this needs `systemToJSON` to also serialize which case
-        // it is (and which `IntrRuleACInfo` variant, for the `Intr` case)
-        // -- an HS-side schema change, not attempted here.
+        let info = parse_rule_info(n, rule_name)?;
         let ru: RuleACInst = Rule::new(
-            RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(rule_name)),
-                attributes: RuleAttributes::default(),
-                loop_breakers: Vec::new(),
-            }),
+            info,
             premises,
             // `Rule::new`'s real parameter order is
             // `(info, premises, conclusions, actions)` -- NOT
@@ -159,6 +138,77 @@ pub fn system_from_json(json: &Value) -> Res<System> {
     *sys.subterm_store_mut() = parse_subterm_store(req_obj(json, "subtermStore")?)?;
 
     Ok(sys)
+}
+
+/// Reconstructs a node's `RuleInfo` from its `"ruleKind"` field (see
+/// `Web/Handler.hs`'s `ruleKindJSON` for the HS-side producer this
+/// mirrors) plus the already-parsed `"ruleName"` string. This is what
+/// closes the ambiguity `rule_name`/`getRuleName` alone cannot resolve
+/// (a built-in intruder rule and a same-named user protocol rule render
+/// identically) — see the module docs' precondition note and
+/// `crate::canon_color`'s own doc comments for why the distinction
+/// matters downstream (vertex coloring).
+///
+/// Backward compatible with a dump that predates this field: `None`
+/// (the field absent) falls back to the OLD behavior — always
+/// reconstruct as a Proto/Stand rule — so an older captured fixture (or
+/// a hand-written test JSON that doesn't care about the distinction)
+/// still round-trips.
+fn parse_rule_info(n: &Value, rule_name: &str) -> Res<RuleInfo<ProtoRuleACInstInfo, IntrRuleACInfo>> {
+    let proto = |name: ProtoRuleName| {
+        RuleInfo::Proto(ProtoRuleACInstInfo {
+            name,
+            attributes: RuleAttributes::default(),
+            loop_breakers: Vec::new(),
+        })
+    };
+    let stand = || proto(ProtoRuleName::Stand(tamarin_term::intern::intern_str(rule_name)));
+
+    let kind = match n.get("ruleKind") {
+        None => return Ok(stand()),
+        Some(k) => k,
+    };
+    let tag = req_str(kind, "tag")?;
+    match tag {
+        "Proto" => match req_str(kind, "variant")? {
+            "Fresh" => Ok(proto(ProtoRuleName::Fresh)),
+            "Stand" => Ok(stand()),
+            other => Err(ImportError(format!("unknown ruleKind Proto variant {other:?}"))),
+        },
+        "Intr" => {
+            let variant = req_str(kind, "variant")?;
+            let info = match variant {
+                "Coerce" => IntrRuleACInfo::Coerce,
+                "IRecv" => IntrRuleACInfo::IRecv,
+                "ISend" => IntrRuleACInfo::ISend,
+                "PubConstr" => IntrRuleACInfo::PubConstr,
+                "NatConstr" => IntrRuleACInfo::NatConstr,
+                "FreshConstr" => IntrRuleACInfo::FreshConstr,
+                "IEquality" => IntrRuleACInfo::IEquality,
+                // `ConstrRule`/`DestrRule` carry a real `FunSym` HS-side
+                // that the dump does not serialize (see `ruleKindJSON`'s
+                // own doc comment: these are theory-dependent, not fixed
+                // across every theory, and are not yet covered by
+                // `canon_color`'s vertex-coloring table either way) --
+                // fabricating a placeholder `FunSym` here would be
+                // actively misleading if anything downstream ever used
+                // it as real, so this fails clearly at RECONSTRUCTION
+                // time instead of silently producing a bogus rule and
+                // deferring the failure to whatever eventually calls
+                // `ColorTable::rule_color` on it.
+                "ConstrRule" | "DestrRule" => {
+                    return Err(ImportError(format!(
+                        "node {rule_name:?} is an intruder {variant} rule -- not yet \
+                         reconstructible from the dump (no FunSym payload is serialized; \
+                         see parse_rule_info's own doc comment)"
+                    )))
+                }
+                other => return Err(ImportError(format!("unknown ruleKind Intr variant {other:?}"))),
+            };
+            Ok(RuleInfo::Intr(info))
+        }
+        other => Err(ImportError(format!("unknown ruleKind tag {other:?}"))),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -507,6 +557,124 @@ mod tests {
         bad["nodes"][0]["premises"] = json!(["("]);
         let err = system_from_json(&bad).expect_err("garbage term text must error");
         assert!(err.0.contains('('), "error should mention the bad text: {err}");
+    }
+
+    /// The actual bug this field exists to fix (see the module docs /
+    /// `crate::canon_color`'s own notes): a node whose `"ruleKind"` says
+    /// `Intr:ISend` must reconstruct as the BUILT-IN rule -- distinct
+    /// from an otherwise-identical node with the SAME `"ruleName":
+    /// "Send"` but `"ruleKind": {"tag": "Proto", "variant": "Stand"}` --
+    /// even though `getRuleName`/`rule_name_string` would render both
+    /// identically. Checked end to end through `ColorTable::rule_color`,
+    /// the actual downstream consumer this ambiguity broke.
+    #[test]
+    fn rule_kind_distinguishes_builtin_from_same_named_protocol_rule() {
+        let _guard = install_test_signature();
+
+        let mut builtin_send = sample_json();
+        builtin_send["nodes"] = json!([{
+            "id": "#j",
+            "ruleName": "Send",
+            "ruleKind": { "tag": "Intr", "variant": "ISend" },
+            "premises": ["!KU(s)"],
+            "actions": ["K(s)"],
+            "conclusions": ["In(s)"]
+        }]);
+        builtin_send["lastAtom"] = Value::Null;
+
+        let mut protocol_send = sample_json();
+        protocol_send["nodes"] = json!([{
+            "id": "#j",
+            "ruleName": "Send",
+            "ruleKind": { "tag": "Proto", "variant": "Stand" },
+            "premises": [],
+            "actions": [],
+            "conclusions": []
+        }]);
+        protocol_send["lastAtom"] = Value::Null;
+
+        let builtin_sys = system_from_json(&builtin_send).expect("builtin system_from_json");
+        let protocol_sys = system_from_json(&protocol_send).expect("protocol system_from_json");
+
+        let theory = crate::canon_color::ColorTable::build(&theory_declaring_send());
+        let (_, builtin_ru) = &builtin_sys.nodes[0];
+        let (_, protocol_ru) = &protocol_sys.nodes[0];
+        assert!(matches!(builtin_ru.info, RuleInfo::Intr(IntrRuleACInfo::ISend)));
+        assert!(matches!(
+            protocol_ru.info,
+            RuleInfo::Proto(ref p) if matches!(p.name, ProtoRuleName::Stand(_))
+        ));
+        assert_ne!(
+            theory.rule_color(builtin_ru),
+            theory.rule_color(protocol_ru),
+            "a built-in ISend node and a same-named protocol rule node must not collide"
+        );
+    }
+
+    /// The built-in Fresh rule (`RuleInfo::Proto` with
+    /// `ProtoRuleName::Fresh` -- a `Proto` case, NOT `Intr`) must also
+    /// round-trip distinctly from a hypothetical protocol rule literally
+    /// named `"FreshRule"` (unlikely, but not disallowed by Tamarin's
+    /// own reserved-name check -- see `ruleKindJSON`'s own doc comment).
+    #[test]
+    fn rule_kind_distinguishes_the_fresh_rule_from_a_same_named_protocol_rule() {
+        let _guard = install_test_signature();
+
+        let mut fresh_json = sample_json();
+        fresh_json["nodes"] = json!([{
+            "id": "#i.1",
+            "ruleName": "FreshRule",
+            "ruleKind": { "tag": "Proto", "variant": "Fresh" },
+            "premises": [], "actions": [], "conclusions": []
+        }]);
+        fresh_json["lastAtom"] = Value::Null;
+
+        let sys = system_from_json(&fresh_json).expect("system_from_json");
+        let (_, ru) = &sys.nodes[0];
+        assert!(matches!(
+            ru.info,
+            RuleInfo::Proto(ref p) if matches!(p.name, ProtoRuleName::Fresh)
+        ));
+    }
+
+    /// A dump predating the `"ruleKind"` field (or a hand-written test
+    /// fixture that omits it) still round-trips, defaulting to the OLD
+    /// behavior (`Proto`/`Stand`) -- backward compatibility, not just an
+    /// oversight.
+    #[test]
+    fn missing_rule_kind_field_defaults_to_proto_stand() {
+        let _guard = install_test_signature();
+        let sys = system_from_json(&sample_json()).expect("system_from_json");
+        let (_, ru) = &sys.nodes[0];
+        assert!(matches!(
+            ru.info,
+            RuleInfo::Proto(ref p) if matches!(p.name, ProtoRuleName::Stand(_))
+        ));
+    }
+
+    /// `ConstrRule`/`DestrRule` intruder rules are not reconstructible
+    /// from the dump (no `FunSym` payload is serialized) -- must fail
+    /// clearly at import time, not produce a bogus rule.
+    #[test]
+    fn constr_rule_kind_is_a_clean_error_not_a_bogus_reconstruction() {
+        let _guard = install_test_signature();
+        let mut bad = sample_json();
+        bad["nodes"][0]["ruleKind"] = json!({ "tag": "Intr", "variant": "ConstrRule" });
+        let err = system_from_json(&bad).expect_err("ConstrRule must error, not reconstruct");
+        assert!(err.0.contains("ConstrRule"), "error should name the variant: {err}");
+    }
+
+    /// A theory that itself declares a protocol rule literally named
+    /// `Send` -- the exact collision scenario `ColorTable::rule_color`'s
+    /// own tests (`canon_color.rs`) already validate the coloring logic
+    /// against; needed here too so `rule_color` has an entry for the
+    /// PROTOCOL `Send` to look up (a table built from an empty theory
+    /// would correctly panic on it — that's not the thing under test
+    /// here).
+    fn theory_declaring_send() -> crate::theory::Theory {
+        let parsed = parse_theory("theory T begin\nrule Send:\n  [] --> []\nend", &[])
+            .expect("parse theory declaring Send");
+        crate::elaborate::elaborate(&parsed).expect("elaborate theory declaring Send")
     }
 }
 
