@@ -43,6 +43,7 @@
 <g id="node14" class="node">
 <title>n13</title>
 <ellipse fill="black" stroke="black" cx="613" cy="-89.4" rx="14.4" ry="14.4"/>
+<text text-anchor="middle" x="581.6" y="-106.8" font-family="Helvetica,sans-Serif" font-size="10.00">C0→P1</text>
 </g>
 <!-- n2&#45;&gt;n13 -->
 <g id="edge1" class="edge">
@@ -86,6 +87,7 @@
 <g id="node15" class="node">
 <title>n14</title>
 <ellipse fill="black" stroke="black" cx="516" cy="-444.41" rx="14.4" ry="14.4"/>
+<text text-anchor="middle" x="484.6" y="-461.81" font-family="Helvetica,sans-Serif" font-size="10.00">C0→P0</text>
 </g>
 <!-- n4&#45;&gt;n14 -->
 <g id="edge3" class="edge">
@@ -121,6 +123,7 @@
 <g id="node16" class="node">
 <title>n15</title>
 <ellipse fill="black" stroke="black" cx="385" cy="-628.15" rx="14.4" ry="14.4"/>
+<text text-anchor="middle" x="353.6" y="-645.55" font-family="Helvetica,sans-Serif" font-size="10.00">C0→P0</text>
 </g>
 <!-- n5&#45;&gt;n15 -->
 <g id="edge5" class="edge">
@@ -142,6 +145,7 @@
 <g id="node17" class="node">
 <title>n16</title>
 <ellipse fill="black" stroke="black" cx="285" cy="-811.89" rx="14.4" ry="14.4"/>
+<text text-anchor="middle" x="253.6" y="-829.29" font-family="Helvetica,sans-Serif" font-size="10.00">C0→P1</text>
 </g>
 <!-- n6&#45;&gt;n16 -->
 <g id="edge7" class="edge">
@@ -165,6 +169,7 @@
 <g id="node18" class="node">
 <title>n17</title>
 <ellipse fill="black" stroke="black" cx="56" cy="-811.89" rx="14.4" ry="14.4"/>
+<text text-anchor="middle" x="24.6" y="-829.29" font-family="Helvetica,sans-Serif" font-size="10.00">C0→P0</text>
 </g>
 <!-- n7&#45;&gt;n17 -->
 <g id="edge9" class="edge">
@@ -208,6 +213,7 @@
 <g id="node19" class="node">
 <title>n18</title>
 <ellipse fill="black" stroke="black" cx="105" cy="-1179.37" rx="14.4" ry="14.4"/>
+<text text-anchor="middle" x="73.6" y="-1196.77" font-family="Helvetica,sans-Serif" font-size="10.00">C0→P0</text>
 </g>
 <!-- n8&#45;&gt;n18 -->
 <g id="edge11" class="edge">
@@ -233,6 +239,7 @@
 <g id="node20" class="node">
 <title>n19</title>
 <ellipse fill="black" stroke="black" cx="689" cy="-720.02" rx="14.4" ry="14.4"/>
+<text text-anchor="middle" x="657.6" y="-737.42" font-family="Helvetica,sans-Serif" font-size="10.00">C0→P0</text>
 </g>
 <!-- n9&#45;&gt;n19 -->
 <g id="edge13" class="edge">
@@ -336,6 +343,7 @@
 <g id="node21" class="node">
 <title>n20</title>
 <ellipse fill="black" stroke="black" cx="506" cy="-1179.37" rx="14.4" ry="14.4"/>
+<text text-anchor="middle" x="474.6" y="-1196.77" font-family="Helvetica,sans-Serif" font-size="10.00">C0→P0</text>
 </g>
 <!-- n10&#45;&gt;n20 -->
 <g id="edge15" class="edge">
@@ -359,6 +367,7 @@
 <g id="node22" class="node">
 <title>n21</title>
 <ellipse fill="black" stroke="black" cx="658" cy="-1179.37" rx="14.4" ry="14.4"/>
+<text text-anchor="middle" x="660.6" y="-1196.77" font-family="Helvetica,sans-Serif" font-size="10.00">C1→P1</text>
 </g>
 <!-- n11&#45;&gt;n21 -->
 <g id="edge17" class="edge">
@@ -390,6 +399,7 @@
 <g id="node23" class="node">
 <title>n22</title>
 <ellipse fill="black" stroke="black" cx="658" cy="-1350.64" rx="14.4" ry="14.4"/>
+<text text-anchor="middle" x="626.6" y="-1368.04" font-family="Helvetica,sans-Serif" font-size="10.00">C0→P0</text>
 </g>
 <!-- n12&#45;&gt;n22 -->
 <g id="edge19" class="edge">

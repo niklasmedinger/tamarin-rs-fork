@@ -61,6 +61,7 @@
 
 pub mod atom;
 pub mod auto_sources;
+pub mod bliss_proc;
 pub mod canon;
 pub mod canon_color;
 pub mod canon_graph;

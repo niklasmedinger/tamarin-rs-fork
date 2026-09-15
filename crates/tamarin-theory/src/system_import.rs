@@ -531,7 +531,7 @@ mod tests {
         let count = |pred: &dyn Fn(&VertexKind) -> bool| part.vertices.iter().filter(|v| pred(v)).count();
         assert_eq!(count(&|v| matches!(v, VertexKind::RuleInstance(_, _))), 2);
         assert_eq!(count(&|v| matches!(v, VertexKind::Action(_, _))), 1);
-        assert_eq!(count(&|v| matches!(v, VertexKind::EdgeRelation)), 1);
+        assert_eq!(count(&|v| matches!(v, VertexKind::EdgeRelation(_, _))), 1);
         assert_eq!(count(&|v| matches!(v, VertexKind::LessRelation)), 1);
         assert_eq!(count(&|v| matches!(v, VertexKind::AtTimepointRelation)), 1);
         assert_eq!(part.edges.len(), 6);

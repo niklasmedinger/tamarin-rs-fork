@@ -53,7 +53,7 @@ use crate::constraint::system::System;
 use crate::guarded::{cmp_fact, BVar, GAtom, GFact, GTerm, Guarded};
 use crate::pretty_formula::pretty_guarded;
 use crate::pretty_system::pretty_fact;
-use crate::rule::{rule_name_string, RuleACInst};
+use crate::rule::{rule_name_string, ConcIdx, PremIdx, RuleACInst};
 
 use tamarin_parser::ast::{SortHint, SuffixSort, VarSpec};
 use tamarin_term::lterm::{LSort, LVar};
@@ -89,12 +89,17 @@ pub enum VertexKind {
     /// panics on a missing entry.
     Dummy(NodeId),
     /// Reifies one `System::edges` conclusion→premise connection:
-    /// `src -> EdgeRelation -> tgt` replaces a directly typed
-    /// `src -> tgt` edge. See the module docs' third bullet. Carries no
-    /// payload — a bare marker; port indices (`ConcIdx`/`PremIdx`) are
-    /// not tracked here, matching this module's existing node-level
-    /// (not port-level) granularity for edges.
-    EdgeRelation,
+    /// `src -> EdgeRelation(conc, prem) -> tgt` replaces a directly typed
+    /// `src -> tgt` edge. See the module docs' third bullet. Carries the
+    /// original edge's port indices — which conclusion slot on `src` and
+    /// which premise slot on `tgt` this connection actually occupies.
+    /// Without them, an edge landing in premise slot 0 of a rule
+    /// instance would be graph-indistinguishable from one landing in
+    /// slot 1 (both routed through a bare, payload-free `EdgeRelation`
+    /// vertex) — losing real structural information the coloring stage
+    /// ([`crate::canon_color`]) needs to tell apart which specific
+    /// premise/conclusion an edge occupies.
+    EdgeRelation(ConcIdx, PremIdx),
     /// Reifies one `i < j` less-than atom: `smaller -> LessRelation ->
     /// larger`. See the module docs' third bullet.
     LessRelation,
@@ -151,7 +156,13 @@ pub fn extract_graph_part(sys: &System) -> GraphPart {
     for e in sys.edges_in_set_order() {
         let s = get_vertex_or_create_dummy_vertex(e.src.0, &mut vertices, &mut node_vertex);
         let t = get_vertex_or_create_dummy_vertex(e.tgt.0, &mut vertices, &mut node_vertex);
-        push_relation(&mut vertices, &mut edges, VertexKind::EdgeRelation, s, t);
+        push_relation(
+            &mut vertices,
+            &mut edges,
+            VertexKind::EdgeRelation(e.src.1, e.tgt.1),
+            s,
+            t,
+        );
     }
 
     // 3. Less-than atoms, reified as `smaller -> LessRelation -> larger`.
@@ -401,10 +412,11 @@ fn write_vertex(out: &mut String, idx: usize, v: &VertexKind) {
             )
             .ok();
         }
-        VertexKind::EdgeRelation => {
+        VertexKind::EdgeRelation(conc, prem) => {
+            let xlabel = escape_dot_label(&format!("C{}\u{2192}P{}", conc.0, prem.0));
             writeln!(
                 out,
-                "  n{idx} [shape=point, width=0.40, style=filled, fillcolor=black, label=\"\"];"
+                "  n{idx} [shape=point, width=0.40, style=filled, fillcolor=black, label=\"\", xlabel=\"{xlabel}\"];"
             )
             .ok();
         }
@@ -541,7 +553,7 @@ mod tests {
         assert_eq!(part.vertices.len(), 3);
         assert!(matches!(&part.vertices[0], VertexKind::RuleInstance(n, _) if *n == nid("i", 1)));
         assert!(matches!(&part.vertices[1], VertexKind::RuleInstance(n, _) if *n == nid("i", 2)));
-        assert_relation(&part, 0, &VertexKind::EdgeRelation, 1);
+        assert_relation(&part, 0, &VertexKind::EdgeRelation(ConcIdx(0), PremIdx(0)), 1);
         assert_eq!(part.edges.len(), 2);
     }
 
@@ -560,7 +572,7 @@ mod tests {
         // 1 rule instance + 1 dummy + 1 reified EdgeRelation vertex.
         assert_eq!(part.vertices.len(), 3);
         assert!(matches!(&part.vertices[1], VertexKind::Dummy(n) if *n == nid("i", 2)));
-        assert_relation(&part, 0, &VertexKind::EdgeRelation, 1);
+        assert_relation(&part, 0, &VertexKind::EdgeRelation(ConcIdx(0), PremIdx(0)), 1);
         assert_eq!(part.edges.len(), 2);
     }
 

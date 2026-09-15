@@ -155,7 +155,11 @@
                 "Client_1( $S, ~k )",
                 "In( h(~k) )"
             ],
-            "ruleName": "Client_2"
+            "ruleName": "Client_2",
+            "ruleKind": {
+                "tag": "Proto",
+                "variant": "Stand"
+            }
         },
         {
             "actions": [
@@ -168,7 +172,11 @@
             "premises": [
                 "!KU( ~k )"
             ],
-            "ruleName": "Send"
+            "ruleName": "Send",
+            "ruleKind": {
+                "tag": "Intr",
+                "variant": "ISend"
+            }
         },
         {
             "actions": [
@@ -181,7 +189,11 @@
             "premises": [
                 "!KU( h(~k) )"
             ],
-            "ruleName": "Send"
+            "ruleName": "Send",
+            "ruleKind": {
+                "tag": "Intr",
+                "variant": "ISend"
+            }
         },
         {
             "actions": [
@@ -194,7 +206,11 @@
             "premises": [
                 "!KD( h(~k) )"
             ],
-            "ruleName": "Coerce"
+            "ruleName": "Coerce",
+            "ruleKind": {
+                "tag": "Intr",
+                "variant": "Coerce"
+            }
         },
         {
             "actions": [],
@@ -205,7 +221,11 @@
             "premises": [
                 "Out( h(~k) )"
             ],
-            "ruleName": "Recv"
+            "ruleName": "Recv",
+            "ruleKind": {
+                "tag": "Intr",
+                "variant": "IRecv"
+            }
         },
         {
             "actions": [
@@ -220,7 +240,11 @@
                 "!Ltk( $S.1, ~ltkS )",
                 "In( aenc(<'1', ~k>, pk(~ltkS)) )"
             ],
-            "ruleName": "Serv_1"
+            "ruleName": "Serv_1",
+            "ruleKind": {
+                "tag": "Proto",
+                "variant": "Stand"
+            }
         },
         {
             "actions": [
@@ -233,7 +257,11 @@
             "premises": [
                 "!KU( aenc(<'1', ~k>, pk(~ltkS)) )"
             ],
-            "ruleName": "Send"
+            "ruleName": "Send",
+            "ruleKind": {
+                "tag": "Intr",
+                "variant": "ISend"
+            }
         },
         {
             "actions": [],
@@ -245,7 +273,11 @@
             "premises": [
                 "Fr( ~ltkS )"
             ],
-            "ruleName": "Register_pk"
+            "ruleName": "Register_pk",
+            "ruleKind": {
+                "tag": "Proto",
+                "variant": "Stand"
+            }
         },
         {
             "actions": [],
@@ -254,7 +286,11 @@
             ],
             "id": "#vf.2",
             "premises": [],
-            "ruleName": "FreshRule"
+            "ruleName": "FreshRule",
+            "ruleKind": {
+                "tag": "Proto",
+                "variant": "Fresh"
+            }
         },
         {
             "actions": [],
@@ -267,7 +303,11 @@
                 "Fr( ~k )",
                 "!Pk( $S, pk(~ltk) )"
             ],
-            "ruleName": "Client_1"
+            "ruleName": "Client_1",
+            "ruleKind": {
+                "tag": "Proto",
+                "variant": "Stand"
+            }
         },
         {
             "actions": [],
@@ -276,7 +316,11 @@
             ],
             "id": "#vf.3",
             "premises": [],
-            "ruleName": "FreshRule"
+            "ruleName": "FreshRule",
+            "ruleKind": {
+                "tag": "Proto",
+                "variant": "Fresh"
+            }
         },
         {
             "actions": [],
@@ -288,7 +332,11 @@
             "premises": [
                 "Fr( ~ltk )"
             ],
-            "ruleName": "Register_pk"
+            "ruleName": "Register_pk",
+            "ruleKind": {
+                "tag": "Proto",
+                "variant": "Stand"
+            }
         },
         {
             "actions": [],
@@ -297,7 +345,11 @@
             ],
             "id": "#vf.4",
             "premises": [],
-            "ruleName": "FreshRule"
+            "ruleName": "FreshRule",
+            "ruleKind": {
+                "tag": "Proto",
+                "variant": "Fresh"
+            }
         }
     ],
     "solvedFormulas": [
