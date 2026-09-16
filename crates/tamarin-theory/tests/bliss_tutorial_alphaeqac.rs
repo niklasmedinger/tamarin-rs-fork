@@ -24,7 +24,6 @@
 use std::path::PathBuf;
 
 use tamarin_theory::bliss_proc::{bliss_available, canonicalize};
-use tamarin_theory::canon_color::ColorTable;
 use tamarin_theory::canon_graph::extract_graph_part;
 use tamarin_theory::elaborate::{elaborate, set_user_funs_for_theory};
 use tamarin_theory::system_import::system_from_json;
@@ -58,13 +57,12 @@ fn tutorial_khu_client_and_client_khu_systems_canonicalize_identically() {
     let parsed = tamarin_parser::parse_theory(&src, &[]).expect("parse Tutorial.spthy");
     let _guard = set_user_funs_for_theory(&parsed);
     let elaborated = elaborate(&parsed).expect("elaborate Tutorial.spthy");
-    let colors = ColorTable::build(&elaborated);
 
     let sys_a = load_system("tutorial_khu_client_system.json");
     let sys_b = load_system("tutorial_client_khu_system.json");
 
-    let part_a = extract_graph_part(&sys_a);
-    let part_b = extract_graph_part(&sys_b);
+    let part_a = extract_graph_part(&sys_a, &elaborated);
+    let part_b = extract_graph_part(&sys_b, &elaborated);
 
     // Sanity check before asking bliss anything: if the two graph parts
     // don't even have the same SHAPE (vertex/edge counts), they cannot
@@ -81,8 +79,8 @@ fn tutorial_khu_client_and_client_khu_systems_canonicalize_identically() {
         "edge count mismatch -- the two systems don't even have the same graph SHAPE"
     );
 
-    let canon_a = canonicalize(&part_a, &colors).unwrap_or_else(|e| panic!("canonicalize a: {e}"));
-    let canon_b = canonicalize(&part_b, &colors).unwrap_or_else(|e| panic!("canonicalize b: {e}"));
+    let canon_a = canonicalize(&part_a).unwrap_or_else(|e| panic!("canonicalize a: {e}"));
+    let canon_b = canonicalize(&part_b).unwrap_or_else(|e| panic!("canonicalize b: {e}"));
 
     assert_eq!(
         canon_a, canon_b,

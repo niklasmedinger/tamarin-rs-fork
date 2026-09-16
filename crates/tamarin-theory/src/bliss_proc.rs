@@ -104,7 +104,7 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 
-use crate::canon_color::{Color, ColorTable};
+use crate::canon_color::Color;
 use crate::canon_graph::GraphPart;
 
 const ALLOW_NO_BLISS_ENV: &str = "TAM_ALLOW_NO_BLISS";
@@ -272,22 +272,23 @@ impl Permutation {
 // =============================================================================
 
 /// Renders `part`'s vertices/edges as bliss's DIMACS-like input format
-/// (see the module docs), coloring each vertex via
-/// `colors.vertex_color`.
+/// (see the module docs), coloring each vertex via `part.colors` (the
+/// `ColorTable` a `GraphPart` now always carries — see
+/// `canon_graph::GraphPart`'s own doc comment).
 ///
 /// Bliss numbers vertices from 1 — `GraphPart`'s own indices (0-based)
 /// are shifted by `+1` here; nothing else about `GraphPart`'s vertex
 /// order is significant to bliss, whose whole job is finding a
 /// canonical order independent of the INPUT order (see the module
 /// docs' caveat list).
-pub fn graph_part_to_dimacs(part: &GraphPart, colors: &ColorTable) -> Result<String, BlissError> {
+pub fn graph_part_to_dimacs(part: &GraphPart) -> Result<String, BlissError> {
     if part.vertices.is_empty() {
         return Err(BlissError::EmptyGraph);
     }
     let mut out = String::new();
     writeln!(out, "p edge {} {}", part.vertices.len(), part.edges.len()).ok();
     for (idx, v) in part.vertices.iter().enumerate() {
-        writeln!(out, "n {} {}", idx + 1, colors.vertex_color(v)).ok();
+        writeln!(out, "n {} {}", idx + 1, part.colors.vertex_color(v)).ok();
     }
     for e in &part.edges {
         writeln!(out, "e {} {}", e.src + 1, e.tgt + 1).ok();
@@ -430,16 +431,12 @@ pub struct CanonicalGraph {
 
 /// Relabels `part`'s vertices/edges according to `labeling` (typically
 /// `BlissResult::canonical_labeling`), coloring each ORIGINAL vertex via
-/// `colors` before relabeling.
-pub fn apply_labeling(
-    part: &GraphPart,
-    colors: &ColorTable,
-    labeling: &Permutation,
-) -> CanonicalGraph {
+/// `part.colors` before relabeling.
+pub fn apply_labeling(part: &GraphPart, labeling: &Permutation) -> CanonicalGraph {
     let n = part.vertices.len();
     let mut vertex_colors = vec![0; n];
     for (old_idx, v) in part.vertices.iter().enumerate() {
-        vertex_colors[labeling.image_of(old_idx)] = colors.vertex_color(v);
+        vertex_colors[labeling.image_of(old_idx)] = part.colors.vertex_color(v);
     }
     let edges = part
         .edges
@@ -452,14 +449,14 @@ pub fn apply_labeling(
     }
 }
 
-/// Runs bliss on `part`'s graph part (colored via `colors`) and applies
-/// the resulting canonical labeling, in one call — the composition
-/// [`graph_part_to_dimacs`] + [`run_bliss`] + [`apply_labeling`] most
-/// callers actually want.
-pub fn canonicalize(part: &GraphPart, colors: &ColorTable) -> Result<CanonicalGraph, BlissError> {
-    let dimacs = graph_part_to_dimacs(part, colors)?;
+/// Runs bliss on `part`'s graph part (colored via `part.colors`) and
+/// applies the resulting canonical labeling, in one call — the
+/// composition [`graph_part_to_dimacs`] + [`run_bliss`] +
+/// [`apply_labeling`] most callers actually want.
+pub fn canonicalize(part: &GraphPart) -> Result<CanonicalGraph, BlissError> {
+    let dimacs = graph_part_to_dimacs(part)?;
     let result = run_bliss(&dimacs)?;
-    Ok(apply_labeling(part, colors, &result.canonical_labeling))
+    Ok(apply_labeling(part, &result.canonical_labeling))
 }
 
 #[cfg(test)]
@@ -495,8 +492,7 @@ mod tests {
     #[test]
     fn dimacs_writer_rejects_an_empty_graph_part() {
         let part = GraphPart::default();
-        let table = ColorTable::default();
-        let err = graph_part_to_dimacs(&part, &table).unwrap_err();
+        let err = graph_part_to_dimacs(&part).unwrap_err();
         assert!(matches!(err, BlissError::EmptyGraph));
     }
 

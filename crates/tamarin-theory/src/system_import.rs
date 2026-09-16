@@ -526,7 +526,7 @@ mod tests {
         // of the real system Edge, the Less atom, and the action's own
         // AtTimepoint link (each relation contributes 2 graph edges:
         // src -> relation -> tgt -- see `canon_graph`'s module docs).
-        let part = crate::canon_graph::extract_graph_part(&sys);
+        let part = crate::canon_graph::extract_graph_part(&sys, &theory_declaring_create_and_receive());
         use crate::canon_graph::VertexKind;
         let count = |pred: &dyn Fn(&VertexKind) -> bool| part.vertices.iter().filter(|v| pred(v)).count();
         assert_eq!(count(&|v| matches!(v, VertexKind::RuleInstance(_, _))), 2);
@@ -675,6 +675,25 @@ mod tests {
         let parsed = parse_theory("theory T begin\nrule Send:\n  [] --> []\nend", &[])
             .expect("parse theory declaring Send");
         crate::elaborate::elaborate(&parsed).expect("elaborate theory declaring Send")
+    }
+
+    /// A theory matching [`sample_json`]'s own rule/action names — needed
+    /// so `ColorTable` (now built at `extract_graph_part` time, per
+    /// `canon_graph::GraphPart`'s own doc comment) has entries for
+    /// `"Create"`/`"Receive"` (protocol rules) and `"Recv"` (a protocol
+    /// action, distinct from the built-in RULE name of the same
+    /// spelling — see `canon_color`'s own `BUILTIN_RULE_NAMES` vs.
+    /// `BUILTIN_ACTION_NAMES`, which never share a name).
+    fn theory_declaring_create_and_receive() -> crate::theory::Theory {
+        let parsed = parse_theory(
+            "theory T begin\n\
+             rule Create:\n  [] --> []\n\
+             rule Receive:\n  [] --[ Recv() ]-> []\n\
+             end",
+            &[],
+        )
+        .expect("parse theory declaring Create/Receive");
+        crate::elaborate::elaborate(&parsed).expect("elaborate theory declaring Create/Receive")
     }
 }
 

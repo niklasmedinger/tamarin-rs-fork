@@ -48,7 +48,7 @@ use std::io::Read;
 
 use tamarin_parser::parser::parse_theory;
 use tamarin_theory::canon_graph::{extract_graph_part, to_graphviz};
-use tamarin_theory::elaborate::set_user_funs_for_theory;
+use tamarin_theory::elaborate::{self, set_user_funs_for_theory};
 use tamarin_theory::system_import::system_from_json;
 
 fn main() {
@@ -73,6 +73,12 @@ fn main() {
              or a builtins: block (see this example's module docs)."
         );
     }
+    // `extract_graph_part` needs the ELABORATED theory (not just the
+    // parsed AST `parsed_theory` above) to build its `GraphPart`'s own
+    // `ColorTable` -- see `canon_graph::GraphPart`'s doc comment.
+    let elaborated_theory = elaborate::elaborate(&parsed_theory).unwrap_or_else(|e| {
+        die(&format!("failed to elaborate theory: {e}"));
+    });
 
     let json_text = match json_path.as_deref() {
         None | Some("-") => {
@@ -98,7 +104,7 @@ fn main() {
         std::process::exit(1);
     });
 
-    let part = extract_graph_part(&sys);
+    let part = extract_graph_part(&sys, &elaborated_theory);
     print!("{}", to_graphviz(&part));
 }
 

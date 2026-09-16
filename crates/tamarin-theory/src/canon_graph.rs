@@ -48,15 +48,18 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use crate::canon_color::{Color, ColorTable};
 use crate::constraint::constraints::NodeId;
 use crate::constraint::system::System;
 use crate::guarded::{cmp_fact, BVar, GAtom, GFact, GTerm, Guarded};
 use crate::pretty_formula::pretty_guarded;
 use crate::pretty_system::pretty_fact;
 use crate::rule::{rule_name_string, ConcIdx, PremIdx, RuleACInst};
+use crate::theory::Theory;
 
 use tamarin_parser::ast::{SortHint, SuffixSort, VarSpec};
 use tamarin_term::lterm::{LSort, LVar};
+use tamarin_utils::color::{hsv_to_hex, Hsv};
 
 /// What a vertex represents. Work.tex's graph part has two vertex kinds
 /// (`i : ri` rule instances, `f @ i` action-formula constraints); the
@@ -124,16 +127,38 @@ pub struct GraphEdge {
     pub tgt: usize,
 }
 
-/// The extracted graph part `(V, E)` — the coloring `c` is a later,
-/// separate stage (TODO.md's skeleton scheme).
+/// The extracted graph part `(V, E, c)` — vertices, edges, AND the
+/// coloring `c` (`TODO.md`'s skeleton scheme, [`crate::canon_color`]),
+/// bundled together as ONE value rather than passed around as two
+/// separately-threaded arguments. A `ColorTable` is meaningful only
+/// relative to the specific `GraphPart` it colors (it's built from the
+/// same theory the part's `System` came from), so keeping them apart
+/// invited a caller to mismatch a part with the wrong table — this
+/// couples them at construction time instead: [`extract_graph_part`] is
+/// the only place a `GraphPart` is built, and it always builds its own
+/// `colors` alongside `vertices`/`edges`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GraphPart {
     pub vertices: Vec<VertexKind>,
     pub edges: Vec<GraphEdge>,
+    pub colors: ColorTable,
 }
 
-/// Extracts the graph part from `sys` (Stage A — see the module docs).
-pub fn extract_graph_part(sys: &System) -> GraphPart {
+impl GraphPart {
+    /// The color of `self.vertices[idx]`, per `self.colors` — the
+    /// entry point most callers actually want over reaching into
+    /// `self.colors.vertex_color(&self.vertices[idx])` directly.
+    pub fn vertex_color(&self, idx: usize) -> Color {
+        self.colors.vertex_color(&self.vertices[idx])
+    }
+}
+
+/// Extracts the graph part from `sys` (Stage A — see the module docs),
+/// building its `colors` table from `theory` ([`crate::canon_color`],
+/// Stage B) in the same call — `theory` must be the SAME (elaborated)
+/// theory `sys` was produced from, or vertex coloring later panics on a
+/// rule/action name this table wasn't built to cover.
+pub fn extract_graph_part(sys: &System, theory: &Theory) -> GraphPart {
     let mut vertices: Vec<VertexKind> = Vec::new();
     let mut edges: Vec<GraphEdge> = Vec::new();
     // NodeId -> index of its RuleInstance/Dummy vertex. Every NodeId the
@@ -211,7 +236,11 @@ pub fn extract_graph_part(sys: &System) -> GraphPart {
         );
     }
 
-    GraphPart { vertices, edges }
+    GraphPart {
+        vertices,
+        edges,
+        colors: ColorTable::build(theory),
+    }
 }
 
 /// Returns the index of `nid`'s `RuleInstance`/`Dummy` vertex, creating a
@@ -332,13 +361,23 @@ fn varspec_to_node_id(v: &VarSpec) -> NodeId {
 //     (see [`VertexKind::Dummy`]'s own doc comment), so one shape covers
 //     both, plus whatever else can create a dummy (`last_atom`, a bare
 //     relation endpoint).
-//   - [`VertexKind::EdgeRelation`]: a tiny filled `point` — the closest
-//     DOT has to "just a pass-through connector, no content of its own".
+//   - [`VertexKind::EdgeRelation`]: a tiny `point` — the closest DOT has
+//     to "just a pass-through connector, no content of its own".
 //   - [`VertexKind::LessRelation`]: a small `triangle` — evokes an
 //     ordering/comparison ("<").
 //   - [`VertexKind::AtTimepointRelation`]: a small `hexagon` — visually
 //     distinct from every other shape used here, matching that it is
 //     this module's own addition with no HS/work.tex counterpart.
+//
+// The FILL color, in contrast, is not hardcoded per kind — it comes
+// straight from `part.colors` via [`dot_fill_color`]: two vertices the
+// canonizer considers indistinguishable (same `ColorTable` color) always
+// render with the exact same fill, and two vertices it distinguishes
+// always render with visibly different fills. This makes the coloring
+// stage's own output directly inspectable (e.g. "why do these two
+// `RuleInstance` vertices look the same color? oh, they're both the
+// built-in `ISend` rule") instead of every rule instance always being
+// the same static light blue regardless of which rule it actually is.
 
 /// Renders `part` as a self-contained `digraph G { ... }` DOT document.
 pub fn to_graphviz(part: &GraphPart) -> String {
@@ -349,7 +388,8 @@ pub fn to_graphviz(part: &GraphPart) -> String {
     out.push_str("  edge [fontname=\"Helvetica\", fontsize=10];\n\n");
 
     for (idx, v) in part.vertices.iter().enumerate() {
-        write_vertex(&mut out, idx, v);
+        let fill = dot_fill_color(part.colors.vertex_color(v));
+        write_vertex(&mut out, idx, v, &fill);
     }
     out.push('\n');
     for e in &part.edges {
@@ -360,7 +400,31 @@ pub fn to_graphviz(part: &GraphPart) -> String {
     out
 }
 
-fn write_vertex(out: &mut String, idx: usize, v: &VertexKind) {
+/// Maps a [`Color`] (an opaque `ColorTable` integer — only equality
+/// between two colors is meaningful, not order or magnitude) to a
+/// visually distinct DOT hex fill color, for [`to_graphviz`]'s use.
+///
+/// Uses golden-angle hue stepping (`color * φ⁻¹ mod 1`, scaled to
+/// `[0, 360)`) — a standard technique for generating a sequence of
+/// well-SEPARATED hues without needing to know the total color count up
+/// front (unlike `tamarin_utils::color::gen_color_groups`, which needs a
+/// group-size layout ahead of time and is already spoken for as the
+/// literal HS-faithful `nodeColorMap` port in
+/// `constraint::system::graph::color` — a different, unrelated cosmetic
+/// palette, per this module's own top-level doc comment). Consecutive
+/// integers land far apart on the hue wheel, so two DIFFERENT small
+/// colors are very unlikely to look alike, even though nothing here
+/// GUARANTEES distinctness for arbitrarily many colors (a real
+/// `ColorTable` only ever has on the order of a few dozen colors, so
+/// this is not a practical concern). Saturation/value are fixed at a
+/// pastel level so dark vertex-label text stays legible on every fill.
+fn dot_fill_color(c: Color) -> String {
+    const GOLDEN_ANGLE_TURNS: f64 = 0.618_033_988_749_895; // 1/phi
+    let hue = ((c as f64) * GOLDEN_ANGLE_TURNS).fract() * 360.0;
+    hsv_to_hex(Hsv::new(hue, 0.45, 0.92))
+}
+
+fn write_vertex(out: &mut String, idx: usize, v: &VertexKind, fill: &str) {
     match v {
         VertexKind::RuleInstance(nid, ru) => {
             let prem_cells: Vec<String> = ru
@@ -391,7 +455,7 @@ fn write_vertex(out: &mut String, idx: usize, v: &VertexKind) {
             label.push('}');
             writeln!(
                 out,
-                "  n{idx} [shape=record, style=filled, fillcolor=\"#d6e8ff\", label=\"{label}\"];"
+                "  n{idx} [shape=record, style=filled, fillcolor=\"{fill}\", label=\"{label}\"];"
             )
             .ok();
         }
@@ -400,7 +464,7 @@ fn write_vertex(out: &mut String, idx: usize, v: &VertexKind) {
             let label = escape_dot_label(&format!("V{idx}  {fact_str} @ {nid}"));
             writeln!(
                 out,
-                "  n{idx} [shape=ellipse, style=filled, fillcolor=\"#ffe4a3\", label=\"{label}\"];"
+                "  n{idx} [shape=ellipse, style=filled, fillcolor=\"{fill}\", label=\"{label}\"];"
             )
             .ok();
         }
@@ -408,7 +472,7 @@ fn write_vertex(out: &mut String, idx: usize, v: &VertexKind) {
             let label = escape_dot_label(&format!("V{idx}  {nid}"));
             writeln!(
                 out,
-                "  n{idx} [shape=diamond, style=dashed, label=\"{label}\"];"
+                "  n{idx} [shape=diamond, style=\"filled,dashed\", fillcolor=\"{fill}\", label=\"{label}\"];"
             )
             .ok();
         }
@@ -416,7 +480,7 @@ fn write_vertex(out: &mut String, idx: usize, v: &VertexKind) {
             let xlabel = escape_dot_label(&format!("C{}\u{2192}P{}", conc.0, prem.0));
             writeln!(
                 out,
-                "  n{idx} [shape=point, width=0.40, style=filled, fillcolor=black, label=\"\", xlabel=\"{xlabel}\"];"
+                "  n{idx} [shape=point, width=0.40, style=filled, fillcolor=\"{fill}\", label=\"\", xlabel=\"{xlabel}\"];"
             )
             .ok();
         }
@@ -424,7 +488,7 @@ fn write_vertex(out: &mut String, idx: usize, v: &VertexKind) {
             let label = escape_dot_label("<");
             writeln!(
                 out,
-                "  n{idx} [shape=triangle, width=0.25, height=0.2, style=filled, fillcolor=\"#c9a0ff\", label=\"{label}\"];"
+                "  n{idx} [shape=triangle, width=0.25, height=0.2, style=filled, fillcolor=\"{fill}\", label=\"{label}\"];"
             )
             .ok();
         }
@@ -432,7 +496,7 @@ fn write_vertex(out: &mut String, idx: usize, v: &VertexKind) {
             let label = escape_dot_label(&format!("V{idx}"));
             writeln!(
                 out,
-                "  n{idx} [shape=hexagon, width=0.25, height=0.2, style=filled, fillcolor=\"#b0e0b0\", label=\"{label}\"];"
+                "  n{idx} [shape=hexagon, width=0.25, height=0.2, style=filled, fillcolor=\"{fill}\", label=\"{label}\"];"
             )
             .ok();
         }
@@ -479,7 +543,17 @@ mod tests {
         ConcIdx, PremIdx, ProtoRuleACInstInfo, ProtoRuleName, Rule, RuleAttributes, RuleInfo,
     };
     use std::sync::Arc;
-    use tamarin_parser::parser::parse_formula_str;
+    use tamarin_parser::parser::{parse_formula_str, parse_theory};
+
+    /// Parses+elaborates `src` into the `&Theory` [`extract_graph_part`]
+    /// needs — mirrors `canon_color.rs`'s own test helper of the same
+    /// name/shape.
+    fn theory(src: &str) -> Theory {
+        let parsed = parse_theory(src, &[]).unwrap_or_else(|e| panic!("parse: {e}"));
+        crate::elaborate::elaborate(&parsed).unwrap_or_else(|e| panic!("elaborate: {e:?}"))
+    }
+
+    const EMPTY: &str = "theory T begin\nend";
 
     fn nid(name: &str, idx: u64) -> NodeId {
         LVar::new(name, LSort::Node, idx)
@@ -547,7 +621,7 @@ mod tests {
             tgt: (nid("i", 2), PremIdx(0)),
         });
 
-        let part = extract_graph_part(&sys);
+        let part = extract_graph_part(&sys, &theory(EMPTY));
 
         // 2 rule instances + 1 reified EdgeRelation vertex.
         assert_eq!(part.vertices.len(), 3);
@@ -567,7 +641,7 @@ mod tests {
             tgt: (nid("i", 2), PremIdx(0)),
         });
 
-        let part = extract_graph_part(&sys);
+        let part = extract_graph_part(&sys, &theory(EMPTY));
 
         // 1 rule instance + 1 dummy + 1 reified EdgeRelation vertex.
         assert_eq!(part.vertices.len(), 3);
@@ -583,7 +657,7 @@ mod tests {
             .less_atoms
             .push(LessAtom::new(nid("i", 1), nid("i", 2), Reason::Formula));
 
-        let part = extract_graph_part(&sys);
+        let part = extract_graph_part(&sys, &theory(EMPTY));
 
         // 2 dummies + 1 reified LessRelation vertex.
         assert_eq!(part.vertices.len(), 3);
@@ -598,7 +672,7 @@ mod tests {
         let mut sys = System::default();
         sys.content_mut().last_atom = Some(nid("i", 7));
 
-        let part = extract_graph_part(&sys);
+        let part = extract_graph_part(&sys, &theory(EMPTY));
 
         assert_eq!(part.vertices, vec![VertexKind::Dummy(nid("i", 7))]);
         assert!(part.edges.is_empty());
@@ -615,7 +689,7 @@ mod tests {
             .formulas
             .push(Arc::new(g("P(x) @ #i & Q(y) @ #i")));
 
-        let part = extract_graph_part(&sys);
+        let part = extract_graph_part(&sys, &theory(EMPTY));
 
         assert_eq!(
             action_fact_names(&part),
@@ -652,7 +726,7 @@ mod tests {
             .solved_formulas
             .push(Arc::new(g("P(x) @ #i")));
 
-        let part = extract_graph_part(&sys);
+        let part = extract_graph_part(&sys, &theory(EMPTY));
 
         assert_eq!(
             action_fact_names(&part),
@@ -671,7 +745,7 @@ mod tests {
             .formulas
             .push(Arc::new(g("P(z) @ #j & Ex x #i. Q(x) @ #i")));
 
-        let part = extract_graph_part(&sys);
+        let part = extract_graph_part(&sys, &theory(EMPTY));
 
         assert_eq!(
             action_fact_names(&part),
@@ -691,6 +765,24 @@ mod tests {
     }
 
     #[test]
+    fn dot_fill_color_is_deterministic_and_a_well_formed_hex_string() {
+        let c1 = dot_fill_color(1);
+        let c2 = dot_fill_color(2);
+        // Well-formed `#rrggbb`: `rgb_to_hex`'s own format.
+        for c in [&c1, &c2] {
+            assert_eq!(c.len(), 7);
+            assert!(c.starts_with('#'));
+            assert!(c[1..].chars().all(|ch| ch.is_ascii_hexdigit()));
+        }
+        // Deterministic: same table color -> same fill, every time.
+        assert_eq!(c1, dot_fill_color(1));
+        // Different table colors -> (in practice, for small inputs)
+        // different fills -- the whole point of driving fill color from
+        // the table instead of a per-`VertexKind` constant.
+        assert_ne!(c1, c2);
+    }
+
+    #[test]
     fn escape_dot_label_escapes_only_quote_and_backslash() {
         assert_eq!(escape_dot_label("plain text"), "plain text");
         assert_eq!(escape_dot_label("say \"hi\""), "say \\\"hi\\\"");
@@ -702,6 +794,10 @@ mod tests {
 
     #[test]
     fn to_graphviz_renders_a_well_formed_digraph_document() {
+        const RULES_A_AND_B: &str = "theory T begin\n\
+            rule A:\n  [] --> []\n\
+            rule B:\n  [] --> []\n\
+            end";
         let mut sys = System::default();
         sys.add_node(nid("i", 1), proto_rule("A"));
         sys.add_node(nid("i", 2), proto_rule("B"));
@@ -709,7 +805,7 @@ mod tests {
             src: (nid("i", 1), ConcIdx(0)),
             tgt: (nid("i", 2), PremIdx(0)),
         });
-        let part = extract_graph_part(&sys);
+        let part = extract_graph_part(&sys, &theory(RULES_A_AND_B));
 
         let dot = to_graphviz(&part);
 
@@ -732,11 +828,14 @@ mod tests {
     /// vertex back to their shared timepoint.
     #[test]
     fn same_timepoint_actions_render_as_two_ellipses_with_attimepoint_relations() {
+        const RULE_WITH_P_AND_Q_ACTIONS: &str = "theory T begin\n\
+            rule R:\n  [] --[ P(), Q() ]-> []\n\
+            end";
         let mut sys = System::default();
         sys.content_mut()
             .formulas
             .push(Arc::new(g("P(x) @ #i & Q(y) @ #i")));
-        let part = extract_graph_part(&sys);
+        let part = extract_graph_part(&sys, &theory(RULE_WITH_P_AND_Q_ACTIONS));
 
         let dot = to_graphviz(&part);
 
@@ -752,11 +851,11 @@ mod tests {
     fn dummy_vertex_renders_as_a_dashed_diamond() {
         let mut sys = System::default();
         sys.content_mut().last_atom = Some(nid("i", 7));
-        let part = extract_graph_part(&sys);
+        let part = extract_graph_part(&sys, &theory(EMPTY));
 
         let dot = to_graphviz(&part);
 
-        assert!(dot.contains("shape=diamond, style=dashed"));
+        assert!(dot.contains("shape=diamond, style=\"filled,dashed\""));
         assert!(dot.contains("#i.7"));
     }
 
@@ -769,7 +868,7 @@ mod tests {
         sys.content_mut()
             .less_atoms
             .push(LessAtom::new(nid("i", 1), nid("i", 2), Reason::Formula));
-        let part = extract_graph_part(&sys);
+        let part = extract_graph_part(&sys, &theory(EMPTY));
 
         let dot = to_graphviz(&part);
 
