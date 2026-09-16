@@ -3644,3 +3644,287 @@ index 913da58f..23fe4f98 100644
      disjunction m1 m2      = DisjT $ unDisjT m1 `mplus` unDisjT m2
  
  
+diff --git a/src/Web/Handler.hs b/src/Web/Handler.hs
+index 0d9dd4aa..3826188e 100644
+--- a/src/Web/Handler.hs
++++ b/src/Web/Handler.hs
+@@ -30,6 +30,7 @@ module Web.Handler
+   -- , getTheoryPathDR
+   , getTheoryGraphR
+   , getTheoryGraphJsonR
++  , getTheorySystemR
+   , getTheoryInteractiveGraphR
+   , getTheoryGraphJsonDiffR
+   , getTheoryGraphJsonMirrorDiffR
+@@ -66,8 +67,18 @@ module Web.Handler
+   )
+ where
+ 
++import Extension.Data.Label qualified as L
++import Logic.Connectives (Conj(..))
++import Term.Unification (substToList, substToListVFresh)
+ import Theory
+   ( Theory(..), DiffTheory(..), ClosedTheory, ClosedDiffTheory, Side
++  , System, NodeId
++  , getRuleName, rPrems, rActs, rConcs, rInfo
++  , RuleInfo(..), IntrRuleACInfo(..), ProtoRuleName(..), praciName
++  , getConcIdx, getPremIdx
++  , prettyLNTerm, prettyLNFact, prettyGuarded, varTerm
++  , sLastAtom, sNodes, sEdges, sLessAtoms
++  , sFormulas, sSolvedFormulas, sLemmas, sEqStore, sSubtermStore
+   , ClosedTheory, ClosedDiffTheory, Side, Signature(..)
+   , removeLemma
+   , lookupLemmaIndex
+@@ -83,6 +94,7 @@ import Theory
+   , runAutoDiffProver
+   , prettyClosedTheory
+   , prettyOpenTheory
++  , prettyNonGraphSystem
+   , openDiffTheory
+   , prettyClosedDiffTheory
+   , prettyOpenDiffTheory
+@@ -136,6 +148,7 @@ import Data.Binary qualified as Bin
+ import Data.ByteString.Builder qualified as B
+ import Data.ByteString.Char8 qualified as BS
+ import Data.Map qualified as M
++import Data.Set qualified as S
+ import Data.Text qualified as T
+ import Data.Text.Encoding qualified as T (encodeUtf8, decodeUtf8)
+ import Data.Text.Lazy.Encoding qualified as TLE
+@@ -154,7 +167,10 @@ import Text.Read (readMaybe)
+ import Theory.Constraint.System.Dot
+ import Theory.Constraint.System.Graph.Graph
+ import Theory.Constraint.System.JSON  -- for export of constraint system to JSON
++import Theory.Constraint.System.Constraints qualified as Con  -- Edge/LessAtom/Reason, for systemToJSON
+ import Theory.Text.Parser (parseLemmaWithMacros)
++import Theory.Tools.EquationStore qualified as EqS  -- for systemToJSON
++import Theory.Tools.SubtermStore qualified as StS  -- for systemToJSON
+ import Theory.Tools.Wellformedness  (prettyWfErrorReport, WfErrorReport)
+ import Lemma
+ import Prover (mkSystem)
+@@ -1443,6 +1459,156 @@ getTheoryGraphJsonR idx path = withTheory idx (\ti -> do
+ 
+     sendFile (fromString ".json") jsonStr)
+ 
++-- | Get a COMPLETE, machine-parseable serialization of the constraint
++-- system at the given path, for extracting it as a cross-implementation
++-- test fixture (e.g. to check the Rust port's canonization/graph-part
++-- extraction against known-alphaeqac systems reached via different
++-- proof-method orders).
++--
++-- Unlike 'prettyNonGraphSystem' (human-readable prose, and only the
++-- non-graph half at that -- no nodes/edges/less-atoms), this covers every
++-- field of 'System' and is designed to be PARSED BACK, not just read.
++-- Every term/fact/formula leaf is emitted as its ordinary pretty-printed
++-- Tamarin surface syntax (`prettyLNTerm`/`prettyLNFact`/`prettyGuarded`)
++-- rather than a bespoke structured encoding: the Rust side already has a
++-- parser + elaborator for exactly this syntax (it has to, to load the
++-- same model), so round-tripping through it reuses fully-tested machinery
++-- on both ends instead of inventing and separately validating a new term
++-- format. The JSON envelope only carries the STRUCTURE (which array is
++-- nodes vs. edges vs. formulas, node-id/index/flag scalars) -- see
++-- 'systemToJSON'.
++getTheorySystemR :: TheoryIdx -> TheoryPath -> Handler Value
++getTheorySystemR idx path = withTheory idx $ \ti ->
++  case systemAtPath ti.theory path of
++    Nothing -> notFound
++    Just se -> pure $ systemToJSON se
++
++-- | See 'getTheorySystemR'. A leaf term/fact/formula is rendered via
++-- 'render' + the ordinary pretty-printer for its type -- the same
++-- rendering 'getTheorySourceR'/'prettyNonGraphSystem' already use, so an
++-- unrelated syntax change to either can't make this drift from what the
++-- source-round-tripping (`--output=file.spthy`) path already promises is
++-- re-parseable.
++systemToJSON :: System -> Value
++systemToJSON se = object
++  [ "lastAtom"       .= (renderNodeId <$> L.get sLastAtom se)
++  , "nodes"          .= map nodeJSON (M.toList $ L.get sNodes se)
++  , "edges"          .= map edgeJSON (S.toList $ L.get sEdges se)
++  , "less"           .= map lessJSON (S.toList $ L.get sLessAtoms se)
++  , "formulas"       .= map renderGuarded (S.toList $ L.get sFormulas se)
++  , "solvedFormulas" .= map renderGuarded (S.toList $ L.get sSolvedFormulas se)
++  , "lemmas"         .= map renderGuarded (S.toList $ L.get sLemmas se)
++  , "eqStore"        .= eqStoreJSON (L.get sEqStore se)
++  , "subtermStore"   .= subtermStoreJSON (L.get sSubtermStore se)
++  ]
++  where
++    renderNodeId  = show :: NodeId -> String
++    renderTerm    = render . prettyLNTerm
++    renderFact    = render . prettyLNFact
++    renderGuarded = render . prettyGuarded
++    -- Domain/range pair of a substitution entry, as a 2-element JSON
++    -- array `[var, term]` (not an object -- there is no natural single
++    -- key for "the variable side", and a 2-tuple is unambiguous here).
++    substPairJSON (v, t) = toJSON [renderTerm (varTerm v), renderTerm t]
++    termPairJSON (a, b)  = toJSON [renderTerm a, renderTerm b]
++
++    nodeJSON (nid, ru) = object
++      [ "id"          .= renderNodeId nid
++      , "ruleName"    .= getRuleName ru
++      , "ruleKind"    .= ruleKindJSON ru
++      , "premises"    .= map renderFact (L.get rPrems ru)
++      , "actions"     .= map renderFact (L.get rActs ru)
++      , "conclusions" .= map renderFact (L.get rConcs ru)
++      ]
++
++    -- `"ruleName"` alone is AMBIGUOUS: `getRuleName` renders both a
++    -- built-in intruder rule (e.g. `ISendRule`) and a user protocol rule
++    -- that happens to be named the same string (e.g. a `.spthy` file
++    -- declaring `rule Send: ...`) identically as `"Send"`. This field
++    -- disambiguates by serializing the ACTUAL `RuleInfo` case (and, for
++    -- `IntrInfo`, which fixed variant), matching the tags
++    -- `tamarin_theory::rule::IntrRuleACInfo`'s own Rust enum variant
++    -- names use, so the Rust-side importer can reconstruct the right
++    -- `RuleInfo` case directly rather than re-deriving it from the
++    -- rendered name string (which is exactly the ambiguity this field
++    -- exists to remove -- see `system_import.rs`'s own doc comments for
++    -- the real bug this closes: a captured system's `Send`-named node
++    -- was actually the built-in `ISendRule`, but without this field
++    -- the Rust side had no way to tell it apart from a same-named
++    -- protocol rule and colored it as if it were the theory's own).
++    --
++    -- `ConstrRule`/`DestrRule` intentionally carry no further payload
++    -- here (their `FunSym`/name detail): the Rust-side vertex-coloring
++    -- table this feeds does not (yet) cover those two cases either way
++    -- (they are synthesized from a theory's own `functions:`/
++    -- `builtins:` declarations, not fixed across every theory), so a
++    -- bare tag is all that's needed to identify the case, not to fully
++    -- reconstruct it.
++    ruleKindJSON ru = case L.get rInfo ru of
++      -- Distinguishing `Fresh`/`Stand` here too (not just `Proto`/`Intr`)
++      -- matters: the built-in Fresh rule IS a `ProtoInfo` case (not
++      -- `IntrInfo`), rendering as `getRuleName` `"FreshRule"` --
++      -- indistinguishable from a hypothetical user rule literally
++      -- *named* `"FreshRule"` (an unlikely but real possibility: that
++      -- name is not on `reservedRuleNames`, so nothing stops a `.spthy`
++      -- file from declaring `rule FreshRule: ...`) without this tag.
++      ProtoInfo p -> case L.get praciName p of
++        FreshRule    -> object [ "tag" .= ("Proto" :: String), "variant" .= ("Fresh" :: String) ]
++        StandRule _  -> object [ "tag" .= ("Proto" :: String), "variant" .= ("Stand" :: String) ]
++      IntrInfo info -> object [ "tag" .= ("Intr" :: String), "variant" .= intrVariantTag info ]
++      where
++        intrVariantTag :: IntrRuleACInfo -> String
++        intrVariantTag (ConstrRule _ _)     = "ConstrRule"
++        intrVariantTag (DestrRule _ _ _ _ _) = "DestrRule"
++        intrVariantTag CoerceRule           = "Coerce"
++        intrVariantTag IRecvRule            = "IRecv"
++        intrVariantTag ISendRule            = "ISend"
++        intrVariantTag PubConstrRule        = "PubConstr"
++        intrVariantTag NatConstrRule        = "NatConstr"
++        intrVariantTag FreshConstrRule      = "FreshConstr"
++        intrVariantTag IEqualityRule        = "IEquality"
++
++    edgeJSON (Con.Edge (srcId, srcIdx) (tgtId, tgtIdx)) = object
++      [ "src"    .= renderNodeId srcId
++      , "srcIdx" .= getConcIdx srcIdx
++      , "tgt"    .= renderNodeId tgtId
++      , "tgtIdx" .= getPremIdx tgtIdx
++      ]
++
++    -- The constructor NAME (not `Show Reason`'s human phrase, e.g.
++    -- "fresh value") -- `Reason` is pure provenance (its own `Eq`/`Ord`
++    -- already ignore it, per `Constraints.hs`), so exact round-tripping
++    -- doesn't matter for correctness, but a stable tag string is trivial
++    -- to match against the Rust `Reason` enum's own variant names.
++    reasonTag Con.Formula        = "Formula" :: String
++    reasonTag Con.InjectiveFacts = "InjectiveFacts"
++    reasonTag Con.Fresh          = "Fresh"
++    reasonTag Con.Adversary      = "Adversary"
++    reasonTag Con.NormalForm     = "NormalForm"
++
++    lessJSON la = object
++      [ "smaller" .= renderNodeId (L.get Con.laSmaller la)
++      , "larger"  .= renderNodeId (L.get Con.laLarger la)
++      , "reason"  .= reasonTag (L.get Con.laReason la)
++      ]
++
++    eqStoreJSON (EqS.EqStore substFree (Conj disjs) _nextSplitId) = object
++      [ "subst" .= map substPairJSON (substToList substFree)
++      , "conj"  .= map conjEntryJSON disjs
++      ]
++    conjEntryJSON (splitId, substsSet) = object
++      [ "splitId"   .= EqS.unSplitId splitId
++      , "disjuncts" .= map (map substPairJSON . substToListVFresh) (S.toList substsSet)
++      ]
++
++    subtermStoreJSON (StS.SubtermStore negSt posSt solvedSt contr oldNeg) = object
++      [ "subterms"       .= map termPairJSON (S.toList posSt)
++      , "solvedSubterms" .= map termPairJSON (S.toList solvedSt)
++      , "negSubterms"    .= map termPairJSON (S.toList negSt)
++      , "oldNegSubterms" .= map termPairJSON (S.toList oldNeg)
++      , "contradictory"  .= contr
++      ]
++
+ -- | Get the graph as JSON for diff theory and given path.
+ getTheoryGraphJsonDiffR :: TheoryIdx -> DiffTheoryPath -> Handler ()
+ getTheoryGraphJsonDiffR idx path = getTheoryGraphJsonDiffR' idx path False
+diff --git a/src/Web/Theory.hs b/src/Web/Theory.hs
+index 7768c0d9..3a81914b 100644
+--- a/src/Web/Theory.hs
++++ b/src/Web/Theory.hs
+@@ -36,6 +36,7 @@ module Web.Theory
+   , dotGraphString
+   , graphJsonThyPath
+   , graphJsonDiffThyPath
++  , systemAtPath
+   )
+ where
+ 
+@@ -538,7 +539,20 @@ subProofSnippet renderUrl renderImgUrl tidx ti lemma proofPath ctxt prf =
+         [ refDotInteractiveDynamicPath renderImgUrl tidx (TheoryProof lemma proofPath)
+         | nonEmptyGraph se ]
+         ++
+-        [ preformatted (Just "sequent") (prettyNonGraphSystem se)
++        -- NOT `linkToPath`: it unconditionally tags the `<a>` with class
++        -- "internal-link", which the UI's global click handlers
++        -- (`installRelativeClickHandler("div#proof a.internal-link", ...)`,
++        -- tamarin-prover-ui.js) intercept and AJAX-load as JSON into the
++        -- current view -- exactly wrong for this link, whose response is
++        -- plain text meant to be its own page/download. `target="_blank"`
++        -- plus omitting that class lets the browser navigate normally.
++        [ withTag "a"
++              [ ("href", T.unpack $ renderUrl (TheorySystemR tidx (TheoryProof lemma proofPath)))
++              , ("target", "_blank")
++              , ("class", "extract-system")
++              ]
++              (keyword_ "extract constraint system")
++        , preformatted (Just "sequent") (prettyNonGraphSystem se)
+         , withTag "h3" [] (text $ nCases ++ " sub-case(s)")
+         ] ++
+         subCases
+@@ -1509,6 +1523,22 @@ imgThyPath imageFormat outputCommand cacheDir_ toDot toJSON thy thyPath =
+ 
+ -- | Render the image corresponding to the given theory path.
+ -- Returns Nothing if there was an error during image generation.
++-- | Resolve a 'TheoryPath' to the 'System' it denotes, if any. Used by
++-- 'Web.Handler.getTheorySystemR' to let a user extract/download the
++-- constraint system at a specific point of the proof tree (e.g. to use as
++-- a cross-implementation test fixture). Mirrors 'imgThyPath's internal
++-- @thyPathSystem@ above (kept as its own top-level function rather than
++-- shared with it, matching this module's existing pattern of one local
++-- copy per caller -- 'graphJsonThyPath' above has its own copy too).
++systemAtPath :: ClosedTheory -> TheoryPath -> Maybe System
++systemAtPath thy (TheorySource k i j) =
++    let cases = map (getDisj . (._cdCases)) (getSource k thy)
++    in  Just . snd $ cases !! (i-1) !! (j-1)
++systemAtPath thy (TheoryProof lemma proofPath) = do
++    subProof <- resolveProofPath thy lemma proofPath
++    psInfo $ root subProof
++systemAtPath _ _ = Nothing
++
+ imgDiffThyPath :: ImageFormat
+            -> FilePath               -- ^ 'dot' command
+            -> FilePath               -- ^ Tamarin's cache directory
+diff --git a/src/Web/Types.hs b/src/Web/Types.hs
+index 9fe3a544..58bdcd3f 100644
+--- a/src/Web/Types.hs
++++ b/src/Web/Types.hs
+@@ -588,6 +588,7 @@ mkYesodData "WebUI" [parseRoutes|
+ /thy/trace/#Int/graph/*TheoryPath             TheoryGraphR            GET
+ /thy/trace/#Int/interactive-graph-def/*TheoryPath             TheoryInteractiveGraphR            GET
+ /thy/trace/#Int/json/*TheoryPath          TheoryGraphJsonR            GET
++/thy/trace/#Int/system/*TheoryPath        TheorySystemR               GET
+ /thy/trace/#Int/autoprove/#SolutionExtractor/#Int/#Bool/*TheoryPath AutoProverR             GET
+ /thy/trace/#Int/autoproveAll/#SolutionExtractor/#Int/*TheoryPath AutoProverAllR             GET
+ /thy/trace/#Int/next/#String/*TheoryPath      NextTheoryPathR         GET
