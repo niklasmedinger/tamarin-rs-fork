@@ -13,7 +13,6 @@
 //! canonization to facts, rule instances, and constraint systems is still
 //! outstanding.
 use crate::{
-    function_symbols::FunSym,
     lterm::{LNTerm, LSort, LVar, Name, NameTag},
     subst::Subst,
     term::{f_app, Term},
@@ -443,6 +442,54 @@ impl Ord for BucketKey {
     }
 }
 
+/// One [`FastFreshState`] counter per [`LSort`]. [`Canonizer`] holds TWO
+/// of these -- `fresh_names` and `fresh_vars` -- kept fully independent
+/// even for the same sort: a canonical name (`fn_i`) and a canonical
+/// variable (`fv_i`) never collide as literal strings, but sharing one
+/// counter between them (the original design) meant a batch's name count
+/// could shift where its variable indices start, and vice versa --
+/// canonizing the same sort's variables could land on different indices
+/// purely because of how many names happened to be canonized alongside
+/// them in the same [`Canonizer::canonize_literals`] call. Splitting the
+/// supplies makes each kind's indices depend only on that kind's own
+/// canonization history.
+#[derive(Debug, Clone, Copy, Default)]
+struct PerSortFresh {
+    msg: FastFreshState,
+    pub_: FastFreshState,
+    fresh: FastFreshState,
+    nat: FastFreshState,
+    node: FastFreshState,
+}
+
+impl PerSortFresh {
+    /// All five sorts seeded from the same starting state -- mirrors
+    /// `Canonizer::new_inner`'s existing choice to seed every SORT from
+    /// one shared, conservative bound rather than computing a tighter
+    /// per-sort one. Unaffected by the name/var split above, which only
+    /// separates NAME supplies from VARIABLE supplies, not one sort's
+    /// supply from another's.
+    fn uniform(state: FastFreshState) -> Self {
+        PerSortFresh {
+            msg: state,
+            pub_: state,
+            fresh: state,
+            nat: state,
+            node: state,
+        }
+    }
+
+    fn get_mut(&mut self, sort: LSort) -> &mut FastFreshState {
+        match sort {
+            LSort::Msg => &mut self.msg,
+            LSort::Pub => &mut self.pub_,
+            LSort::Fresh => &mut self.fresh,
+            LSort::Nat => &mut self.nat,
+            LSort::Node => &mut self.node,
+        }
+    }
+}
+
 /// The dynamic scheduling structure driving Algorithm 1 (`CAN_alphaeqac`):
 /// a bucket queue keyed by how many literals at a position are still
 /// uncanonized, i.e. work.tex's `[(LitPos(p), p) | p in Pos(t)]` worklist
@@ -458,16 +505,13 @@ struct Canonizer {
     /// The current candidate canonical labellings of literals, i.e., sort-respeting renamings of the literals of `term` to a canonical set of fresh literals.
     subst: Vec<BTreeMap<LNLit, LNLit>>,
 
-    /// The next fresh literal of the msg sort to be used in the canonical labelling.
-    fresh_msg: FastFreshState,
-    /// The next fresh literal of the pub sort to be used in the canonical labelling.
-    fresh_pub: FastFreshState,
-    /// The next fresh literal of the fresh sort to be used in the canonical labelling.
-    fresh_fresh: FastFreshState,
-    /// The next fresh literal of the nat sort to be used in the canonical labelling.
-    fresh_nat: FastFreshState,
-    /// The next fresh literal of the node sort to be used in the canonical labelling.
-    fresh_node: FastFreshState,
+    /// The next fresh index to use for a canonical NAME (`fn_i`/`pn_i`/...)
+    /// of each sort -- independent of `fresh_vars` even for the same sort;
+    /// see [`PerSortFresh`]'s own doc comment for why.
+    fresh_names: PerSortFresh,
+    /// The next fresh index to use for a canonical VARIABLE (`mv_i`/`fv_i`/...)
+    /// of each sort -- independent of `fresh_names` even for the same sort.
+    fresh_vars: PerSortFresh,
     /// `(count, sort) -> positions currently having exactly that many
     /// uncanonized literals of that sort`, in ascending key order. A
     /// `BTreeMap` rather than an array of buckets so the smallest nonempty
@@ -530,22 +574,22 @@ impl Canonizer {
             remaining.insert(p, uncanonicalized_lits);
         }
 
-        // Some boilerplate to get the fresh literal generators to start at the right place, so that the canonicalization of a term with a non-empty initial substitution doesn't produce fresh literals that collide with the substitution's image.
-        let image: Vec<_> = subst
-            .values()
-            .copied()
-            .map(|l| crate::term::lit(l))
-            .collect();
-        let tmp = crate::term::Term::App(FunSym::List, image.into());
-        let fresh_state = crate::lterm::avoid(&tmp);
+        // Get the fresh literal generators to start at the right place, so
+        // that canonizing a term with a non-empty initial substitution
+        // doesn't produce fresh literals that collide with the
+        // substitution's image -- see `avoid_names`/`avoid_vars`'s own
+        // doc comments for why this can't just be `crate::lterm::avoid`
+        // (which only sees `Lit::Var`, not `Lit::Con`), and why the two
+        // kinds are seeded separately now that `Canonizer` keeps
+        // independent supplies for them (see `PerSortFresh`'s own doc
+        // comment).
+        let fresh_names = PerSortFresh::uniform(avoid_names(subst.values()));
+        let fresh_vars = PerSortFresh::uniform(avoid_vars(subst.values()));
 
         Canonizer {
             term: t.clone(),
-            fresh_fresh: fresh_state,
-            fresh_msg: fresh_state,
-            fresh_pub: fresh_state,
-            fresh_nat: fresh_state,
-            fresh_node: fresh_state,
+            fresh_names,
+            fresh_vars,
             subst: vec![subst],
             buckets,
             remaining,
@@ -734,14 +778,17 @@ impl Canonizer {
             }
         }
 
-        // Names and variables of the same sort share one fresh-index
-        // counter: the canonical families never collide (`fn_i` vs `fv_i`),
-        // so there is no need to keep the counters separate.
-        let name_idx = self.allocate_fresh_indices(sort, names.len() as u64);
+        // Names and variables of the same sort draw from INDEPENDENT
+        // fresh-index supplies (`fresh_names`/`fresh_vars`): even though
+        // the canonical families never collide as literal strings (`fn_i`
+        // vs `fv_i`), sharing one counter meant a batch's name count
+        // could shift where its variable indices start (and vice versa)
+        // -- see `PerSortFresh`'s own doc comment.
+        let name_idx = self.allocate_fresh_name_indices(sort, names.len() as u64);
         let canonical_names: Vec<Name> = (0..names.len() as u64)
             .map(|i| canonical_name(sort, name_idx + i))
             .collect();
-        let var_idx = self.allocate_fresh_indices(sort, vars.len() as u64);
+        let var_idx = self.allocate_fresh_var_indices(sort, vars.len() as u64);
         let canonical_vars: Vec<LVar> = (0..vars.len() as u64)
             .map(|i| canonical_var(sort, var_idx + i))
             .collect();
@@ -766,15 +813,18 @@ impl Canonizer {
         self.subst = new_substs;
     }
 
-    /// Allocate `n` fresh indices for the given sort, returning the first allocated index.
-    fn allocate_fresh_indices(&mut self, sort: LSort, n: u64) -> u64 {
-        match sort {
-            LSort::Pub => self.fresh_pub.fresh_idents(n),
-            LSort::Fresh => self.fresh_fresh.fresh_idents(n),
-            LSort::Msg => self.fresh_msg.fresh_idents(n),
-            LSort::Node => self.fresh_node.fresh_idents(n),
-            LSort::Nat => self.fresh_nat.fresh_idents(n),
-        }
+    /// Allocate `n` fresh NAME indices for `sort`, returning the first
+    /// allocated index. Independent of [`Self::allocate_fresh_var_indices`]
+    /// even for the same `sort` -- see [`PerSortFresh`]'s own doc comment.
+    fn allocate_fresh_name_indices(&mut self, sort: LSort, n: u64) -> u64 {
+        self.fresh_names.get_mut(sort).fresh_idents(n)
+    }
+
+    /// Allocate `n` fresh VARIABLE indices for `sort`, returning the first
+    /// allocated index. Independent of [`Self::allocate_fresh_name_indices`]
+    /// even for the same `sort`.
+    fn allocate_fresh_var_indices(&mut self, sort: LSort, n: u64) -> u64 {
+        self.fresh_vars.get_mut(sort).fresh_idents(n)
     }
 
     /// Computes the canonical form of `self.term`: drives [`Self::next_literals`]
@@ -800,6 +850,75 @@ impl Canonizer {
             .min_by(|(a, _), (b, _)| a.cmp(b))
             .expect("Canonizer::subst always holds at least one candidate renaming")
     }
+}
+
+/// The NAME-side half of [`Canonizer::new_inner`]'s seeding: a
+/// `FastFreshState` that won't generate any index already used by a
+/// canonical NAME literal (`Lit::Con`) in `lits`. Paired with
+/// [`avoid_vars`] for the variable-side half -- kept as two separate
+/// functions (rather than one scanning both kinds at once) now that
+/// `Canonizer` keeps independent supplies for names and variables (see
+/// [`PerSortFresh`]'s own doc comment): each half only ever needs to see
+/// its own kind.
+///
+/// **Why not just `crate::lterm::avoid`**: that function (and the
+/// `HasFrees`/`bounds_var_idx` machinery it's built on) only ever visits
+/// `Lit::Var` -- a `Lit::Con(Name)` is a structural no-op for `HasFrees`
+/// (see `lterm.rs`'s own `HasFrees for Lit<C, V>` impl: `l @ Lit::Con(_)
+/// => l`, no callback). So seeding a `Canonizer` from a substitution whose
+/// image already contains a canonical NAME literal (e.g. `fn7`, from an
+/// earlier `canonicalize_alpha_eq_ac_seeded`-style accumulation) but no
+/// canonical VARIABLE of that sort silently ignored the `7` -- a later
+/// call canonizing an unrelated term could then re-derive the same
+/// literal name `fn7` for a DIFFERENT original identifier, breaking
+/// injectivity of the accumulated labelling. This couldn't manifest
+/// while every call site passed `Subst::empty()` (`new`'s only caller
+/// shape until now), which is exactly why it went unnoticed.
+///
+/// Fixed by computing the max index the same way `avoid`/`bounds_var_idx`
+/// do ([`avoid_indices`]: reserve `[0, max+1)` so the next fresh index
+/// starts at `max+1`), but reading the numeric suffix [`canonical_name`]
+/// bakes into a name literal's string instead of relying on `HasFrees`.
+fn avoid_names<'a>(lits: impl IntoIterator<Item = &'a LNLit>) -> FastFreshState {
+    avoid_indices(lits.into_iter().filter_map(|l| match l {
+        Lit::Con(name) => canonical_name_idx(name),
+        Lit::Var(_) => None,
+    }))
+}
+
+/// The VARIABLE-side half of [`Canonizer::new_inner`]'s seeding -- the
+/// counterpart to [`avoid_names`]. Unlike the name side, an `LVar`'s
+/// index is already visible to `crate::lterm::avoid`/`HasFrees`; this
+/// exists mainly so both halves share the exact same "reserve `max+1`"
+/// logic ([`avoid_indices`]) and so `new_inner` reads symmetrically for
+/// the two independent supplies it now seeds.
+fn avoid_vars<'a>(lits: impl IntoIterator<Item = &'a LNLit>) -> FastFreshState {
+    avoid_indices(lits.into_iter().filter_map(|l| match l {
+        Lit::Var(v) => Some(v.idx),
+        Lit::Con(_) => None,
+    }))
+}
+
+/// Shared "reserve `[0, max+1)`" logic behind [`avoid_names`]/[`avoid_vars`]
+/// -- mirrors `crate::lterm::avoid`'s own reservation logic, just over a
+/// plain `u64` index iterator instead of a `HasFrees` term.
+fn avoid_indices(indices: impl IntoIterator<Item = u64>) -> FastFreshState {
+    let max = indices.into_iter().max();
+    let mut s = FastFreshState::nothing_used();
+    if let Some(max) = max {
+        s.fresh_idents(max + 1);
+    }
+    s
+}
+
+/// The inverse of [`canonical_name`]'s encoding: the `idx` baked into a
+/// canonical name's string (`"fn7"` -> `Some(7)`), or `None` if `name`
+/// isn't of that `<letters><digits>` shape (i.e. not a name this module
+/// itself produced).
+fn canonical_name_idx(name: &Name) -> Option<u64> {
+    let s = name.id.as_str();
+    let digits_start = s.find(|c: char| c.is_ascii_digit())?;
+    s[digits_start..].parse().ok()
 }
 
 /// The canonical variable of `sort` at index `idx`, per `work.tex`'s naming
@@ -927,6 +1046,144 @@ mod tests {
             expected_perms2
         );
         (ct1, ct2)
+    }
+
+    // -- 0) `Canonizer::new_with_subst` seeding: the fresh-index counters
+    //    must start past every literal already in the seed substitution's
+    //    image, whether that literal is a canonical VARIABLE or a
+    //    canonical NAME -- see `avoid_names`/`avoid_vars`'s own doc
+    //    comments for the bug this covers (`crate::lterm::avoid` alone
+    //    only sees `Lit::Var`) -- and the two kinds' supplies must stay
+    //    fully INDEPENDENT even for the same sort (see `PerSortFresh`'s
+    //    own doc comment). The term being canonized is irrelevant to this
+    //    seeding behavior, so every case below uses the same unrelated
+    //    dummy term. ---------------------------------------------------
+
+    /// Names only: a substitution whose image contains just a canonical
+    /// NAME literal (`fn7`) must push the next fresh Fresh-sorted NAME
+    /// index to 8. Before the seeding fix, `Lit::Con` was invisible to
+    /// `crate::lterm::avoid`, so this would have wrongly stayed at 0.
+    #[test]
+    fn canonizer_seeding_advances_past_a_canonical_name_in_the_substitution_image() {
+        let t = v("dummy", LSort::Msg);
+        let mut subst = BTreeMap::new();
+        subst.insert(
+            Lit::Con(Name::new(NameTag::Fresh, "origFresh")),
+            Lit::Con(canonical_name(LSort::Fresh, 7)),
+        );
+        let mut c = Canonizer::new_with_subst(&t, subst);
+        assert_eq!(
+            c.allocate_fresh_name_indices(LSort::Fresh, 1),
+            8,
+            "seeding from a substitution containing the canonical name fn7 must \
+             make the next fresh Fresh-sorted NAME index 8, not collide with fn7"
+        );
+    }
+
+    /// Vars only: the case `crate::lterm::avoid` already handled
+    /// correctly even before the seeding fix -- pinned here as a
+    /// regression guard now that seeding goes through `avoid_vars`
+    /// instead.
+    #[test]
+    fn canonizer_seeding_advances_past_a_canonical_var_in_the_substitution_image() {
+        let t = v("dummy", LSort::Msg);
+        let mut subst = BTreeMap::new();
+        subst.insert(
+            Lit::Var(LVar::new("origPub", LSort::Pub, 0)),
+            Lit::Var(canonical_var(LSort::Pub, 3)),
+        );
+        let mut c = Canonizer::new_with_subst(&t, subst);
+        assert_eq!(
+            c.allocate_fresh_var_indices(LSort::Pub, 1),
+            4,
+            "seeding from a substitution containing the canonical var pv3 must \
+             make the next fresh Pub-sorted VARIABLE index 4"
+        );
+    }
+
+    /// Both, of the SAME sort: the NAME supply and the VARIABLE supply
+    /// must seed and advance completely INDEPENDENTLY of each other --
+    /// neither one's index is affected by the other kind's index, no
+    /// matter which one happens to be larger. Checked both ways round so
+    /// a fix that accidentally shares state between the two kinds (e.g.
+    /// still taking a combined max) can't pass by accident.
+    #[test]
+    fn canonizer_seeding_keeps_the_name_and_var_supplies_independent_for_the_same_sort() {
+        let t = v("dummy", LSort::Msg);
+
+        let mut name_larger = BTreeMap::new();
+        name_larger.insert(
+            Lit::Var(LVar::new("origFresh1", LSort::Fresh, 0)),
+            Lit::Var(canonical_var(LSort::Fresh, 2)),
+        );
+        name_larger.insert(
+            Lit::Con(Name::new(NameTag::Fresh, "origFresh2")),
+            Lit::Con(canonical_name(LSort::Fresh, 9)),
+        );
+        let mut c1 = Canonizer::new_with_subst(&t, name_larger);
+        assert_eq!(
+            c1.allocate_fresh_name_indices(LSort::Fresh, 1),
+            10,
+            "the name fn9 must push the NAME supply to 10, regardless of fv2"
+        );
+        assert_eq!(
+            c1.allocate_fresh_var_indices(LSort::Fresh, 1),
+            3,
+            "the VARIABLE supply must start at 3 (past fv2 only), unaffected by fn9"
+        );
+
+        let mut var_larger = BTreeMap::new();
+        var_larger.insert(
+            Lit::Var(LVar::new("origFresh1", LSort::Fresh, 0)),
+            Lit::Var(canonical_var(LSort::Fresh, 9)),
+        );
+        var_larger.insert(
+            Lit::Con(Name::new(NameTag::Fresh, "origFresh2")),
+            Lit::Con(canonical_name(LSort::Fresh, 2)),
+        );
+        let mut c2 = Canonizer::new_with_subst(&t, var_larger);
+        assert_eq!(
+            c2.allocate_fresh_var_indices(LSort::Fresh, 1),
+            10,
+            "the var fv9 must push the VARIABLE supply to 10, regardless of fn2"
+        );
+        assert_eq!(
+            c2.allocate_fresh_name_indices(LSort::Fresh, 1),
+            3,
+            "the NAME supply must start at 3 (past fn2 only), unaffected by fv9"
+        );
+    }
+
+    /// The concrete, directly observable consequence of the split:
+    /// canonizing ONE name and ONE var of the SAME sort in the SAME batch
+    /// (`Canonizer::canonize_literals`) must assign each its own index-0
+    /// canonical literal. Under the old shared counter, the var would
+    /// have been pushed to index 1 purely because the name happened to
+    /// be allocated first within `canonize_literals`.
+    #[test]
+    fn canonize_literals_gives_a_same_sort_name_and_var_independent_index_0() {
+        let t = v("dummy", LSort::Msg); // arbitrary -- canonize_literals never reads self.term
+        let mut c = Canonizer::new(&t);
+        let orig_name = Name::new(NameTag::Fresh, "origFresh");
+        let orig_var = LVar::new("origFreshVar", LSort::Fresh, 0);
+        c.canonize_literals(&[Lit::Con(orig_name), Lit::Var(orig_var)]);
+
+        assert_eq!(
+            c.subst.len(),
+            1,
+            "one name and one var: no permutation ambiguity within either kind"
+        );
+        let subst = &c.subst[0];
+        assert_eq!(
+            subst.get(&Lit::Con(orig_name)),
+            Some(&Lit::Con(canonical_name(LSort::Fresh, 0))),
+            "the name must canonize to fn0"
+        );
+        assert_eq!(
+            subst.get(&Lit::Var(orig_var)),
+            Some(&Lit::Var(canonical_var(LSort::Fresh, 0))),
+            "the var must ALSO canonize to index 0 -- its own supply, untouched by the name"
+        );
     }
 
     // -- 1) NoEq-only terms: renaming variables of the same sort is alpha
