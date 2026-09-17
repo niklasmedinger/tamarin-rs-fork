@@ -105,7 +105,7 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 use crate::canon_color::Color;
-use crate::canon_graph::GraphPart;
+use crate::canon_graph::{GraphPart, VertexKind};
 
 const ALLOW_NO_BLISS_ENV: &str = "TAM_ALLOW_NO_BLISS";
 
@@ -194,7 +194,7 @@ pub fn bliss_available() -> bool {
 /// relabeling under which the graph maps to itself) — the same
 /// underlying mathematical object serves both roles; only the caller's
 /// interpretation differs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Permutation(Vec<usize>);
 
 impl Permutation {
@@ -217,6 +217,21 @@ impl Permutation {
 
     pub fn as_slice(&self) -> &[usize] {
         &self.0
+    }
+
+    /// `self ∘ other`: apply `other` first, then `self` — so
+    /// `self.compose(other).image_of(v) == self.image_of(other.image_of(v))`.
+    ///
+    /// Used two ways: [`generate_group`]'s BFS closure composes
+    /// candidate group elements with generators to discover new ones,
+    /// and a caller searching "minimum over automorphisms" composes
+    /// bliss's own `canonical_labeling` with each element of the closed
+    /// `Aut(G)` (`labeling.compose(&g)`) to enumerate every OTHER
+    /// canonical labeling bliss could equally validly have chosen (see
+    /// the module docs' vertex-numbering caveat and `CanonicalGraph`'s
+    /// own doc comment on "minimum over automorphisms").
+    pub fn compose(&self, other: &Permutation) -> Permutation {
+        Permutation(other.0.iter().map(|&v| self.image_of(v)).collect())
     }
 
     /// Parses bliss's 1-indexed cycle notation (e.g. `"(1,2,3)(4,5)"`,
@@ -265,6 +280,43 @@ impl Permutation {
         }
         Ok(Permutation(perm))
     }
+}
+
+/// Closes `generators` (typically `BlissResult::generators` — a
+/// GENERATING SET for `Aut(G)`, not the whole group) under composition,
+/// via a standard BFS from the identity, returning every element of the
+/// group they generate.
+///
+/// **This is necessary, not optional**: bliss reports generators, and a
+/// generating set does not enumerate the whole group by itself. Concrete
+/// counterexample: if `Aut(G) = ⟨g₁, g₂⟩` with `g₁` and `g₂` independent
+/// transpositions (disjoint supports), the group has FOUR elements — the
+/// identity, `g₁`, `g₂`, AND `g₁∘g₂` — but bliss only ever reports the
+/// two generators. Iterating over just `{id, g₁, g₂}` (skipping the BFS
+/// closure this function performs) can miss the actual minimum when
+/// finding it requires applying both independent symmetries at once —
+/// see `canon::tests::naive_generator_only_iteration_misses_the_true_minimum`
+/// for a worked, empirically-verified example built exactly this way.
+///
+/// Standard group-closure algorithm: starting from `{id}`, repeatedly
+/// compose every element discovered so far with every generator, adding
+/// any newly-seen result, until nothing new appears. This reaches every
+/// element of the generated (possibly non-abelian) group regardless of
+/// the fixed composition order, since every group element is some
+/// (finite, as the group itself is finite) product of generators.
+pub fn generate_group(generators: &[Permutation], n: usize) -> Vec<Permutation> {
+    let identity = Permutation::identity(n);
+    let mut seen: BTreeSet<Permutation> = BTreeSet::from([identity.clone()]);
+    let mut frontier: Vec<Permutation> = vec![identity];
+    while let Some(p) = frontier.pop() {
+        for g in generators {
+            let q = p.compose(g);
+            if seen.insert(q.clone()) {
+                frontier.push(q);
+            }
+        }
+    }
+    seen.into_iter().collect()
 }
 
 // =============================================================================
@@ -414,6 +466,21 @@ fn parse_bliss_stdout(stdout: &str, n: usize) -> Result<BlissResult, BlissError>
 /// `bliss` binary (see the module docs' caveat list and
 /// `differently_numbered_isomorphic_graphs_agree_after_canonicalizing`).
 ///
+/// **This is a cheap, coloring-level DIAGNOSTIC, not a sufficient
+/// $\alphaeqac$ check, and not part of the production canonical form.**
+/// Equality here is NECESSARY but not SUFFICIENT: it only says the two
+/// graphs have the same colored-digraph shape, which does not imply
+/// their vertices canonize to the same content (a `ColorTable` color is
+/// deliberately coarser than full term content — see `canon_color`'s own
+/// soundness note). Two vertices sharing a color could still hold
+/// genuinely different, non-$\alphaeqac$ term content. The actual
+/// production canonical form is `canon::canonicalize_graph_part`, which
+/// canonizes full vertex content plus edges as ONE term — this struct
+/// remains useful only as an isolated check of the coloring+bliss layer
+/// on its own, independent of the (separate, more involved) content
+/// canonization machinery, which is why it's still exercised directly in
+/// this module's own tests and in `bliss_tutorial_alphaeqac.rs`.
+///
 /// **This does NOT (yet) implement "minimum over automorphisms"**
 /// (`TODO.md`'s still-open question; the canonization plan's Stage F):
 /// when the graph has a non-trivial automorphism group, bliss's own
@@ -438,15 +505,24 @@ pub fn apply_labeling(part: &GraphPart, labeling: &Permutation) -> CanonicalGrap
     for (old_idx, v) in part.vertices.iter().enumerate() {
         vertex_colors[labeling.image_of(old_idx)] = part.colors.vertex_color(v);
     }
-    let edges = part
-        .edges
-        .iter()
-        .map(|e| (labeling.image_of(e.src), labeling.image_of(e.tgt)))
-        .collect();
     CanonicalGraph {
         vertex_colors,
-        edges,
+        edges: canonical_edges(part, labeling),
     }
+}
+
+/// `part`'s edges, remapped to canonical positions per `labeling` —
+/// factored out of [`apply_labeling`] so a caller that wants the FULL
+/// vertex content (via `canonical_vertex_order`, unlike
+/// [`CanonicalGraph`], which only keeps colors) can still get the
+/// matching canonical edge set without needing colors at all. This is
+/// exactly what `canon::canonicalize_graph_part` needs alongside
+/// `canonical_vertex_order`'s output.
+pub fn canonical_edges(part: &GraphPart, labeling: &Permutation) -> BTreeSet<(usize, usize)> {
+    part.edges
+        .iter()
+        .map(|e| (labeling.image_of(e.src), labeling.image_of(e.tgt)))
+        .collect()
 }
 
 /// Runs bliss on `part`'s graph part (colored via `part.colors`) and
@@ -457,6 +533,35 @@ pub fn canonicalize(part: &GraphPart) -> Result<CanonicalGraph, BlissError> {
     let dimacs = graph_part_to_dimacs(part)?;
     let result = run_bliss(&dimacs)?;
     Ok(apply_labeling(part, &result.canonical_labeling))
+}
+
+/// Reorders `part`'s vertices into canonical position order, per
+/// `labeling` (typically `BlissResult::canonical_labeling`) — the
+/// complementary operation to [`apply_labeling`]/[`CanonicalGraph`], for
+/// a caller that wants to canonize the vertices' own CONTENT rather than
+/// just check the graph's shape.
+///
+/// Unlike [`apply_labeling`], this keeps each vertex's FULL `VertexKind`
+/// payload (the `RuleACInst`/`GFact`/`NodeId` it carries) instead of
+/// collapsing it to a bare `Color` — `CanonicalGraph` deliberately throws
+/// that content away to stay a pure, naming-insensitive shape digest
+/// (see its own doc comment): two $\alphaeqac$ systems have genuinely
+/// different variable names in their `RuleACInst`s, so keeping raw
+/// content in something meant for a `==` shape check would make that
+/// check fail for the wrong reason. This function is for the opposite
+/// need — `tamarin_theory::canon::canonicalize_vertex_sequence`, which
+/// canonizes that content, is exactly the place a naming difference
+/// SHOULD be resolved (by renaming to a shared canonical literal), not
+/// hidden by throwing the content away first.
+pub fn canonical_vertex_order<'a>(part: &'a GraphPart, labeling: &Permutation) -> Vec<&'a VertexKind> {
+    let mut ordered: Vec<Option<&'a VertexKind>> = vec![None; part.vertices.len()];
+    for (old_idx, v) in part.vertices.iter().enumerate() {
+        ordered[labeling.image_of(old_idx)] = Some(v);
+    }
+    ordered
+        .into_iter()
+        .map(|slot| slot.expect("labeling is a bijection over part.vertices -- every slot filled"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -494,6 +599,37 @@ mod tests {
         let part = GraphPart::default();
         let err = graph_part_to_dimacs(&part).unwrap_err();
         assert!(matches!(err, BlissError::EmptyGraph));
+    }
+
+    /// Unlike `apply_labeling`, `canonical_vertex_order` must keep each
+    /// vertex's FULL content (here, distinct `NodeId`s), just reordered
+    /// -- not collapse it to a bare color the way `CanonicalGraph` does.
+    #[test]
+    fn canonical_vertex_order_reorders_full_vertex_content() {
+        use tamarin_term::lterm::{LSort, LVar};
+
+        let part = GraphPart {
+            vertices: vec![
+                VertexKind::Dummy(LVar::new("i", LSort::Node, 0)),
+                VertexKind::Dummy(LVar::new("i", LSort::Node, 1)),
+                VertexKind::Dummy(LVar::new("i", LSort::Node, 2)),
+            ],
+            ..Default::default()
+        };
+
+        // 3-cycle: 0->2, 1->0, 2->1 (0-indexed).
+        let labeling = Permutation::from_cycle_notation("(1,3,2)", 3).unwrap();
+        assert_eq!(labeling.image_of(0), 2);
+        assert_eq!(labeling.image_of(1), 0);
+        assert_eq!(labeling.image_of(2), 1);
+
+        let ordered = canonical_vertex_order(&part, &labeling);
+
+        // Canonical position `labeling.image_of(old_idx)` must hold
+        // exactly the vertex that was originally at `old_idx`.
+        assert_eq!(*ordered[2], part.vertices[0]);
+        assert_eq!(*ordered[0], part.vertices[1]);
+        assert_eq!(*ordered[1], part.vertices[2]);
     }
 
     // ---------------------------------------------------------------
@@ -561,5 +697,97 @@ mod tests {
         let canon_a = relabel(&colors_a, &edges_a, &ra.canonical_labeling);
         let canon_b = relabel(&colors_b, &edges_b, &rb.canonical_labeling);
         assert_eq!(canon_a, canon_b);
+    }
+
+    // -----------------------------------------------------------------
+    // generate_group -- pure permutation algebra, no bliss needed.
+    // -----------------------------------------------------------------
+
+    /// A single order-2 generator (a transposition) closes to exactly
+    /// `{id, g}` -- the group is already closed by construction, so this
+    /// mainly pins that `generate_group` doesn't do anything strange for
+    /// the simplest possible non-trivial case.
+    #[test]
+    fn generate_group_closes_a_single_transposition() {
+        let swap_2_3 = Permutation::from_cycle_notation("(3,4)", 4).unwrap();
+        let mut group = generate_group(std::slice::from_ref(&swap_2_3), 4);
+        group.sort();
+        let mut expected = vec![Permutation::identity(4), swap_2_3];
+        expected.sort();
+        assert_eq!(group, expected);
+    }
+
+    /// THE case `generate_group` exists for: two INDEPENDENT
+    /// (disjoint-support) transpositions generate a 4-element group --
+    /// `{id, g1, g2, g1∘g2}` -- not just the 2 generators plus identity.
+    /// A caller iterating over only `{id, g1, g2}` would never see
+    /// `g1∘g2` at all.
+    #[test]
+    fn generate_group_of_two_independent_transpositions_has_four_elements() {
+        let g1 = Permutation::from_cycle_notation("(1,2)", 6).unwrap(); // swaps 0,1
+        let g2 = Permutation::from_cycle_notation("(3,4)", 6).unwrap(); // swaps 2,3 (disjoint from g1)
+        let group = generate_group(&[g1.clone(), g2.clone()], 6);
+        assert_eq!(
+            group.len(),
+            4,
+            "Z2 x Z2 (two independent transpositions) has exactly 4 elements"
+        );
+
+        let id = Permutation::identity(6);
+        let g1_g2 = id.compose(&g1).compose(&g2); // apply g1 then g2 (order doesn't matter, disjoint)
+        let mut expected = vec![id, g1, g2, g1_g2];
+        expected.sort();
+        let mut got = group;
+        got.sort();
+        assert_eq!(got, expected);
+    }
+
+    // -----------------------------------------------------------------
+    // Real bliss run against bliss's OWN documented automorphism example
+    // (https://users.aalto.fi/~tjunttil/bliss/definitions.html, also
+    // work.tex's $G_1$ example, \Cref{ex:graph_iso}): 4 vertices, vertex
+    // 1 colored distinctly from 2/3/4, edges {1,2},{1,3},{1,4},{2,3},{2,4}
+    // (encoded here as a symmetric pair of directed edges per undirected
+    // edge, since `bliss_proc` always runs bliss with `-directed`).
+    // Documented automorphism group: `{id, (3 4)}`, generated by the
+    // single transposition swapping vertices 3 and 4.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn bliss_g1_example_has_the_documented_automorphism_group() {
+        if !bliss_available() {
+            return;
+        }
+        let dimacs = "p edge 4 10\n\
+                      n 1 1\n\
+                      n 2 0\n\
+                      n 3 0\n\
+                      n 4 0\n\
+                      e 1 2\ne 2 1\n\
+                      e 1 3\ne 3 1\n\
+                      e 1 4\ne 4 1\n\
+                      e 2 3\ne 3 2\n\
+                      e 2 4\ne 4 2\n";
+        let result = run_bliss(dimacs).expect("run_bliss");
+
+        assert_eq!(
+            result.generators.len(),
+            1,
+            "bliss's own documented generating set for this graph is the single \
+             transposition (3 4)"
+        );
+
+        let group = generate_group(&result.generators, 4);
+        let mut got = group;
+        got.sort();
+        let mut expected = vec![
+            Permutation::identity(4),
+            Permutation::from_cycle_notation("(3,4)", 4).unwrap(),
+        ];
+        expected.sort();
+        assert_eq!(
+            got, expected,
+            "Aut(G_1) is documented as exactly {{id, (3 4)}} -- two elements"
+        );
     }
 }

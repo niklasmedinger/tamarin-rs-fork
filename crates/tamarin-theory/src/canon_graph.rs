@@ -44,6 +44,14 @@
 //!   graph canonizer only ever needs to reason about vertex colors,
 //!   never edge colors. See [`VertexKind::EdgeRelation`]/
 //!   [`VertexKind::LessRelation`]/[`VertexKind::AtTimepointRelation`].
+//! - `last_atom` is reified the same way, but as a UNARY marker rather
+//!   than a binary relation (there is no "other side"): a fresh
+//!   [`VertexKind::LastAtomRelation`] vertex with a single edge to
+//!   `last_atom`'s own vertex. Added 2026-09-18 after a real gap: giving
+//!   `last_atom`'s `NodeId` a vertex without marking it as `last_atom`
+//!   left two systems differing only in WHICH node is `last_atom`
+//!   canonizing identically — a bare [`VertexKind::Dummy`] vertex looks
+//!   the same whether or not it happens to be `last_atom`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -115,6 +123,17 @@ pub enum VertexKind {
     /// treatment as `EdgeRelation`/`LessRelation` for uniformity (see
     /// the module docs' third bullet).
     AtTimepointRelation,
+    /// Reifies `System::last_atom`: `LastAtomRelation -> target`, where
+    /// `target` is whichever `RuleInstance`/`Dummy` vertex owns the
+    /// `NodeId` `last_atom` names. A UNARY marker, unlike
+    /// `EdgeRelation`/`LessRelation`/`AtTimepointRelation` (there is no
+    /// "other side" to a `last_atom` reference) — see the module docs'
+    /// fourth bullet for the gap this closes: without this marker, a
+    /// `last_atom` target that has no rule instance of its own gets a
+    /// bare [`VertexKind::Dummy`] vertex indistinguishable from any
+    /// other Dummy, so two systems differing only in WHICH node is
+    /// `last_atom` would canonize identically.
+    LastAtomRelation,
 }
 
 /// A directed structural edge, referencing vertices by their index into
@@ -197,10 +216,21 @@ pub fn extract_graph_part(sys: &System, theory: &Theory) -> GraphPart {
         push_relation(&mut vertices, &mut edges, VertexKind::LessRelation, s, t);
     }
 
-    // 4. `last_atom` — a bare reference needs a vertex even when nothing
-    //    else in the system points at it.
+    // 4. `last_atom` — reified as `LastAtomRelation -> target` (a unary
+    //    marker, not a full `push_relation`, since there is no "other
+    //    side"), so WHICH vertex is `last_atom` is discoverable via edge
+    //    topology, not just "some vertex exists for this NodeId" (which
+    //    leaves it indistinguishable from a bare edge endpoint with no
+    //    rule instance of its own — see `VertexKind::LastAtomRelation`'s
+    //    own doc comment).
     if let Some(la) = sys.last_atom {
-        get_vertex_or_create_dummy_vertex(la, &mut vertices, &mut node_vertex);
+        let target = get_vertex_or_create_dummy_vertex(la, &mut vertices, &mut node_vertex);
+        let marker_idx = vertices.len();
+        vertices.push(VertexKind::LastAtomRelation);
+        edges.push(GraphEdge {
+            src: marker_idx,
+            tgt: target,
+        });
     }
 
     // 5. Action-formula vertices: one per (unquantified) action
@@ -368,6 +398,10 @@ fn varspec_to_node_id(v: &VarSpec) -> NodeId {
 //   - [`VertexKind::AtTimepointRelation`]: a small `hexagon` — visually
 //     distinct from every other shape used here, matching that it is
 //     this module's own addition with no HS/work.tex counterpart.
+//   - [`VertexKind::LastAtomRelation`]: a small `star` — at most one per
+//     graph part (`last_atom` is an `Option<NodeId>`), so it doesn't need
+//     to visually blend in with a family of repeated relation shapes the
+//     way the others do.
 //
 // The FILL color, in contrast, is not hardcoded per kind — it comes
 // straight from `part.colors` via [`dot_fill_color`]: two vertices the
@@ -497,6 +531,14 @@ fn write_vertex(out: &mut String, idx: usize, v: &VertexKind, fill: &str) {
             writeln!(
                 out,
                 "  n{idx} [shape=hexagon, width=0.25, height=0.2, style=filled, fillcolor=\"{fill}\", label=\"{label}\"];"
+            )
+            .ok();
+        }
+        VertexKind::LastAtomRelation => {
+            let label = escape_dot_label("last");
+            writeln!(
+                out,
+                "  n{idx} [shape=star, width=0.3, height=0.3, style=filled, fillcolor=\"{fill}\", label=\"{label}\"];"
             )
             .ok();
         }
@@ -674,8 +716,54 @@ mod tests {
 
         let part = extract_graph_part(&sys, &theory(EMPTY));
 
-        assert_eq!(part.vertices, vec![VertexKind::Dummy(nid("i", 7))]);
-        assert!(part.edges.is_empty());
+        // A Dummy for the target NodeId, PLUS a LastAtomRelation marker
+        // reifying that it specifically is `last_atom` (see
+        // `VertexKind::LastAtomRelation`'s own doc comment for why a
+        // bare Dummy alone isn't enough).
+        assert_eq!(
+            part.vertices,
+            vec![VertexKind::Dummy(nid("i", 7)), VertexKind::LastAtomRelation]
+        );
+        assert_relation_unary(&part, 1, 0);
+    }
+
+    /// Asserts a UNARY relation `GraphEdge { src, tgt }` exists directly
+    /// (no intermediate vertex — unlike [`assert_relation`], which is for
+    /// the binary `src -> relation -> tgt` shape).
+    fn assert_relation_unary(part: &GraphPart, src: usize, tgt: usize) {
+        assert!(
+            part.edges.contains(&GraphEdge { src, tgt }),
+            "expected an edge {src} -> {tgt}, not found in {part:?}"
+        );
+    }
+
+    #[test]
+    fn extract_graph_part_distinguishes_which_node_is_last_atom() {
+        // Two otherwise-identical systems (same two rule instances, same
+        // insertion order) that differ ONLY in which node is `last_atom`.
+        // Before the fix, `last_atom`'s target got a bare vertex
+        // indistinguishable from any other Dummy/RuleInstance, so these
+        // two graph parts canonicalized identically — the bug this test
+        // guards against.
+        let mut sys_a = System::default();
+        sys_a.add_node(nid("i", 1), proto_rule("A"));
+        sys_a.add_node(nid("i", 2), proto_rule("A"));
+        sys_a.content_mut().last_atom = Some(nid("i", 1));
+
+        let mut sys_b = System::default();
+        sys_b.add_node(nid("i", 1), proto_rule("A"));
+        sys_b.add_node(nid("i", 2), proto_rule("A"));
+        sys_b.content_mut().last_atom = Some(nid("i", 2));
+
+        let part_a = extract_graph_part(&sys_a, &theory(EMPTY));
+        let part_b = extract_graph_part(&sys_b, &theory(EMPTY));
+
+        // Same vertex set (both nodes have rule instances, plus the
+        // LastAtomRelation marker), but the marker's edge target differs.
+        assert_eq!(part_a.vertices, part_b.vertices);
+        assert_ne!(part_a.edges, part_b.edges);
+        assert_relation_unary(&part_a, 2, 0);
+        assert_relation_unary(&part_b, 2, 1);
     }
 
     /// Pins the key design decision: two action facts sharing a

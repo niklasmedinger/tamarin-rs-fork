@@ -34,8 +34,10 @@
 use std::path::PathBuf;
 
 use tamarin_theory::bliss_proc::{
-    apply_labeling, bliss_available, graph_part_to_dimacs, run_bliss,
+    apply_labeling, bliss_available, canonical_edges, canonical_vertex_order, graph_part_to_dimacs,
+    run_bliss,
 };
+use tamarin_theory::canon::canonicalize_graph_part;
 use tamarin_theory::canon_graph::extract_graph_part;
 use tamarin_theory::elaborate::{elaborate, set_user_funs_for_theory};
 use tamarin_theory::system_import::system_from_json;
@@ -123,5 +125,26 @@ fn tutorial_khu_client_and_client_khu_systems_canonicalize_identically() {
         "the two systems' graph parts should be alphaeqac -- same canonical color \
          multiset and edge structure once each is relabeled by its own bliss \
          canonical labeling"
+    );
+
+    // The actual production canonical form (see `CanonicalGraph`'s own
+    // doc comment for why the shape check above is only a diagnostic,
+    // not sufficient on its own): put each system's vertices in its OWN
+    // bliss canonical order, keeping full RuleACInst/GFact content this
+    // time (not just colors -- see `canonical_vertex_order`), plus the
+    // matching canonical-position edge set (`canonical_edges`), and
+    // confirm the two systems' full graph parts -- rule instances,
+    // action-formula facts, edges, and less-atoms (which enter the graph
+    // via `LessRelation` vertices/edges, not a separate mechanism) --
+    // canonize to the IDENTICAL term.
+    let ordered_a = canonical_vertex_order(&part_a, &result_a.canonical_labeling);
+    let ordered_b = canonical_vertex_order(&part_b, &result_b.canonical_labeling);
+    let edges_a = canonical_edges(&part_a, &result_a.canonical_labeling);
+    let edges_b = canonical_edges(&part_b, &result_b.canonical_labeling);
+    assert_eq!(
+        canonicalize_graph_part(&ordered_a, &edges_a),
+        canonicalize_graph_part(&ordered_b, &edges_b),
+        "the two systems' full graph parts should canonize to the identical term \
+         once each is walked in its own bliss canonical order"
     );
 }

@@ -54,14 +54,17 @@
 //! differently-named rules should never be treated as $\alphaeqac$) must
 //! compare `info` separately.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use tamarin_term::alpha_eq_ac::canonicalize_alpha_eq_ac;
+use tamarin_term::alpha_eq_ac::{
+    canonicalize_alpha_eq_ac, canonicalize_alpha_eq_ac_seeded, CanonLabelling,
+};
 use tamarin_term::function_symbols::{Constructability, FunSym, NoEqSym, Privacy};
 use tamarin_term::lterm::LNTerm;
-use tamarin_term::subst::Subst;
 use tamarin_term::term::f_app_list;
 
+use crate::canon_graph::VertexKind;
 use crate::fact::{FactTag, LNFact};
 use crate::rule::Rule;
 
@@ -110,7 +113,19 @@ pub fn fact_to_term(fact: &LNFact) -> LNTerm {
 /// Canonizes a fact w.r.t. $\alphaeqac$: two facts are $\alphaeqac$ iff
 /// their [`fact_to_term`] lifts canonize syntactically equal.
 pub fn canonicalize_fact(fact: &LNFact) -> LNTerm {
-    canonicalize_alpha_eq_ac(&fact_to_term(fact), Subst::empty())
+    canonicalize_alpha_eq_ac(&fact_to_term(fact))
+}
+
+/// Canonizes a fact w.r.t. $\alphaeqac$, accumulating into `labelling`
+/// (see [`tamarin_term::alpha_eq_ac::canonicalize_alpha_eq_ac_seeded`]) --
+/// the entry point a constraint-system-wide vertex loop uses so a
+/// variable/name shared between several vertices' facts gets the SAME
+/// canonical literal everywhere, rather than each fact being canonized in
+/// isolation like [`canonicalize_fact`] does. [`canonicalize_fact`]
+/// itself is unaffected -- both are backed by the same underlying
+/// `Canonizer`, just with an empty labelling that's immediately discarded.
+pub fn canonicalize_fact_seeded(fact: &LNFact, labelling: &mut CanonLabelling) -> LNTerm {
+    canonicalize_alpha_eq_ac_seeded(&fact_to_term(fact), labelling)
 }
 
 /// Lifts a group of facts (a rule's premises, actions, or conclusions) to
@@ -132,7 +147,263 @@ pub fn rule_to_term<I>(rule: &Rule<I>) -> LNTerm {
 
 /// Canonizes a rule w.r.t. $\alphaeqac$ (see [`rule_to_term`]).
 pub fn canonicalize_rule<I>(rule: &Rule<I>) -> LNTerm {
-    canonicalize_alpha_eq_ac(&rule_to_term(rule), Subst::empty())
+    canonicalize_alpha_eq_ac(&rule_to_term(rule))
+}
+
+/// Canonizes a rule w.r.t. $\alphaeqac$, accumulating into `labelling` --
+/// the [`canonicalize_fact_seeded`] counterpart for a `RuleInstance`
+/// graph vertex (`canon_graph::VertexKind::RuleInstance`).
+pub fn canonicalize_rule_seeded<I>(rule: &Rule<I>, labelling: &mut CanonLabelling) -> LNTerm {
+    canonicalize_alpha_eq_ac_seeded(&rule_to_term(rule), labelling)
+}
+
+// =============================================================================
+// Action-formula vertices (`canon_graph::VertexKind::Action`)
+// =============================================================================
+//
+// An action-formula vertex's payload is a `GFact` -- the locally-nameless
+// formula IR's fact type -- not an `LNFact` like a rule instance's own
+// premises/actions/conclusions are. Bridging the two needs a
+// SIGNATURE-aware step (resolving a fact's argument terms' function
+// symbols to their real arity/privacy/AC-ness), which only the
+// currently-installed `elaborate` signature context can do; see
+// `action_vertex_fact`'s own doc comment for the exact precondition and
+// why this deliberately does NOT use the fallible `try_gfact_to_fact`.
+
+/// Converts an action-formula vertex's `GFact`
+/// (`canon_graph::VertexKind::Action`'s payload) to the `LNFact` it
+/// denotes, so it can be canonized exactly like a rule instance's own
+/// facts ([`canonicalize_fact_seeded`]).
+///
+/// Reuses the SAME bridge `system_import::parse_fact` already uses in
+/// production to reconstruct `LNFact`s from a captured `System`'s
+/// formula atoms: [`guarded::gfact_to_fact`] (purely structural, no
+/// signature needed) then [`crate::elaborate::fact_to_lnfact`] (resolves
+/// the fact's function-symbol names against the CURRENTLY INSTALLED
+/// signature -- see `elaborate::set_user_funs_for_theory`'s own doc
+/// comment). The caller must have that signature installed for the SAME
+/// theory `gfact` came from -- exactly the precondition
+/// `canon_graph::extract_graph_part`'s own `&Theory` parameter already
+/// implies for whoever built the `GraphPart` this vertex came from.
+///
+/// **Panics** if `gfact` still carries a `Bound` variable, or if the
+/// installed signature can't elaborate one of its terms. Both are
+/// treated as caller-contract violations, not recoverable runtime
+/// conditions: `canon_graph::collect_action_atoms` only ever extracts a
+/// `VertexKind::Action` from a GROUND, already-committed conjunct
+/// (never from inside a `Guarded::Disj` alternative or a `GGuarded`
+/// binder's body -- see that function's own doc comment), so every
+/// `GFact` this is actually called on is assumed already closed: a
+/// leftover `Bound` var surfacing here means that extraction discipline
+/// was violated somewhere upstream, which should fail loudly rather than
+/// silently mis-canonize. This is why [`guarded::gfact_to_fact`] is used
+/// deliberately instead of the fallible `guarded::try_gfact_to_fact`: a
+/// violation surfaces immediately, at the point of conversion, instead of
+/// limping forward as a `None`/`Result::Err` a caller could mishandle.
+pub fn action_vertex_fact(gfact: &GFact) -> LNFact {
+    let pfact = guarded::gfact_to_fact(gfact);
+    crate::elaborate::fact_to_lnfact(&pfact).unwrap_or_else(|e| {
+        panic!(
+            "action_vertex_fact: {e} -- {gfact:?} did not elaborate under the currently \
+             installed signature (wrong/missing set_user_funs_for_theory guard for this \
+             system's theory?)"
+        )
+    })
+}
+
+/// Canonizes an action-formula vertex's fact w.r.t. $\alphaeqac$,
+/// accumulating into `labelling` -- the [`canonicalize_fact_seeded`]
+/// counterpart for a `canon_graph::VertexKind::Action` vertex. See
+/// [`action_vertex_fact`] for the conversion this composes and its
+/// panic precondition.
+pub fn canonicalize_action_fact_seeded(gfact: &GFact, labelling: &mut CanonLabelling) -> LNTerm {
+    canonicalize_fact_seeded(&action_vertex_fact(gfact), labelling)
+}
+
+// =============================================================================
+// Graph parts (Stage D/G assembly: a whole `GraphPart`, in canonical vertex
+// order, INCLUDING its structural vertices and its edges)
+// =============================================================================
+//
+// An earlier version of this section (`vertex_sequence_to_term`) lifted only
+// the `RuleInstance`/`Action` vertices, skipping structural ones
+// (`Dummy`/`EdgeRelation`/`LessRelation`/`AtTimepointRelation`) and ignoring
+// edges entirely, on the theory that `bliss_proc::CanonicalGraph` covered
+// them separately. That left a real gap: two graphs with a genuinely
+// different vertex COUNT (e.g. one has an extra `Dummy` the other lacks) or
+// a genuinely different EDGE set could still canonize to the identical term,
+// since neither was represented at all. Fixed by encoding EVERY vertex
+// (structural ones via a marker, exactly like `fact_tag_marker` marks a
+// fact's tag) and the edge set (as pairs of canonical-position markers) into
+// the same term.
+
+/// A NUL,NUL-prefixed marker name for `suffix`, distinct from both a real
+/// function symbol (no valid Tamarin identifier contains a NUL byte) and
+/// from [`fact_tag_marker_name`]'s own NUL-prefixed markers (which use a
+/// SINGLE leading NUL followed immediately by ASCII text — a second NUL
+/// byte here guarantees the two marker families can never collide).
+fn graph_marker_name(suffix: &str) -> Vec<u8> {
+    let mut name = vec![0u8, 0u8];
+    name.extend_from_slice(suffix.as_bytes());
+    name
+}
+
+/// The 0-ary marker term for `suffix` (see [`graph_marker_name`]) — a
+/// function symbol, never a literal, so it is NEVER renamed by
+/// `CAN_alphaeqac` (unlike e.g. a public name, which — being a literal —
+/// the canonizer would try to assign a fresh canonical name to, making it
+/// useless as a fixed marker of vertex/edge IDENTITY).
+fn graph_marker(suffix: &str) -> LNTerm {
+    let sym = NoEqSym::new(
+        graph_marker_name(suffix),
+        0,
+        Privacy::Public,
+        Constructability::Constructor,
+    );
+    LNTerm::App(FunSym::NoEq(sym), Arc::from([]))
+}
+
+/// Lifts one graph vertex to a term: a `RuleInstance`/`Action` vertex
+/// lifts its own content (via [`rule_to_term`], or [`fact_to_term`] after
+/// bridging through [`action_vertex_fact`]); a structural vertex
+/// (`Dummy`/`EdgeRelation`/`LessRelation`/`AtTimepointRelation`/
+/// `LastAtomRelation`) lifts to a marker identifying its KIND (and, for
+/// `EdgeRelation`, its port indices — the same information its
+/// `ColorTable` color already encodes, here reified as a term instead of
+/// a side-channel integer).
+fn vertex_to_term(v: &VertexKind) -> LNTerm {
+    match v {
+        VertexKind::RuleInstance(_, ru) => rule_to_term(ru),
+        VertexKind::Action(_, gfact) => fact_to_term(&action_vertex_fact(gfact)),
+        VertexKind::Dummy(_) => graph_marker("Dummy"),
+        VertexKind::EdgeRelation(conc, prem) => {
+            graph_marker(&format!("EdgeRelation:{}:{}", conc.0, prem.0))
+        }
+        VertexKind::LessRelation => graph_marker("LessRelation"),
+        VertexKind::AtTimepointRelation => graph_marker("AtTimepointRelation"),
+        VertexKind::LastAtomRelation => graph_marker("LastAtomRelation"),
+    }
+}
+
+/// A marker term naming canonical vertex position `i` — used to encode an
+/// edge's endpoints. A function symbol (like [`graph_marker`]), not a
+/// name/variable literal: a canonical POSITION is already a fixed,
+/// meaningful number, not something `CAN_alphaeqac` should be free to
+/// rename.
+fn index_marker(i: usize) -> LNTerm {
+    graph_marker(&format!("idx:{i}"))
+}
+
+/// Lifts a canonical-order vertex sequence
+/// (`bliss_proc::canonical_vertex_order`'s output) PLUS its
+/// canonical-position edge set (`bliss_proc::canonical_edges`'s output)
+/// to ONE term — the constraint-system-wide generalization of
+/// [`rule_to_term`]/[`fact_to_term`]: every vertex becomes its own
+/// sub-term ([`vertex_to_term`]), nested inside one `List` in vertex
+/// order, paired with a second `List` of edges (each edge itself a pair
+/// of [`index_marker`]s). `List` is not AC, so both orderings are
+/// significant: the vertex order is what makes two isomorphic-but-
+/// differently-numbered systems line up position-for-position once each
+/// is in its OWN bliss canonical order; `edges` is expected pre-sorted
+/// (a `BTreeSet`, as `canonical_edges` returns) so the edge list doesn't
+/// depend on `GraphPart::edges`'s own creation order.
+pub fn graph_part_to_term(ordered: &[&VertexKind], edges: &BTreeSet<(usize, usize)>) -> LNTerm {
+    let vertices_term = f_app_list(ordered.iter().map(|v| vertex_to_term(v)).collect());
+    let edges_term = f_app_list(
+        edges
+            .iter()
+            .map(|&(src, tgt)| f_app_list(vec![index_marker(src), index_marker(tgt)]))
+            .collect(),
+    );
+    f_app_list(vec![vertices_term, edges_term])
+}
+
+/// Canonizes a graph part w.r.t. $\alphaeqac$ (see
+/// [`graph_part_to_term`]) — the graph-part-wide counterpart to
+/// [`canonicalize_rule`]/[`canonicalize_fact`], calling
+/// [`canonicalize_alpha_eq_ac`] exactly once over the WHOLE assembled
+/// term rather than threading a [`CanonLabelling`] across many separate
+/// per-vertex calls: since every vertex's content is nested inside one
+/// term before canonization ever runs, one `Canonizer` pass already
+/// treats every vertex's literals under one shared worklist, which is
+/// all the accumulating (`_seeded`) functions above exist to simulate
+/// across SEPARATE calls.
+///
+/// This is a SUFFICIENT canonical encoding of everything
+/// `canon_graph::extract_graph_part` extracts (rule instances, action
+/// facts, `System::edges`, and `less_atoms` — the last two both entering
+/// the graph via `EdgeRelation`/`LessRelation` vertices, so they're
+/// already covered by `ordered`/`edges` with no separate handling
+/// needed). It does NOT yet cover what `extract_graph_part` leaves out of
+/// the graph entirely: `lemmas`, `eq_store`, `subterm_store`, and any
+/// formula content beyond ground action atoms (Stage G, not yet done).
+pub fn canonicalize_graph_part(ordered: &[&VertexKind], edges: &BTreeSet<(usize, usize)>) -> LNTerm {
+    canonicalize_alpha_eq_ac(&graph_part_to_term(ordered, edges))
+}
+
+// =============================================================================
+// Minimum over automorphisms (Stage F)
+// =============================================================================
+//
+// work.tex's own suggested tie-break for a non-unique graph canonizer --
+// "pick the graph with the lexicographically smallest adjacency matrix" --
+// cannot actually work: by the definition of automorphism, EVERY element
+// of Aut(G) preserves the adjacency matrix exactly, so that criterion is
+// vacuous for choosing among automorphism-related labelings (it only ever
+// distinguishes graphs that aren't isomorphic to begin with). The
+// resolution needs the CONTENT the graph's colors are coarser than --
+// i.e. `canonicalize_graph_part`'s own term-level result.
+
+/// Resolves "minimum over automorphisms" for a graph part: applies every
+/// element of the CLOSED automorphism group (`generate_group` on
+/// `result.generators` -- NOT just the raw generators bliss reports; see
+/// its own doc comment for why that would miss candidates) to
+/// `result.canonical_labeling`, canonizes each resulting candidate via
+/// [`canonicalize_graph_part`], and returns every `(labeling, term)` pair
+/// achieving the minimum term.
+///
+/// **This resolves the ambiguity only at the graph-part level.** When the
+/// minimum is achieved by more than one labeling — a real possibility
+/// whenever the graph has a genuinely symmetric substructure whose
+/// content also ties under canonization — a caller needing a single,
+/// well-defined SYSTEM-wide canonical form must NOT pick one of the
+/// returned survivors arbitrarily: a formula elsewhere in the system can
+/// reference one of the tied substructures' variables asymmetrically,
+/// and different (both graph-part-minimal) tie-breaks can then make two
+/// genuinely $\alphaeqac$ systems land on different final canonical
+/// forms. Breaking such a tie needs the REST of the system (formulas/
+/// lemmas) as a secondary key, by extending each survivor's own
+/// accumulated labelling and re-minimizing at the full-system level —
+/// not yet implemented; this function deliberately stops at returning
+/// the tied candidates rather than picking one.
+pub fn minimal_graph_part_labelings(
+    part: &crate::canon_graph::GraphPart,
+    result: &crate::bliss_proc::BlissResult,
+) -> Vec<(crate::bliss_proc::Permutation, LNTerm)> {
+    use crate::bliss_proc::{canonical_edges, canonical_vertex_order, generate_group};
+
+    let group = generate_group(&result.generators, part.vertices.len());
+    let mut best: Vec<(crate::bliss_proc::Permutation, LNTerm)> = Vec::new();
+    for g in group {
+        let candidate_labeling = result.canonical_labeling.compose(&g);
+        let ordered = canonical_vertex_order(part, &candidate_labeling);
+        let edges = canonical_edges(part, &candidate_labeling);
+        let term = canonicalize_graph_part(&ordered, &edges);
+        match best.first() {
+            None => best.push((candidate_labeling, term)),
+            Some((_, best_term)) => match term.cmp(best_term) {
+                std::cmp::Ordering::Less => {
+                    best.clear();
+                    best.push((candidate_labeling, term));
+                }
+                std::cmp::Ordering::Equal => {
+                    best.push((candidate_labeling, term));
+                }
+                std::cmp::Ordering::Greater => {}
+            },
+        }
+    }
+    best
 }
 
 // =============================================================================
@@ -1001,7 +1272,7 @@ mod tests {
             vec![out_fact(v("x", LSort::Msg))],
         );
         let once = canonicalize_rule(&r);
-        let twice = canonicalize_alpha_eq_ac(&once, Subst::empty());
+        let twice = canonicalize_alpha_eq_ac(&once);
         assert_eq!(once, twice);
         assert_eq!(fingerprint_term(&once), fingerprint_term(&twice));
     }
@@ -1463,5 +1734,518 @@ mod tests {
         let twice = canonicalize_guarded(&once, &identity);
         assert_eq!(once, twice);
         assert_eq!(fingerprint_guarded(&once), fingerprint_guarded(&twice));
+    }
+
+    // -- Accumulating (seeded) canonization / action-formula vertices ------
+    //
+    // `canonicalize_fact_seeded`/`canonicalize_rule_seeded`/
+    // `canonicalize_action_fact_seeded` are what a constraint-system-wide
+    // vertex loop (canonizing every `RuleInstance`/`Action` graph vertex
+    // in canonical order, per `canon_graph::VertexKind`) would actually
+    // call, one per vertex, threading ONE `CanonLabelling` through all of
+    // them. These tests pin the property that machinery depends on: a
+    // variable shared between DIFFERENT vertices (a rule instance's own
+    // fact, an action-formula vertex's fact) canonizes to the SAME
+    // literal in both, and does so identically regardless of what the
+    // shared variable happened to be named originally.
+
+    /// Parses `s` as a bare fact (reusing [`g`]'s formula-parser path) and
+    /// unwraps the `GAtom::Pred` atom it must produce -- the same shape
+    /// `system_import::parse_fact`/`canon_graph::collect_action_atoms`
+    /// hand to a real `VertexKind::Action`.
+    fn gfact(s: &str) -> GFact {
+        match g(s) {
+            Guarded::Atom(GAtom::Pred(f)) => f,
+            other => panic!("{s:?} did not parse as a bare fact (Pred atom): {other:?}"),
+        }
+    }
+
+    /// Installs a minimal, no-custom-functions signature -- `action_vertex_fact`'s
+    /// precondition (mirrors `system_import.rs`'s own `install_test_signature`).
+    fn install_empty_signature() -> crate::elaborate::UserFunsForTheoryGuard {
+        let thy =
+            tamarin_parser::parser::parse_theory("theory T begin\nend", &[]).expect("parse minimal theory");
+        crate::elaborate::set_user_funs_for_theory(&thy)
+    }
+
+    #[test]
+    fn canonicalize_fact_seeded_and_rule_seeded_agree_regardless_of_the_shared_variables_name() {
+        // Pair A and pair B are the SAME shape, differing only in what the
+        // fact/rule's shared variable happens to be called.
+        let fact_a = proto_fact(Multiplicity::Linear, "P", vec![v("shared", LSort::Msg)]);
+        let rule_a = rule(vec![in_fact(v("shared", LSort::Msg))], vec![], vec![]);
+        let fact_b = proto_fact(Multiplicity::Linear, "P", vec![v("s", LSort::Msg)]);
+        let rule_b = rule(vec![in_fact(v("s", LSort::Msg))], vec![], vec![]);
+
+        let mut labelling_a = CanonLabelling::empty();
+        let fact_term_a = canonicalize_fact_seeded(&fact_a, &mut labelling_a);
+        let rule_term_a = canonicalize_rule_seeded(&rule_a, &mut labelling_a);
+
+        let mut labelling_b = CanonLabelling::empty();
+        let fact_term_b = canonicalize_fact_seeded(&fact_b, &mut labelling_b);
+        let rule_term_b = canonicalize_rule_seeded(&rule_b, &mut labelling_b);
+
+        assert_eq!(fact_term_a, fact_term_b);
+        assert_eq!(rule_term_a, rule_term_b);
+    }
+
+    #[test]
+    fn action_vertex_fact_converts_a_ground_gfact_to_the_matching_lnfact() {
+        let _guard = install_empty_signature();
+        let converted = action_vertex_fact(&gfact("P(x)"));
+        let expected = proto_fact(Multiplicity::Linear, "P", vec![v("x", LSort::Msg)]);
+        assert_eq!(converted, expected);
+    }
+
+    /// The end-to-end property this whole bridge exists for: a
+    /// `RuleInstance` vertex's own fact and an `Action` vertex's `GFact`
+    /// -- two DIFFERENT payload types -- canonize to the SAME literal for
+    /// a variable they share, via one accumulated labelling, exactly like
+    /// two `RuleInstance` vertices already do above.
+    #[test]
+    fn action_vertex_and_rule_instance_share_a_variable_via_one_labelling() {
+        let _guard = install_empty_signature();
+
+        let rule_a = rule(vec![in_fact(v("shared", LSort::Msg))], vec![], vec![]);
+        let action_a = gfact("Foo(shared)");
+        let rule_b = rule(vec![in_fact(v("s", LSort::Msg))], vec![], vec![]);
+        let action_b = gfact("Foo(s)");
+
+        let mut labelling_a = CanonLabelling::empty();
+        let rule_term_a = canonicalize_rule_seeded(&rule_a, &mut labelling_a);
+        let action_term_a = canonicalize_action_fact_seeded(&action_a, &mut labelling_a);
+
+        let mut labelling_b = CanonLabelling::empty();
+        let rule_term_b = canonicalize_rule_seeded(&rule_b, &mut labelling_b);
+        let action_term_b = canonicalize_action_fact_seeded(&action_b, &mut labelling_b);
+
+        assert_eq!(rule_term_a, rule_term_b);
+        assert_eq!(
+            action_term_a, action_term_b,
+            "the action vertex's variable must canonize to the same literal as the \
+             rule instance's shared variable, regardless of its original name"
+        );
+    }
+
+    /// The explicit invariant this session's design relies on: an action
+    /// vertex's `GFact` is assumed already closed (no leftover `Bound`
+    /// var) by construction (`canon_graph::collect_action_atoms` never
+    /// extracts one from inside a `Disj`/`GGuarded` scope). A violation
+    /// must panic loudly, not be swallowed by a fallible conversion.
+    #[test]
+    #[should_panic(expected = "left-over bound variable")]
+    fn action_vertex_fact_panics_on_a_leftover_bound_variable() {
+        let _guard = install_empty_signature();
+        let bound_gfact = GFact {
+            persistent: false,
+            name: "P".to_string(),
+            args: std::sync::Arc::from([GTerm::Var(BVar::Bound(0))]),
+            annotations: Vec::new(),
+        };
+        let _ = action_vertex_fact(&bound_gfact);
+    }
+
+    // -- Graph parts (`graph_part_to_term`/`canonicalize_graph_part`) --
+
+    fn rule_ac_inst(
+        name: &'static str,
+        premises: Vec<LNFact>,
+        actions: Vec<LNFact>,
+        conclusions: Vec<LNFact>,
+    ) -> crate::rule::RuleACInst {
+        use crate::rule::{ProtoRuleACInstInfo, ProtoRuleName, RuleAttributes, RuleInfo};
+        Rule::new(
+            RuleInfo::Proto(ProtoRuleACInstInfo {
+                name: ProtoRuleName::Stand(name),
+                attributes: RuleAttributes::empty(),
+                loop_breakers: Vec::new(),
+            }),
+            premises,
+            conclusions,
+            actions,
+        )
+    }
+
+    fn node(idx: u64) -> crate::constraint::constraints::NodeId {
+        LVar::new("i", LSort::Node, idx)
+    }
+
+    #[test]
+    fn graph_part_of_rule_instances_matches_a_hand_built_term() {
+        let r1 = rule_ac_inst("A", vec![in_fact(v("x", LSort::Msg))], vec![], vec![]);
+        let r2 = rule_ac_inst("B", vec![], vec![], vec![out_fact(v("y", LSort::Msg))]);
+        let vertices = [
+            VertexKind::RuleInstance(node(0), r1.clone()),
+            VertexKind::RuleInstance(node(1), r2.clone()),
+        ];
+        let ordered: Vec<&VertexKind> = vertices.iter().collect();
+        let edges = BTreeSet::from([(0usize, 1usize)]);
+
+        let expected_vertices = f_app_list(vec![rule_to_term(&r1), rule_to_term(&r2)]);
+        let expected_edges = f_app_list(vec![f_app_list(vec![index_marker(0), index_marker(1)])]);
+        let expected = f_app_list(vec![expected_vertices, expected_edges]);
+        assert_eq!(graph_part_to_term(&ordered, &edges), expected);
+    }
+
+    /// THE regression test for the false positive this redesign fixes
+    /// (`vertex_sequence_to_term`'s earlier version skipped structural
+    /// vertices entirely): two graph parts whose `RuleInstance` vertices
+    /// are identical -- same content, same relative order -- but whose
+    /// TOTAL vertex count differs (one has an extra structural `Dummy`
+    /// the other lacks entirely) must NOT canonize equal. They are not
+    /// even the same size, let alone $\alphaeqac$.
+    #[test]
+    fn graph_part_to_term_distinguishes_different_vertex_counts() {
+        let r1 = rule_ac_inst("A", vec![in_fact(v("x", LSort::Msg))], vec![], vec![]);
+        let r2 = rule_ac_inst("B", vec![], vec![], vec![out_fact(v("y", LSort::Msg))]);
+
+        let without_dummy = [
+            VertexKind::RuleInstance(node(0), r1.clone()),
+            VertexKind::RuleInstance(node(1), r2.clone()),
+        ];
+        let with_dummy = [
+            VertexKind::RuleInstance(node(0), r1),
+            VertexKind::Dummy(node(2)),
+            VertexKind::RuleInstance(node(1), r2),
+        ];
+
+        let a: Vec<&VertexKind> = without_dummy.iter().collect();
+        let b: Vec<&VertexKind> = with_dummy.iter().collect();
+        let no_edges = BTreeSet::new();
+        assert_ne!(
+            canonicalize_graph_part(&a, &no_edges),
+            canonicalize_graph_part(&b, &no_edges),
+            "a graph part with an extra structural vertex must not canonize equal to \
+             one without it, even if their RuleInstance content is otherwise identical"
+        );
+    }
+
+    /// Different structural KINDS at the same position must also be
+    /// told apart (not just "structural vs not").
+    #[test]
+    fn graph_part_to_term_distinguishes_structural_vertex_kinds() {
+        let dummy = [VertexKind::Dummy(node(0))];
+        let less = [VertexKind::LessRelation];
+        let a: Vec<&VertexKind> = dummy.iter().collect();
+        let b: Vec<&VertexKind> = less.iter().collect();
+        let no_edges = BTreeSet::new();
+        assert_ne!(
+            graph_part_to_term(&a, &no_edges),
+            graph_part_to_term(&b, &no_edges)
+        );
+    }
+
+    /// Two graph parts with the IDENTICAL vertex sequence but DIFFERENT
+    /// edges must not canonize equal -- edges are now part of the
+    /// encoding, not left to a separate, unrelated shape check.
+    #[test]
+    fn graph_part_to_term_distinguishes_different_edge_sets() {
+        let r1 = rule_ac_inst("A", vec![], vec![], vec![]);
+        let r2 = rule_ac_inst("B", vec![], vec![], vec![]);
+        let vertices = [
+            VertexKind::RuleInstance(node(0), r1),
+            VertexKind::RuleInstance(node(1), r2),
+        ];
+        let ordered: Vec<&VertexKind> = vertices.iter().collect();
+
+        let edge_0_to_1 = BTreeSet::from([(0usize, 1usize)]);
+        let edge_1_to_0 = BTreeSet::from([(1usize, 0usize)]);
+        assert_ne!(
+            graph_part_to_term(&ordered, &edge_0_to_1),
+            graph_part_to_term(&ordered, &edge_1_to_0)
+        );
+    }
+
+    /// `List` is not AC, so vertex ORDER is significant: two sequences
+    /// with the same vertices in a DIFFERENT order must not canonize
+    /// equal (unless that reordering happens to itself be an
+    /// automorphism of the underlying content, which this example is
+    /// deliberately built to avoid).
+    #[test]
+    fn graph_part_order_is_significant() {
+        let r1 = rule_ac_inst("A", vec![in_fact(v("x", LSort::Msg))], vec![], vec![]);
+        let r2 = rule_ac_inst("B", vec![], vec![], vec![out_fact(v("y", LSort::Msg))]);
+
+        let forward = [
+            VertexKind::RuleInstance(node(0), r1.clone()),
+            VertexKind::RuleInstance(node(1), r2.clone()),
+        ];
+        let backward = [
+            VertexKind::RuleInstance(node(1), r2),
+            VertexKind::RuleInstance(node(0), r1),
+        ];
+
+        let a: Vec<&VertexKind> = forward.iter().collect();
+        let b: Vec<&VertexKind> = backward.iter().collect();
+        let no_edges = BTreeSet::new();
+        assert_ne!(
+            canonicalize_graph_part(&a, &no_edges),
+            canonicalize_graph_part(&b, &no_edges)
+        );
+    }
+
+    /// The end-to-end property this whole design exists for, expressed
+    /// directly at the graph-part level (the bliss-level counterpart
+    /// lives in `bliss_tutorial_alphaeqac.rs`): a `RuleInstance` vertex
+    /// and an `Action` vertex sharing a variable canonize that variable
+    /// to the SAME literal, automatically -- ONE `Canonizer` pass over
+    /// the whole nested term treats a shared literal VALUE as one entry
+    /// no matter which sub-term it occurs in, so no explicit accumulator
+    /// threading is needed here (contrast the `_seeded` functions above,
+    /// which exist for the case where each vertex must be canonized in
+    /// its OWN separate call).
+    #[test]
+    fn graph_part_shares_a_variable_between_a_rule_instance_and_an_action_vertex() {
+        let _guard = install_empty_signature();
+
+        let rule_a = rule_ac_inst("R", vec![in_fact(v("shared", LSort::Msg))], vec![], vec![]);
+        let action_a = gfact("Foo(shared)");
+        let seq_a = [
+            VertexKind::RuleInstance(node(0), rule_a),
+            VertexKind::Action(node(0), action_a),
+        ];
+
+        let rule_b = rule_ac_inst("R", vec![in_fact(v("s", LSort::Msg))], vec![], vec![]);
+        let action_b = gfact("Foo(s)");
+        let seq_b = [
+            VertexKind::RuleInstance(node(0), rule_b),
+            VertexKind::Action(node(0), action_b),
+        ];
+
+        let a: Vec<&VertexKind> = seq_a.iter().collect();
+        let b: Vec<&VertexKind> = seq_b.iter().collect();
+        let no_edges = BTreeSet::new();
+        assert_eq!(
+            canonicalize_graph_part(&a, &no_edges),
+            canonicalize_graph_part(&b, &no_edges),
+            "the variable shared between the rule instance and the action vertex must \
+             canonize identically regardless of its original name"
+        );
+    }
+
+    // -- Minimum over automorphisms (`minimal_graph_part_labelings`) --
+
+    use crate::bliss_proc::bliss_available;
+    use crate::canon_color::ColorTable;
+
+    fn theory(src: &str) -> crate::theory::Theory {
+        let parsed = tamarin_parser::parser::parse_theory(src, &[]).unwrap_or_else(|e| panic!("parse: {e}"));
+        crate::elaborate::elaborate(&parsed).unwrap_or_else(|e| panic!("elaborate: {e:?}"))
+    }
+
+    /// A ground 0-ary NoEq function symbol term, e.g. for `name = "aaa"`
+    /// a term that is never renamed by `CAN_alphaeqac` (unlike a name/var
+    /// literal) and orders by NAME -- exactly what's needed to build
+    /// content whose relative order is fixed and predictable across
+    /// canonization, for testing which automorphism candidate wins.
+    fn zero_ary_fun_term(name: &'static str) -> LNTerm {
+        let sym = NoEqSym::new(
+            name.as_bytes().to_vec(),
+            0,
+            Privacy::Public,
+            Constructability::Constructor,
+        );
+        LNTerm::App(FunSym::NoEq(sym), Arc::from([]))
+    }
+
+    fn rule_with_conclusion(name: &'static str, concl: LNTerm) -> crate::rule::RuleACInst {
+        rule_ac_inst(name, vec![], vec![], vec![out_fact(concl)])
+    }
+
+    /// `minimal_graph_part_labelings` on bliss's own $G_1$ shape (4
+    /// vertices, vertex 1 distinctly colored, `Aut(G) = {id, (3 4)}` --
+    /// see `bliss_proc::tests::bliss_g1_example_has_the_documented_automorphism_group`),
+    /// but with REAL rule-instance content at vertices 3/4 that's
+    /// asymmetric enough to fully resolve the tie: exactly ONE labeling
+    /// must survive, and it must be the one placing the lexicographically
+    /// smaller content ahead of the larger one.
+    #[test]
+    fn minimal_graph_part_labelings_resolves_a_tie_broken_by_content() {
+        if !bliss_available() {
+            return;
+        }
+        use crate::bliss_proc::{graph_part_to_dimacs, run_bliss};
+        use crate::canon_graph::{GraphEdge, GraphPart};
+
+        let colors = ColorTable::build(&theory(
+            "theory T begin\n\
+             rule Hub:\n  [] --> []\n\
+             rule Leaf:\n  [] --> []\n\
+             end",
+        ));
+
+        let a_fun = zero_ary_fun_term("aaa");
+        let z_fun = zero_ary_fun_term("zzz");
+
+        // Vertex 0 = hub (uniquely colored, like G_1's vertex 1); vertices
+        // 1/2 = the two symmetric leaves (like G_1's vertices 3/4), one
+        // holding the lexicographically SMALLER content, one the LARGER.
+        let vertices = vec![
+            VertexKind::RuleInstance(node(0), rule_ac_inst("Hub", vec![], vec![], vec![])),
+            VertexKind::RuleInstance(node(1), rule_with_conclusion("Leaf", z_fun)),
+            VertexKind::RuleInstance(node(2), rule_with_conclusion("Leaf", a_fun)),
+        ];
+        let edges = vec![
+            GraphEdge { src: 0, tgt: 1 },
+            GraphEdge { src: 0, tgt: 2 },
+        ];
+        let part = GraphPart {
+            vertices,
+            edges,
+            colors,
+        };
+
+        let dimacs = graph_part_to_dimacs(&part).unwrap_or_else(|e| panic!("dimacs: {e}"));
+        let result = run_bliss(&dimacs).unwrap_or_else(|e| panic!("run_bliss: {e}"));
+        assert_eq!(
+            result.generators.len(),
+            1,
+            "one hub with two symmetric leaves has the same {{id, swap}} automorphism \
+             group as bliss's own G_1 example"
+        );
+
+        let survivors = minimal_graph_part_labelings(&part, &result);
+        assert_eq!(
+            survivors.len(),
+            1,
+            "the leaves' asymmetric content (aaa vs zzz) must fully resolve the tie \
+             the graph SHAPE alone leaves open"
+        );
+
+        // The winning term must be strictly smaller than the one and only
+        // OTHER candidate (the non-surviving labeling) -- confirms the
+        // filter actually discriminated on content, not just accepted
+        // whichever candidate came first.
+        let group = crate::bliss_proc::generate_group(&result.generators, 3);
+        let all_terms: Vec<LNTerm> = group
+            .iter()
+            .map(|g| {
+                let labeling = result.canonical_labeling.compose(g);
+                let ordered = crate::bliss_proc::canonical_vertex_order(&part, &labeling);
+                let edges = crate::bliss_proc::canonical_edges(&part, &labeling);
+                canonicalize_graph_part(&ordered, &edges)
+            })
+            .collect();
+        assert_eq!(all_terms.len(), 2, "Aut(G) = {{id, swap}} has exactly 2 elements");
+        assert_eq!(&survivors[0].1, all_terms.iter().min().unwrap());
+        assert!(
+            all_terms.iter().any(|t| *t != survivors[0].1),
+            "the two candidates must actually differ, or this test isn't exercising \
+             the content-based tie-break at all"
+        );
+    }
+
+    /// THE regression test for why `minimal_graph_part_labelings` MUST
+    /// use `generate_group`'s full closure rather than iterating over
+    /// `{id} ∪ result.generators` directly: a graph with automorphism
+    /// group `Aut(G) = Z2 × Z2` (two independent, disjoint-support leaf
+    /// swaps -- bliss reports 2 generators for it, not 4 elements), built
+    /// so that the TRUE minimum is achieved ONLY by applying BOTH swaps
+    /// together. "Naive" iteration over just `{id, g1, g2}` never tries
+    /// `g1∘g2`, so it converges on a candidate that is NOT the true
+    /// minimum.
+    ///
+    /// Construction: two independent hub+2-leaves components (`HubA`
+    /// with `LeafA` children, `HubB` with `LeafB` children, no edges
+    /// between the components). Each component's two leaves hold the
+    /// SAME pair of contents (`zzz` and `aaa`) as the OTHER component's
+    /// leaves, so minimizing EACH component independently requires its
+    /// OWN swap decision -- fixing one component's swap does nothing for
+    /// the other's, so only the labeling applying BOTH swaps reaches the
+    /// lexicographically smallest overall sequence.
+    #[test]
+    fn naive_generator_only_iteration_misses_the_true_minimum() {
+        if !bliss_available() {
+            return;
+        }
+        use crate::bliss_proc::{
+            canonical_edges, canonical_vertex_order, generate_group, graph_part_to_dimacs, run_bliss,
+        };
+        use crate::canon_graph::{GraphEdge, GraphPart};
+
+        let colors = ColorTable::build(&theory(
+            "theory T begin\n\
+             rule HubA:\n  [] --> []\n\
+             rule HubB:\n  [] --> []\n\
+             rule LeafA:\n  [] --> []\n\
+             rule LeafB:\n  [] --> []\n\
+             end",
+        ));
+
+        // NOTE: which physical vertex holds "aaa" vs "zzz" here was chosen
+        // empirically (by inspecting bliss's actual reported canonical
+        // labeling for this exact graph) so that bliss's OWN default
+        // labeling (`g = id`) is sub-optimal for BOTH leaf pairs at once
+        // -- otherwise `id` or a single generator could coincidentally
+        // already reach the true minimum, and the test would not
+        // actually exercise the gap `generate_group` closes. See this
+        // test's own doc comment.
+        let vertices = vec![
+            VertexKind::RuleInstance(node(0), rule_ac_inst("HubA", vec![], vec![], vec![])), // 0
+            VertexKind::RuleInstance(node(1), rule_with_conclusion("LeafA", zero_ary_fun_term("aaa"))), // 1
+            VertexKind::RuleInstance(node(2), rule_with_conclusion("LeafA", zero_ary_fun_term("zzz"))), // 2
+            VertexKind::RuleInstance(node(3), rule_ac_inst("HubB", vec![], vec![], vec![])), // 3
+            VertexKind::RuleInstance(node(4), rule_with_conclusion("LeafB", zero_ary_fun_term("aaa"))), // 4
+            VertexKind::RuleInstance(node(5), rule_with_conclusion("LeafB", zero_ary_fun_term("zzz"))), // 5
+        ];
+        let edges = vec![
+            GraphEdge { src: 0, tgt: 1 },
+            GraphEdge { src: 0, tgt: 2 },
+            GraphEdge { src: 3, tgt: 4 },
+            GraphEdge { src: 3, tgt: 5 },
+        ];
+        let part = GraphPart {
+            vertices,
+            edges,
+            colors,
+        };
+
+        let dimacs = graph_part_to_dimacs(&part).unwrap_or_else(|e| panic!("dimacs: {e}"));
+        let result = run_bliss(&dimacs).unwrap_or_else(|e| panic!("run_bliss: {e}"));
+        assert_eq!(
+            result.generators.len(),
+            2,
+            "two independent leaf-pair swaps -- bliss should report exactly 2 generators"
+        );
+
+        let full_group = generate_group(&result.generators, part.vertices.len());
+        assert_eq!(
+            full_group.len(),
+            4,
+            "Aut(G) = Z2 x Z2 (two independent swaps) has 4 elements: id, g1, g2, g1*g2 \
+             -- strictly more than bliss's own 2 reported generators"
+        );
+
+        // "Naive" iteration: only {id} ∪ the raw generators bliss
+        // reported -- i.e. exactly what a caller would try if it skipped
+        // `generate_group`'s closure step.
+        let naive_candidates: Vec<crate::bliss_proc::Permutation> =
+            std::iter::once(crate::bliss_proc::Permutation::identity(part.vertices.len()))
+                .chain(result.generators.iter().cloned())
+                .collect();
+        assert_eq!(naive_candidates.len(), 3, "naive set: id + 2 raw generators");
+        let naive_min = naive_candidates
+            .iter()
+            .map(|g| {
+                let labeling = result.canonical_labeling.compose(g);
+                let ordered = canonical_vertex_order(&part, &labeling);
+                let edges = canonical_edges(&part, &labeling);
+                canonicalize_graph_part(&ordered, &edges)
+            })
+            .min()
+            .unwrap();
+
+        // Correct: minimize over the FULL closed group (what
+        // `minimal_graph_part_labelings` actually does).
+        let survivors = minimal_graph_part_labelings(&part, &result);
+        let true_min = &survivors[0].1;
+
+        assert!(
+            *true_min < naive_min,
+            "the true minimum (found only by trying g1∘g2, via full group closure) must \
+             be strictly smaller than whatever naive {{id}} ∪ raw-generators iteration \
+             finds -- otherwise this test isn't actually exercising the gap group \
+             closure fixes"
+        );
     }
 }

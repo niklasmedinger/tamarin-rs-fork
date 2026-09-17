@@ -14,7 +14,6 @@
 //! outstanding.
 use crate::{
     lterm::{LNTerm, LSort, LVar, Name, NameTag},
-    subst::Subst,
     term::{f_app, Term},
     vterm::Lit,
 };
@@ -464,7 +463,7 @@ struct PerSortFresh {
 
 impl PerSortFresh {
     /// All five sorts seeded from the same starting state -- mirrors
-    /// `Canonizer::new_inner`'s existing choice to seed every SORT from
+    /// [`CanonLabelling::from_theta`]'s choice to seed every SORT from
     /// one shared, conservative bound rather than computing a tighter
     /// per-sort one. Unaffected by the name/var split above, which only
     /// separates NAME supplies from VARIABLE supplies, not one sort's
@@ -487,6 +486,75 @@ impl PerSortFresh {
             LSort::Nat => &mut self.nat,
             LSort::Node => &mut self.node,
         }
+    }
+}
+
+/// An accumulating canonical labelling, threaded across a SEQUENCE of
+/// [`canonicalize_alpha_eq_ac_seeded`] calls (one per graph vertex, in
+/// canonical vertex order -- see `tamarin_theory::canon`'s vertex-level
+/// canonization, which lifts this to facts/rule instances/action-formula
+/// facts). Bundles the winning `theta` with the [`PerSortFresh`] cursors
+/// live at the point it was produced.
+///
+/// **Why a bundle, not just `theta`**: a canonical NAME literal's index
+/// is baked into its display string with no separate numeric field (see
+/// `canonical_name`'s own doc comment) — `crate::lterm::avoid` only ever
+/// sees `Lit::Var`, so reconstructing "where to resume allocating fresh
+/// indices" purely from `theta`'s rendered image can silently miss an
+/// already-used canonical name and later re-derive it for a different
+/// original identifier, breaking injectivity of the accumulated
+/// labelling (the exact bug `avoid_names`/`avoid_vars` were written to
+/// fix). Carrying the cursors forward explicitly — mutate-in-place
+/// across calls, never reconstructed — sidesteps that class of bug
+/// entirely rather than just patching this one instance of it.
+///
+/// `Clone` because a caller minimizing over several candidates (e.g. a
+/// future automorphism search) needs each candidate to fork its own
+/// independent accumulator rather than share mutable state.
+#[derive(Debug, Clone, Default)]
+pub struct CanonLabelling {
+    theta: BTreeMap<LNLit, LNLit>,
+    fresh_names: PerSortFresh,
+    fresh_vars: PerSortFresh,
+}
+
+impl CanonLabelling {
+    /// The starting point for a fresh accumulation: no literal fixed yet,
+    /// every fresh-index cursor at 0.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Builds a labelling from a THETA OBTAINED SOME OTHER WAY (not
+    /// accumulated incrementally via this type) — e.g. one already
+    /// computed by a caller that doesn't (yet) thread a `CanonLabelling`
+    /// through its own pipeline. Re-derives safe fresh-index cursors from
+    /// `theta`'s image via [`avoid_names`]/[`avoid_vars`], the one
+    /// remaining use for those two functions now that the primary path
+    /// (`empty` + repeated [`canonicalize_alpha_eq_ac_seeded`] calls)
+    /// tracks its own cursors explicitly and never needs to reconstruct
+    /// them.
+    pub fn from_theta(theta: BTreeMap<LNLit, LNLit>) -> Self {
+        let fresh_names = PerSortFresh::uniform(avoid_names(theta.values()));
+        let fresh_vars = PerSortFresh::uniform(avoid_vars(theta.values()));
+        CanonLabelling {
+            theta,
+            fresh_names,
+            fresh_vars,
+        }
+    }
+
+    /// The literal-to-literal renaming accumulated so far.
+    pub fn theta(&self) -> &BTreeMap<LNLit, LNLit> {
+        &self.theta
+    }
+
+    /// Consumes the labelling, keeping only the accumulated renaming --
+    /// what a caller that's done accumulating (e.g. about to canonize a
+    /// formula via `canon::canonicalize_guarded`, which takes `theta` by
+    /// reference and needs nothing else from this type) actually wants.
+    pub fn into_theta(self) -> BTreeMap<LNLit, LNLit> {
+        self.theta
     }
 }
 
@@ -536,15 +604,25 @@ impl Canonizer {
     /// with its literal set, bucketed by set size and indexed by literal.
     /// Positions with no literals (e.g. an AC-group position selecting only
     /// compound subterms) are omitted, since they are never popped.
+    /// Starts from an empty [`CanonLabelling`] -- no accumulation.
     fn new(t: &LNTerm) -> Self {
-        Self::new_inner(t, BTreeMap::new())
+        Self::new_with_labelling(t, CanonLabelling::empty())
     }
 
-    fn new_with_subst(t: &LNTerm, subst: BTreeMap<LNLit, LNLit>) -> Self {
-        Self::new_inner(t, subst)
-    }
+    /// Like [`Self::new`], but seeded from `labelling`: every literal
+    /// already in `labelling.theta` is treated as already-canonized (its
+    /// position's uncanonized-literal count excludes it), and the fresh-
+    /// index cursors pick up exactly where `labelling` left them -- see
+    /// [`CanonLabelling`]'s own doc comment for why this is now a plain
+    /// field copy rather than a `crate::lterm::avoid`/`avoid_names`/
+    /// `avoid_vars` reconstruction.
+    fn new_with_labelling(t: &LNTerm, labelling: CanonLabelling) -> Self {
+        let CanonLabelling {
+            theta,
+            fresh_names,
+            fresh_vars,
+        } = labelling;
 
-    fn new_inner(t: &LNTerm, subst: BTreeMap<LNLit, LNLit>) -> Self {
         let mut buckets: BTreeMap<BucketKey, BTreeSet<Position>> = BTreeMap::new();
         let mut remaining: BTreeMap<Position, BTreeSet<LNLit>> = BTreeMap::new();
         let mut occurs_in: BTreeMap<LNLit, Vec<Position>> = BTreeMap::new();
@@ -559,7 +637,7 @@ impl Canonizer {
             }
             let uncanonicalized_lits: BTreeSet<_> = lits
                 .into_iter()
-                .filter(|l| !subst.contains_key(l))
+                .filter(|l| !theta.contains_key(l))
                 .collect();
             let mut sort_counts: BTreeMap<LSort, usize> = BTreeMap::new();
             for l in &uncanonicalized_lits {
@@ -574,23 +652,11 @@ impl Canonizer {
             remaining.insert(p, uncanonicalized_lits);
         }
 
-        // Get the fresh literal generators to start at the right place, so
-        // that canonizing a term with a non-empty initial substitution
-        // doesn't produce fresh literals that collide with the
-        // substitution's image -- see `avoid_names`/`avoid_vars`'s own
-        // doc comments for why this can't just be `crate::lterm::avoid`
-        // (which only sees `Lit::Var`, not `Lit::Con`), and why the two
-        // kinds are seeded separately now that `Canonizer` keeps
-        // independent supplies for them (see `PerSortFresh`'s own doc
-        // comment).
-        let fresh_names = PerSortFresh::uniform(avoid_names(subst.values()));
-        let fresh_vars = PerSortFresh::uniform(avoid_vars(subst.values()));
-
         Canonizer {
             term: t.clone(),
             fresh_names,
             fresh_vars,
-            subst: vec![subst],
+            subst: vec![theta],
             buckets,
             remaining,
             occurs_in,
@@ -833,7 +899,15 @@ impl Canonizer {
     /// smallest result, which is automatically in `CAN_AC` normal form since
     /// [`apply_literal_renaming`] rebuilds through the term's smart
     /// constructors (Algorithm 1, `CAN_alphaeqac`, `work.tex`).
-    fn canonize(&mut self) -> (LNTerm, BTreeMap<LNLit, LNLit>) {
+    ///
+    /// Returns the winning candidate packaged as a [`CanonLabelling`], not
+    /// a bare `theta`: `self.fresh_names`/`self.fresh_vars` at this point
+    /// are well-defined regardless of WHICH candidate wins, since
+    /// [`Self::allocate_fresh_name_indices`]/[`Self::allocate_fresh_var_indices`]
+    /// mutate the SAME shared counters before branching into the
+    /// permutation cross-product -- every live candidate consumed
+    /// identical index ranges, just assigned to different literals.
+    fn canonize(&mut self) -> (LNTerm, CanonLabelling) {
         while let Some(lits) = self.next_literals() {
             self.canonize_literals(&lits);
         }
@@ -841,18 +915,24 @@ impl Canonizer {
         let term = self.term.clone();
         let candidates = std::mem::take(&mut self.subst);
         self.considered_permutations = candidates.len();
-        candidates
+        let (canon_term, theta) = candidates
             .into_iter()
             .map(|subst| {
                 let canon_term = apply_literal_renaming(&term, &subst);
                 (canon_term, subst)
             })
             .min_by(|(a, _), (b, _)| a.cmp(b))
-            .expect("Canonizer::subst always holds at least one candidate renaming")
+            .expect("Canonizer::subst always holds at least one candidate renaming");
+        let labelling = CanonLabelling {
+            theta,
+            fresh_names: self.fresh_names,
+            fresh_vars: self.fresh_vars,
+        };
+        (canon_term, labelling)
     }
 }
 
-/// The NAME-side half of [`Canonizer::new_inner`]'s seeding: a
+/// The NAME-side half of [`CanonLabelling::from_theta`]'s reconstruction: a
 /// `FastFreshState` that won't generate any index already used by a
 /// canonical NAME literal (`Lit::Con`) in `lits`. Paired with
 /// [`avoid_vars`] for the variable-side half -- kept as two separate
@@ -865,18 +945,20 @@ impl Canonizer {
 /// `HasFrees`/`bounds_var_idx` machinery it's built on) only ever visits
 /// `Lit::Var` -- a `Lit::Con(Name)` is a structural no-op for `HasFrees`
 /// (see `lterm.rs`'s own `HasFrees for Lit<C, V>` impl: `l @ Lit::Con(_)
-/// => l`, no callback). So seeding a `Canonizer` from a substitution whose
-/// image already contains a canonical NAME literal (e.g. `fn7`, from an
-/// earlier `canonicalize_alpha_eq_ac_seeded`-style accumulation) but no
-/// canonical VARIABLE of that sort silently ignored the `7` -- a later
-/// call canonizing an unrelated term could then re-derive the same
-/// literal name `fn7` for a DIFFERENT original identifier, breaking
-/// injectivity of the accumulated labelling. This couldn't manifest
-/// while every call site passed `Subst::empty()` (`new`'s only caller
-/// shape until now), which is exactly why it went unnoticed.
+/// => l`, no callback). So reconstructing "where to resume allocating
+/// fresh indices" from an arbitrary theta's rendered image alone (this
+/// function's whole reason for existing) can silently miss a canonical
+/// NAME literal already in that image (e.g. `fn7`) -- a later call could
+/// then re-derive the same literal name `fn7` for a DIFFERENT original
+/// identifier, breaking injectivity. [`CanonLabelling`]'s PRIMARY
+/// accumulation path (`empty` + repeated seeded calls) sidesteps this
+/// class of bug entirely by never reconstructing in the first place; this
+/// function remains only for [`CanonLabelling::from_theta`]'s fallback
+/// case, where reconstruction is unavoidable because no cursor history
+/// exists to carry forward.
 ///
-/// Fixed by computing the max index the same way `avoid`/`bounds_var_idx`
-/// do ([`avoid_indices`]: reserve `[0, max+1)` so the next fresh index
+/// Computes the max index the same way `avoid`/`bounds_var_idx` do
+/// ([`avoid_indices`]: reserve `[0, max+1)` so the next fresh index
 /// starts at `max+1`), but reading the numeric suffix [`canonical_name`]
 /// bakes into a name literal's string instead of relying on `HasFrees`.
 fn avoid_names<'a>(lits: impl IntoIterator<Item = &'a LNLit>) -> FastFreshState {
@@ -886,12 +968,13 @@ fn avoid_names<'a>(lits: impl IntoIterator<Item = &'a LNLit>) -> FastFreshState 
     }))
 }
 
-/// The VARIABLE-side half of [`Canonizer::new_inner`]'s seeding -- the
-/// counterpart to [`avoid_names`]. Unlike the name side, an `LVar`'s
-/// index is already visible to `crate::lterm::avoid`/`HasFrees`; this
-/// exists mainly so both halves share the exact same "reserve `max+1`"
-/// logic ([`avoid_indices`]) and so `new_inner` reads symmetrically for
-/// the two independent supplies it now seeds.
+/// The VARIABLE-side half of [`CanonLabelling::from_theta`]'s
+/// reconstruction -- the counterpart to [`avoid_names`]. Unlike the name
+/// side, an `LVar`'s index is already visible to
+/// `crate::lterm::avoid`/`HasFrees`; this exists mainly so both halves
+/// share the exact same "reserve `max+1`" logic ([`avoid_indices`]) and
+/// so `from_theta` reads symmetrically for the two independent supplies
+/// it seeds.
 fn avoid_vars<'a>(lits: impl IntoIterator<Item = &'a LNLit>) -> FastFreshState {
     avoid_indices(lits.into_iter().filter_map(|l| match l {
         Lit::Var(v) => Some(v.idx),
@@ -967,16 +1050,37 @@ fn apply_literal_renaming(t: &LNTerm, ren: &BTreeMap<LNLit, LNLit>) -> LNTerm {
     }
 }
 
+/// Canonizes `t` w.r.t. $\alphaeqac$ using and updating `labelling` in
+/// place: a literal already in `labelling.theta()` keeps its existing
+/// image; a new literal gets this call's own local permutation tie-break
+/// (the `Canonizer` machinery, unchanged); the winning candidate's
+/// newly-fixed entries and advanced fresh-index cursors are folded back
+/// into `labelling`. This is what lets several terms — e.g. every graph
+/// vertex's own fact, in canonical vertex order — share ONE consistent
+/// labelling: a variable/name common to two different vertices' facts
+/// gets assigned the SAME canonical literal in both, rather than each
+/// term being canonized in isolation (see `tamarin_theory::canon`'s
+/// `canonicalize_fact_seeded`/`canonicalize_rule_seeded`/
+/// `canonicalize_action_fact_seeded`, which lift this to facts/rules/
+/// action-formula facts the same way `canonicalize_fact`/
+/// `canonicalize_rule` already lift the non-accumulating
+/// [`canonicalize_alpha_eq_ac`]).
+pub fn canonicalize_alpha_eq_ac_seeded(t: &LNTerm, labelling: &mut CanonLabelling) -> LNTerm {
+    let mut c = Canonizer::new_with_labelling(t, std::mem::take(labelling));
+    let (canon_term, updated) = c.canonize();
+    *labelling = updated;
+    canon_term
+}
+
 /// Canonize `t` with respect to $\alphaeqac$: two terms are $\alphaeqac$ iff
 /// their canonical forms are syntactically equal (`thm:can_alphaeqac_can2`).
 ///
-/// `subst` is reserved for seeding the canonization with literals already
-/// canonized elsewhere (needed to lift this to facts and rule instances that
-/// share a labelling across several terms, per TODO.md); it is not yet wired
-/// up, so it is currently ignored.
-pub fn canonicalize_alpha_eq_ac(t: &LNTerm, _subst: Subst<LNLit, LNLit>) -> LNTerm {
-    // TODO: Return the canonical substitution too if we need it
-    Canonizer::new(t).canonize().0
+/// Behavior-preserving entry point for a caller that doesn't need to
+/// accumulate a labelling across several terms — equivalent to
+/// [`canonicalize_alpha_eq_ac_seeded`] with a fresh, empty
+/// [`CanonLabelling`] that's then discarded.
+pub fn canonicalize_alpha_eq_ac(t: &LNTerm) -> LNTerm {
+    canonicalize_alpha_eq_ac_seeded(t, &mut CanonLabelling::empty())
 }
 
 // `Fingerprint`/`fingerprint_term` now live in `crate::fingerprint` (SHA-256,
@@ -994,7 +1098,6 @@ mod tests {
     use crate::builtin::{emap, xor};
     use crate::function_symbols::{Constructability, NoEqSym, Privacy};
     use crate::lterm::{fresh_term, LNTerm, LSort, LVar};
-    use crate::subst::Subst;
     use crate::term::{f_app_no_eq, Term};
     use crate::vterm::var_term;
 
@@ -1048,7 +1151,7 @@ mod tests {
         (ct1, ct2)
     }
 
-    // -- 0) `Canonizer::new_with_subst` seeding: the fresh-index counters
+    // -- 0) `CanonLabelling::from_theta` seeding: the fresh-index counters
     //    must start past every literal already in the seed substitution's
     //    image, whether that literal is a canonical VARIABLE or a
     //    canonical NAME -- see `avoid_names`/`avoid_vars`'s own doc
@@ -1071,7 +1174,7 @@ mod tests {
             Lit::Con(Name::new(NameTag::Fresh, "origFresh")),
             Lit::Con(canonical_name(LSort::Fresh, 7)),
         );
-        let mut c = Canonizer::new_with_subst(&t, subst);
+        let mut c = Canonizer::new_with_labelling(&t, CanonLabelling::from_theta(subst));
         assert_eq!(
             c.allocate_fresh_name_indices(LSort::Fresh, 1),
             8,
@@ -1092,7 +1195,7 @@ mod tests {
             Lit::Var(LVar::new("origPub", LSort::Pub, 0)),
             Lit::Var(canonical_var(LSort::Pub, 3)),
         );
-        let mut c = Canonizer::new_with_subst(&t, subst);
+        let mut c = Canonizer::new_with_labelling(&t, CanonLabelling::from_theta(subst));
         assert_eq!(
             c.allocate_fresh_var_indices(LSort::Pub, 1),
             4,
@@ -1120,7 +1223,7 @@ mod tests {
             Lit::Con(Name::new(NameTag::Fresh, "origFresh2")),
             Lit::Con(canonical_name(LSort::Fresh, 9)),
         );
-        let mut c1 = Canonizer::new_with_subst(&t, name_larger);
+        let mut c1 = Canonizer::new_with_labelling(&t, CanonLabelling::from_theta(name_larger));
         assert_eq!(
             c1.allocate_fresh_name_indices(LSort::Fresh, 1),
             10,
@@ -1141,7 +1244,7 @@ mod tests {
             Lit::Con(Name::new(NameTag::Fresh, "origFresh2")),
             Lit::Con(canonical_name(LSort::Fresh, 2)),
         );
-        let mut c2 = Canonizer::new_with_subst(&t, var_larger);
+        let mut c2 = Canonizer::new_with_labelling(&t, CanonLabelling::from_theta(var_larger));
         assert_eq!(
             c2.allocate_fresh_var_indices(LSort::Fresh, 1),
             10,
@@ -1151,6 +1254,45 @@ mod tests {
             c2.allocate_fresh_name_indices(LSort::Fresh, 1),
             3,
             "the NAME supply must start at 3 (past fn2 only), unaffected by fv9"
+        );
+    }
+
+    /// The headline property `CanonLabelling`/`canonicalize_alpha_eq_ac_seeded`
+    /// exist for: canonizing TWO SEPARATE terms in sequence, sharing ONE
+    /// labelling, assigns a literal common to BOTH terms the SAME
+    /// canonical literal in both outputs -- unlike two independent
+    /// `canonicalize_alpha_eq_ac` calls, which would each pick their own
+    /// local tie-break with no relation to each other.
+    #[test]
+    fn canonicalize_alpha_eq_ac_seeded_shares_a_common_variable_across_two_terms() {
+        let shared = v("shared", LSort::Fresh);
+        let t1 = f_app_no_eq(no_eq_sym("f", 1), vec![shared.clone()]);
+        let t2 = f_app_no_eq(no_eq_sym("g", 1), vec![shared]);
+
+        let mut labelling = CanonLabelling::empty();
+        let c1 = canonicalize_alpha_eq_ac_seeded(&t1, &mut labelling);
+        let c2 = canonicalize_alpha_eq_ac_seeded(&t2, &mut labelling);
+
+        // The shared variable must have been assigned exactly one entry
+        // in the accumulated theta (not re-canonized independently the
+        // second time).
+        assert_eq!(
+            labelling.theta().len(),
+            1,
+            "the shared variable must be fixed exactly once across both calls"
+        );
+
+        // Extracting the argument each canonical term actually carries
+        // confirms it's the SAME canonical literal in both, not merely
+        // that theta happens to have one entry.
+        let arg_of = |t: &LNTerm| match t {
+            Term::App(_, args) => args[0].clone(),
+            _ => panic!("expected a unary application"),
+        };
+        assert_eq!(
+            arg_of(&c1),
+            arg_of(&c2),
+            "the variable shared between t1 and t2 must canonize to the identical literal in both"
         );
     }
 
@@ -1289,7 +1431,7 @@ mod tests {
         let c = v("c", LSort::Msg);
         let d = v("d", LSort::Msg);
         let t = f_app_no_eq(f, vec![xor(c.clone(), d), xor(a.clone(), c), a]);
-        let once = canonicalize_alpha_eq_ac(&t, Subst::empty());
+        let once = canonicalize_alpha_eq_ac(&t);
         // Perms: 1 both — "both" here means both applications of `canonize`
         // (on `t` and on its canonical form `once`), since idempotence is
         // about one term's canonization being a fixed point, not a
@@ -1630,7 +1772,7 @@ mod tests {
         );
         assert_eq!(canon_term, want);
         assert_eq!(fingerprint_term(&canon_term), fingerprint_term(&want));
-        assert_eq!(subst.len(), 4);
+        assert_eq!(subst.theta().len(), 4);
         // Perms: 2
         assert_eq!(canon.considered_permutations(), 2);
     }
@@ -1658,7 +1800,7 @@ mod tests {
         let want = f_app_no_eq(f, vec![xor(mv(1), mv(2)), xor(mv(0), mv(1)), mv(0)]);
         assert_eq!(canon_term, want);
         assert_eq!(fingerprint_term(&canon_term), fingerprint_term(&want));
-        assert_eq!(subst.len(), 3);
+        assert_eq!(subst.theta().len(), 3);
         // Perms: 1
         assert_eq!(canon.considered_permutations(), 1);
     }

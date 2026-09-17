@@ -522,10 +522,12 @@ mod tests {
         // The actual payload this whole pipeline exists for: the
         // imported System's graph part should look exactly like a
         // hand-built one would -- 2 rule-instance vertices, 1 action
-        // vertex (Recv @ #i.2), and a reified relation vertex for each
-        // of the real system Edge, the Less atom, and the action's own
-        // AtTimepoint link (each relation contributes 2 graph edges:
-        // src -> relation -> tgt -- see `canon_graph`'s module docs).
+        // vertex (Recv @ #i.2), a reified relation vertex for each of the
+        // real system Edge, the Less atom, and the action's own
+        // AtTimepoint link (each contributes 2 graph edges: src ->
+        // relation -> tgt -- see `canon_graph`'s module docs), plus 1
+        // LastAtomRelation marker vertex (last_atom = #i.2, a unary
+        // relation contributing just 1 direct edge to its target).
         let part = crate::canon_graph::extract_graph_part(&sys, &theory_declaring_create_and_receive());
         use crate::canon_graph::VertexKind;
         let count = |pred: &dyn Fn(&VertexKind) -> bool| part.vertices.iter().filter(|v| pred(v)).count();
@@ -534,7 +536,8 @@ mod tests {
         assert_eq!(count(&|v| matches!(v, VertexKind::EdgeRelation(_, _))), 1);
         assert_eq!(count(&|v| matches!(v, VertexKind::LessRelation)), 1);
         assert_eq!(count(&|v| matches!(v, VertexKind::AtTimepointRelation)), 1);
-        assert_eq!(part.edges.len(), 6);
+        assert_eq!(count(&|v| matches!(v, VertexKind::LastAtomRelation)), 1);
+        assert_eq!(part.edges.len(), 7);
 
         // And it renders to a well-formed DOT document without panicking.
         let dot = crate::canon_graph::to_graphviz(&part);

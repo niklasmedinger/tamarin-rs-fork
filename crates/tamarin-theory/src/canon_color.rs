@@ -84,17 +84,18 @@ pub type Color = u32;
 // Block 1 — structural relation-vertex kinds
 // =============================================================================
 
-/// The three colors that don't depend on premise/conclusion port
+/// The four colors that don't depend on premise/conclusion port
 /// positions — fixed, identical across every theory.
 const STRUCTURAL_DUMMY: Color = 0;
 const STRUCTURAL_LESS_RELATION: Color = 1;
 const STRUCTURAL_AT_TIMEPOINT_RELATION: Color = 2;
+const STRUCTURAL_LAST_ATOM_RELATION: Color = 3;
 /// One past the last FIXED structural color — where the
 /// `EdgeRelation(ConcIdx, PremIdx)` sub-block starts (still block 1; see
 /// the module docs). That sub-block's own size is
 /// `max_conc_count * max_prem_count`, computed by [`ColorTable::build`]
 /// and stored per-table — see [`ColorTable::block1_size`].
-const STRUCTURAL_FIXED_COUNT: Color = 3;
+const STRUCTURAL_FIXED_COUNT: Color = 4;
 
 /// `STRUCTURAL_FIXED_COUNT` plus the `EdgeRelation` sub-block's size —
 /// i.e. where block 2 (Tamarin built-ins) starts. A free function (not a
@@ -375,6 +376,7 @@ impl ColorTable {
             VertexKind::EdgeRelation(conc, prem) => self.edge_relation_color(*conc, *prem),
             VertexKind::LessRelation => STRUCTURAL_LESS_RELATION,
             VertexKind::AtTimepointRelation => STRUCTURAL_AT_TIMEPOINT_RELATION,
+            VertexKind::LastAtomRelation => STRUCTURAL_LAST_ATOM_RELATION,
             VertexKind::RuleInstance(_, ru) => self.rule_color(ru),
             VertexKind::Action(_, fact) => self.action_color(&fact.name),
         }
