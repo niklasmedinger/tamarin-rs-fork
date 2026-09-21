@@ -15,9 +15,13 @@
 //! formulas/solved_formulas/lemmas/eq_store/subterm_store -- and asserts
 //! the two systems' full `CanonicalSystem`s are identical, not just their
 //! graph parts. Both fixtures happen to have an empty `eqStore` and
-//! `subtermStore`, so this does NOT exercise
-//! `canonicalize_eq_disj_alternative`'s `todo!()` stub (see `canon.rs`'s
-//! own doc comment) -- only the fields that are actually implemented.
+//! `subtermStore`, so this does NOT exercise `eq_store.conj`'s
+//! per-alternative range-term canonicalization
+//! (`canon::canonicalize_eq_disj_alternative`, fully implemented but only
+//! unit-tested directly so far, not against real captured data -- see
+//! `canon.rs`'s own test module) or a multi-survivor Stage F tie-break
+//! (both systems' graph parts have a trivial automorphism group, per
+//! `bliss_tutorial_alphaeqac.rs`).
 //!
 //! Skips (via `bliss_available()`'s own panic-unless-opted-out gate) if
 //! `bliss` is not on `PATH`/`$BLISS_PATH` and `TAM_ALLOW_NO_BLISS=1` is

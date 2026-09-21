@@ -13,16 +13,18 @@
 //! that is a separate, later enhancement, not attempted here:
 //!
 //! 1. This crate's own structural relation-vertex kinds. Two parts:
-//!    - `VertexKind::Dummy`/`LessRelation`/`AtTimepointRelation` — three
-//!      FIXED colors, identical across every theory.
+//!    - `VertexKind::Dummy`/`LessRelation`/`AtTimepointRelation`/
+//!      `LastAtomRelation` — four FIXED colors (`STRUCTURAL_FIXED_COUNT`;
+//!      bumped from three when `LastAtomRelation` was added), identical
+//!      across every theory.
 //!    - `VertexKind::EdgeRelation(ConcIdx, PremIdx)` — one color per
 //!      distinct `(ConcIdx, PremIdx)` PAIR that can occur for this
-//!      theory, packed right after the three fixed colors above (still
+//!      theory, packed right after the four fixed colors above (still
 //!      block 1: these are structural port positions, not theory
 //!      content). The pair's bounds are discovered by
 //!      [`ColorTable::build`] scanning every fixed built-in rule's own
 //!      premise/conclusion counts *and* this theory's own declared
-//!      rules' — so, unlike the three fixed colors, this sub-block's
+//!      rules' — so, unlike the four fixed colors, this sub-block's
 //!      SIZE (though not its structure) is theory-dependent: a theory
 //!      whose own rule has more premises than any built-in rule widens
 //!      it. See [`ColorTable::edge_relation_color`] for why this
@@ -344,7 +346,7 @@ impl ColorTable {
     /// The color for one `EdgeRelation(conc, prem)` vertex — part of
     /// block 1 (see the module docs). Every distinct `(ConcIdx, PremIdx)`
     /// combination this table was built to cover gets its own color,
-    /// packed as `conc * max_prem_count + prem` right after the three
+    /// packed as `conc * max_prem_count + prem` right after the four
     /// fixed structural colors. This is exactly the information a bare,
     /// payload-free `EdgeRelation` marker discarded: without it, an edge
     /// landing in premise slot 0 of a rule instance was

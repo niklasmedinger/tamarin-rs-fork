@@ -7,9 +7,12 @@
 //! (`tamarin-prover/src/Web/Handler.hs`'s `getTheorySystemR`/
 //! `systemToJSON`) — for cross-implementation testing: extract a real
 //! constraint system from a real HS proof search, reconstruct it here,
-//! and check [`crate::canon_graph::extract_graph_part`] (and, once it
-//! exists, full canonization) against it — including checking pairs the
-//! user already knows should be $\alphaeqac$.
+//! and check [`crate::canon_graph::extract_graph_part`] and
+//! [`crate::canon::canonicalize_constraint_system`] against it —
+//! including checking pairs the user already knows should be
+//! $\alphaeqac$ (see `crates/tamarin-theory/tests/
+//! canonicalize_constraint_system_tutorial.rs`, which does exactly that
+//! against two real captured Tutorial systems built via this module).
 //!
 //! Every term/fact/formula leaf in the dump is ordinary pretty-printed
 //! Tamarin surface syntax (not a bespoke structured encoding), so

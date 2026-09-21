@@ -481,15 +481,18 @@ fn parse_bliss_stdout(stdout: &str, n: usize) -> Result<BlissResult, BlissError>
 /// canonization machinery, which is why it's still exercised directly in
 /// this module's own tests and in `bliss_tutorial_alphaeqac.rs`.
 ///
-/// **This does NOT (yet) implement "minimum over automorphisms"**
-/// (`TODO.md`'s still-open question; the canonization plan's Stage F):
-/// when the graph has a non-trivial automorphism group, bliss's own
-/// internal tie-break among orbit-equivalent labelings is used AS IS,
-/// not searched over for a lexicographically-smallest result. Correct
-/// as a canonical form only when the graph has NO non-trivial
-/// automorphisms — deliberately out of scope for this stage; see
-/// `BlissResult::generators`, which already carries what a future Stage
-/// F would need to search over.
+/// **This does NOT implement "minimum over automorphisms"** (`TODO.md`'s
+/// question; the canonization plan's Stage F) **and never will** — that's
+/// deliberately out of scope for `CanonicalGraph`/`canonicalize`, which
+/// exist only as a coloring+bliss-layer diagnostic (see above): when the
+/// graph has a non-trivial automorphism group, bliss's own internal
+/// tie-break among orbit-equivalent labelings is used AS IS here, not
+/// searched over for a lexicographically-smallest result, so this is
+/// correct as a canonical form only when the graph has NO non-trivial
+/// automorphisms. The REAL "minimum over automorphisms" resolution lives
+/// in `canon::minimal_graph_part_labelings` (Stage F, implemented), which
+/// searches `generate_group(&result.generators, ..)`'s full closure —
+/// `BlissResult::generators` is exactly what it searches over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalGraph {
     pub vertex_colors: Vec<Color>,

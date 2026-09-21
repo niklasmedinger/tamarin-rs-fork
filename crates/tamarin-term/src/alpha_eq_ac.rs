@@ -9,9 +9,12 @@
 //! and 2) bringing the result into `CAN_AC` normal form. See Algorithm 1
 //! (`CAN_alphaeqac`) and Theorem `thm:can_alphaeqac` in `work.tex`.
 //!
-//! This module is under active development (see TODO.md); lifting
-//! canonization to facts, rule instances, and constraint systems is still
-//! outstanding.
+//! This module implements the base, TERM-level case; lifting to facts,
+//! rule instances, guarded formulas, whole graph parts, and finally whole
+//! constraint systems (`tamarin_theory::canon`'s `canonicalize_fact`/
+//! `canonicalize_rule`/`canonicalize_guarded`/`canonicalize_graph_part`/
+//! `canonicalize_constraint_system`) all build on the accumulating
+//! `CanonLabelling`/`canonicalize_alpha_eq_ac_seeded` entry point below.
 use crate::{
     lterm::{LNTerm, LSort, LVar, Name, NameTag},
     term::{f_app, Term},

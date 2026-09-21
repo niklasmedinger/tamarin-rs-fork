@@ -334,9 +334,11 @@ pub fn graph_part_to_term(ordered: &[&VertexKind], edges: &BTreeSet<(usize, usiz
 /// facts, `System::edges`, and `less_atoms` — the last two both entering
 /// the graph via `EdgeRelation`/`LessRelation` vertices, so they're
 /// already covered by `ordered`/`edges` with no separate handling
-/// needed). It does NOT yet cover what `extract_graph_part` leaves out of
-/// the graph entirely: `lemmas`, `eq_store`, `subterm_store`, and any
-/// formula content beyond ground action atoms (Stage G, not yet done).
+/// needed). It does NOT cover what `extract_graph_part` leaves out of the
+/// graph entirely: `lemmas`, `eq_store`, `subterm_store`, and any formula
+/// content beyond ground action atoms — those are handled separately, by
+/// `canonicalize_constraint_system` (Stage G, below), which extends this
+/// function's own accumulated labelling through them.
 pub fn canonicalize_graph_part(
     ordered: &[&VertexKind],
     edges: &BTreeSet<(usize, usize)>,
@@ -375,10 +377,13 @@ pub fn canonicalize_graph_part(
 /// and different (both graph-part-minimal) tie-breaks can then make two
 /// genuinely $\alphaeqac$ systems land on different final canonical
 /// forms. Breaking such a tie needs the REST of the system (formulas/
-/// lemmas) as a secondary key, by extending each survivor's own
-/// accumulated labelling and re-minimizing at the full-system level —
-/// not yet implemented; this function deliberately stops at returning
-/// the tied candidates rather than picking one.
+/// lemmas/eq_store/subterm_store) as a secondary key, by extending each
+/// survivor's own accumulated labelling and re-minimizing at the
+/// full-system level — implemented in `canonicalize_constraint_system`
+/// (below), which is the caller that actually needs more than one
+/// survivor; THIS function deliberately still stops at returning every
+/// tied candidate rather than picking one itself, since it has no way to
+/// know whether the caller needs that system-level tie-break.
 pub fn minimal_graph_part_labelings(
     part: &crate::canon_graph::GraphPart,
     result: &crate::bliss_proc::BlissResult,
@@ -419,8 +424,9 @@ pub fn minimal_graph_part_labelings(
 // constraint, or a rule/fact argument — see the paragraph building up to
 // `ex:canon_guarded`), so by the time formulas are canonized a canonical
 // labelling `theta` for them already exists (computed while canonizing the
-// system's rule instances/action formulas, which this module doesn't yet do
-// — TODO.md's graph-canonization item). `theta` is assumed EXHAUSTIVE: every
+// system's rule instances/action formulas via graph-part canonization,
+// below — Stage G's `canonicalize_constraint_system` is the actual call
+// site that threads that `theta` in here). `theta` is assumed EXHAUSTIVE: every
 // free variable and name constant `g` mentions must have an entry, or
 // canonization panics (see [`lookup_theta`]) — a miss means `theta` was
 // built incorrectly, not a case to paper over with a silent fallback. Given
@@ -1085,7 +1091,8 @@ fn hash_sort_hint(h: &mut FingerprintHasher, s: p::SortHint) {
 }
 
 // =============================================================================
-// Whole-system assembly (Stage G) -- PLAN.md's field-by-field design
+// Whole-system assembly (Stage G) -- field-by-field canonicalization of a
+// whole constraint `System`
 // =============================================================================
 //
 // `canonicalize_constraint_system` composes every earlier stage:
@@ -1128,8 +1135,7 @@ pub struct CanonicalSystem {
     /// from `solved_formulas` -- membership in one store vs. the other is
     /// live proof-search state (e.g. `ProofMethod::Induction`'s
     /// applicability, `isInitialSystem`), not pure memoization, so
-    /// merging them would conflate two non-interchangeable systems (see
-    /// PLAN.md's Stage G write-up for the concrete evidence).
+    /// merging them would conflate two non-interchangeable systems.
     pub formulas: Vec<Guarded>,
     /// `solved_formulas`, canonicalized the same way as `formulas`, as
     /// its own independent sorted set.
@@ -1149,20 +1155,25 @@ pub struct CanonicalSystem {
 pub struct CanonicalEqStore {
     /// `eq_store.subst`, canonical-key sorted.
     pub subst: Vec<(LNLit, LNTerm)>,
-    /// `eq_store.conj` -- `split_id` DROPPED (nothing references it once
-    /// `goals` is excluded, see PLAN.md). Each alternative is stored
+    /// `eq_store.conj` -- `split_id` DROPPED: its only consumer is
+    /// `Goal::Split`, and `goals` is excluded from the canonical form
+    /// entirely (fully computable from `nodes`/`edges`/`formulas`), so
+    /// nothing ever reads a `split_id` value. Each alternative is stored
     /// fully canonicalized, not as a raw `LNSubstVFresh`: domain keys
     /// renamed via the shared `theta`, each range term canonicalized via
-    /// a scoped/forked `CanonLabelling` pass (see
-    /// [`canonicalize_eq_disj_alternative`] -- currently a `todo!()`
-    /// stub). The middle `Vec` (one `EqDisj`'s alternatives) and the
+    /// a per-alternative-forked `CanonLabelling` pass (see
+    /// [`canonicalize_eq_disj_alternative`]). The middle `Vec` (one
+    /// `EqDisj`'s alternatives) and the
     /// outer `Vec` (the list of `EqDisj`s) are both sorted by their own
     /// canonicalized content directly, as MULTISETS: duplicates from
     /// alpha-equivalent alternatives/disjunctions are preserved, never
-    /// deduplicated (Tamarin's own solver keeps them distinct;
-    /// collapsing them changes real downstream proof-search behavior --
-    /// see PLAN.md's `eq_store.conj` write-up for the real regression
-    /// this guards against).
+    /// deduplicated. Tamarin's own solver keeps them distinct on purpose
+    /// (see `tools/equation_store.rs`'s own comment on its
+    /// `applyBound`/`S.fromList` handling for the proven real regression:
+    /// alpha-canonically deduping a disjunction's alternatives there
+    /// collapses a real 6-substitution case to 5, dropping a split case
+    /// and changing the proof tree), so collapsing them here would
+    /// likewise conflate two non-interchangeable systems.
     pub conj: Vec<Vec<Vec<(LNLit, LNTerm)>>>,
 }
 
@@ -1179,10 +1190,9 @@ pub struct CanonicalSubtermStore {
 /// Lexicographic comparison over [`CanonicalSystem`]'s fields, in the same
 /// order the driver ([`canonicalize_constraint_system`]) fills them in.
 /// Needed because `Guarded` has no `Ord` impl, so `CanonicalSystem` can't
-/// `#[derive(Ord)]` -- see its own doc comment. This is what Stage F's
-/// system-level tie-break (PLAN.md) minimizes over when
-/// `minimal_graph_part_labelings` returns more than one graph-part-level
-/// survivor.
+/// `#[derive(Ord)]` -- see its own doc comment. This is what the
+/// system-level tie-break minimizes over when `minimal_graph_part_labelings`
+/// returns more than one graph-part-level survivor.
 pub fn cmp_canonical_system(a: &CanonicalSystem, b: &CanonicalSystem) -> std::cmp::Ordering {
     a.graph_part
         .cmp(&b.graph_part)
@@ -1223,13 +1233,14 @@ fn sort_dedup_guarded(mut v: Vec<Guarded>) -> Vec<Guarded> {
     v
 }
 
-/// The `_seeded` sibling of [`canonicalize_graph_part`] Stage F's driver
-/// needs: also returns the [`CanonLabelling`] the canonization produced,
-/// so a caller can CONTINUE it through the rest of the system instead of
-/// discarding it (flagged 2026-09-17 as needed once a graph-part tie must
-/// be broken using the rest of the system -- PLAN.md, Stage F -- since
-/// picking one of several tied survivors arbitrarily and discarding its
-/// labelling is exactly the bug that section rules out).
+/// The `_seeded` sibling of [`canonicalize_graph_part`] the driver needs:
+/// also returns the [`CanonLabelling`] the canonization produced, so a
+/// caller can CONTINUE it through the rest of the system instead of
+/// discarding it. Needed because a graph-part tie must be broken using the
+/// rest of the system, not by picking one of several tied survivors
+/// arbitrarily and discarding its labelling -- see
+/// [`minimal_graph_part_labelings`]'s own doc comment for the concrete
+/// counterexample.
 pub fn canonicalize_graph_part_seeded(
     ordered: &[&VertexKind],
     edges: &BTreeSet<(usize, usize)>,
@@ -1271,8 +1282,8 @@ pub fn canonicalize_constraint_system(
     // `minimal_graph_part_labelings` deliberately returns every tied
     // survivor rather than choosing one, because a graph-part-level tie
     // is not always resolvable without looking at the rest of the system
-    // (PLAN.md, Stage F's own "Open, NOT implemented" paragraph explains
-    // the concrete counterexample).
+    // (see its own doc comment for the concrete counterexample; the loop
+    // below is what actually resolves it, per survivor).
     let survivors = minimal_graph_part_labelings(&part, &result);
     debug_assert!(
         !survivors.is_empty(),
@@ -1286,7 +1297,7 @@ pub fn canonicalize_constraint_system(
     // labelling; cheap relative to the bliss subprocess call this reuses
     // no new invocation of) and extend it through formulas ->
     // solved_formulas -> lemmas -> eq_store -> subterm_store -- a fixed,
-    // deterministic order (PLAN.md's "Driver shape" paragraph).
+    // deterministic order.
     let mut candidates: Vec<CanonicalSystem> = Vec::with_capacity(survivors.len());
     for (labeling, graph_term) in &survivors {
         let ordered = crate::bliss_proc::canonical_vertex_order(&part, labeling);
@@ -1315,8 +1326,8 @@ pub fn canonicalize_constraint_system(
 }
 
 /// Extends `labelling` (already seeded from a graph-part survivor) through
-/// every remaining "Core" field of `sys` (PLAN.md's field-audit table),
-/// building the rest of a [`CanonicalSystem`].
+/// every remaining field of `sys` this module treats as part of the
+/// canonical form, building the rest of a [`CanonicalSystem`].
 ///
 /// Read-only (`&CanonLabelling`, not `&mut`): nothing past the graph part
 /// ever discovers a new literal EXCEPT `eq_store.conj`'s per-alternative
@@ -1337,9 +1348,8 @@ fn canonicalize_system_content_seeded(
     // system) and panics on a miss rather than silently miscanonizing
     // (see `lookup_theta`). Kept as three SEPARATE sets, not unioned --
     // `solved_formulas` membership is live proof-search state, not pure
-    // memoization (PLAN.md's Stage G write-up has the concrete evidence:
-    // `ProofMethod::Induction`'s applicability and `isInitialSystem` both
-    // key off it).
+    // memoization: `ProofMethod::Induction`'s applicability and
+    // `isInitialSystem` both key off it.
     let formulas = sort_dedup_guarded(
         sys.formulas
             .iter()
@@ -1374,8 +1384,7 @@ fn canonicalize_system_content_seeded(
     }
 }
 
-/// Canonicalizes `store` (PLAN.md's `eq_store.subst`/`eq_store.conj`
-/// paragraphs).
+/// Canonicalizes `store` -- `eq_store.subst` and `eq_store.conj`.
 fn canonicalize_eq_store(store: &EquationStore, labelling: &CanonLabelling) -> CanonicalEqStore {
     // eq_store.subst: domain vars are real, graph-reachable variables --
     // same guardedness-style assumption as formulas, so a missing theta
@@ -1383,7 +1392,7 @@ fn canonicalize_eq_store(store: &EquationStore, labelling: &CanonLabelling) -> C
     // var through. The range rewrite reuses `apply_literal_renaming`
     // as-is (silently passes through anything `theta` doesn't cover,
     // matching its existing, tested behaviour at every other call site --
-    // PLAN.md flags this as intentional, not a gap).
+    // intentional here too, not a gap).
     let mut subst: Vec<(LNLit, LNTerm)> = store
         .subst
         .iter()
@@ -1439,11 +1448,10 @@ fn canonicalize_eq_disj(disj: &EqDisj, labelling: &CanonLabelling) -> Vec<Vec<(L
 /// **Range terms** are entirely, uniformly LOCAL/fresh: per `SubstVFresh`'s
 /// own contract, every variable in a range term is existentially bound to
 /// THIS ONE alternative, regardless of whether its raw identity happens
-/// to look like a real system variable's (PLAN.md's "Domain vs. range is
-/// a hard split" paragraph -- a routine case, not a corner case: Maude
-/// unifies actual terms containing actual system variables, and
-/// `freshen_witness_range` leaves a variable that legitimately belongs to
-/// the original input equations untouched). So:
+/// to look like a real system variable's -- a routine case, not a corner
+/// case: Maude unifies actual terms containing actual system variables,
+/// and `freshen_witness_range` leaves a variable that legitimately
+/// belongs to the original input equations untouched. So:
 ///
 /// 1. **Freshen the WHOLE alternative's range in one call**
 ///    ([`LNSubstVFresh::fresh_to_free_avoiding`] -- shares one rename
@@ -1583,10 +1591,10 @@ fn raw_var_idx_avoid_floor(theta: &std::collections::BTreeMap<LNLit, LNLit>) -> 
         .map_or(0, |m| m + 1)
 }
 
-/// Canonicalizes `store` (PLAN.md's `subterm_store` paragraph): drops
-/// `propagated`/`old_neg_subterms` (Rust-only bookkeeping, excluded by the
-/// field audit), renames every term pair via `theta` (reusing
-/// `apply_literal_renaming`, same as `eq_store.subst`'s range), and
+/// Canonicalizes `store` (the `subterm_store`): drops
+/// `propagated`/`old_neg_subterms` (Rust-only bookkeeping, not
+/// semantically meaningful content), renames every term pair via `theta`
+/// (reusing `apply_literal_renaming`, same as `eq_store.subst`'s range), and
 /// re-sorts everything -- `neg_subterms` is already a sorted, deduplicated
 /// set pre-canonicalization, but renaming can change relative order and
 /// even collapse two distinct pairs into one, so the existing sort/dedup
@@ -3027,7 +3035,9 @@ mod tests {
             out.len(),
             2,
             "two alpha-equivalent alternatives must NOT be deduplicated -- \
-             Tamarin's own solver keeps them distinct (see PLAN.md)"
+             Tamarin's own solver keeps them distinct on purpose (see \
+             tools/equation_store.rs's own comment on its \
+             applyBound/S.fromList handling)"
         );
         assert_eq!(
             out[0], out[1],
