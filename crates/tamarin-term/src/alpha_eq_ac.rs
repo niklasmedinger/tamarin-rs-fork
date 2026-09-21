@@ -1037,7 +1037,12 @@ fn canonical_name(sort: LSort, idx: u64) -> Name {
 /// Applies a literal-to-literal renaming to `t`, rebuilding through the
 /// term's smart constructors ([`f_app`]) so the result stays in `CAN_AC`
 /// normal form. Literals outside `ren`'s domain are left unchanged.
-fn apply_literal_renaming(t: &LNTerm, ren: &BTreeMap<LNLit, LNLit>) -> LNTerm {
+///
+/// `pub`, not `pub(crate)`: `tamarin_theory::canon`'s whole-system assembly
+/// (Stage G) reuses this directly for `eq_store.subst`'s range rewrite
+/// rather than reimplementing it, and `tamarin_theory` is a separate crate
+/// from this one, so `pub(crate)` would not have been visible there.
+pub fn apply_literal_renaming(t: &LNTerm, ren: &BTreeMap<LNLit, LNLit>) -> LNTerm {
     match t {
         Term::Lit(l) => Term::Lit(*ren.get(l).unwrap_or(l)),
         Term::App(sym, args) => {

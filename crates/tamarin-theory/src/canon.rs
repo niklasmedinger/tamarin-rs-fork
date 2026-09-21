@@ -337,7 +337,10 @@ pub fn graph_part_to_term(ordered: &[&VertexKind], edges: &BTreeSet<(usize, usiz
 /// needed). It does NOT yet cover what `extract_graph_part` leaves out of
 /// the graph entirely: `lemmas`, `eq_store`, `subterm_store`, and any
 /// formula content beyond ground action atoms (Stage G, not yet done).
-pub fn canonicalize_graph_part(ordered: &[&VertexKind], edges: &BTreeSet<(usize, usize)>) -> LNTerm {
+pub fn canonicalize_graph_part(
+    ordered: &[&VertexKind],
+    edges: &BTreeSet<(usize, usize)>,
+) -> LNTerm {
     canonicalize_alpha_eq_ac(&graph_part_to_term(ordered, edges))
 }
 
@@ -1081,11 +1084,557 @@ fn hash_sort_hint(h: &mut FingerprintHasher, s: p::SortHint) {
     h.u8(b);
 }
 
+// =============================================================================
+// Whole-system assembly (Stage G) -- PLAN.md's field-by-field design
+// =============================================================================
+//
+// `canonicalize_constraint_system` composes every earlier stage:
+//   A/B (extract_graph_part) -> C (run_bliss) -> F (minimal_graph_part_labelings)
+//   -> G (this section: extend each graph-part survivor's own labelling
+//   through formulas/solved_formulas/lemmas/eq_store/subterm_store, then
+//   take the minimum `CanonicalSystem` over survivors).
+//
+// Every field, including `eq_store.conj`'s per-alternative range-term
+// canonicalization, is real, working code, exercised end to end by
+// `tests/canonicalize_constraint_system_tutorial.rs` against two real
+// captured Tutorial systems -- though that fixture pair happens to have an
+// empty `eq_store.conj`, so `canonicalize_eq_disj_alternative`'s own logic
+// (below) is not yet validated against real non-empty data, only reasoned
+// through and unit-tested directly (`tests::eq_disj_alternative_*`).
+
+use crate::bliss_proc::BlissError;
+use crate::constraint::system::{Side, SourceKind, System};
+use crate::theory::Theory;
+use crate::tools::equation_store::{EqDisj, EquationStore, LNSubst, LNSubstVFresh};
+use crate::tools::subterm_store::{SubtermConstraint, SubtermStore};
+use tamarin_term::alpha_eq_ac::apply_literal_renaming;
+use tamarin_term::lterm::LVar;
+use tamarin_term::vterm::var_term;
+
+/// The complete canonical form of a constraint `System` (Stage G).
+///
+/// `PartialEq` only, no `Eq`/`Ord` derive: `Guarded` itself derives only
+/// `PartialEq` (no `Eq`, no `Ord` -- only the free [`cmp_guarded`]), so
+/// neither derives here for `CanonicalSystem` either. A full total order
+/// needs the dedicated [`cmp_canonical_system`] function instead.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanonicalSystem {
+    /// Rule instances, action facts, `System::edges`, `less_atoms` (via
+    /// `LessRelation`), and `last_atom` (via `LastAtomRelation`) --
+    /// everything [`graph_part_to_term`] covers.
+    pub graph_part: LNTerm,
+    /// `formulas`: canonicalized via the graph part's accumulated
+    /// labelling, deduplicated, sorted via `cmp_guarded`. KEPT SEPARATE
+    /// from `solved_formulas` -- membership in one store vs. the other is
+    /// live proof-search state (e.g. `ProofMethod::Induction`'s
+    /// applicability, `isInitialSystem`), not pure memoization, so
+    /// merging them would conflate two non-interchangeable systems (see
+    /// PLAN.md's Stage G write-up for the concrete evidence).
+    pub formulas: Vec<Guarded>,
+    /// `solved_formulas`, canonicalized the same way as `formulas`, as
+    /// its own independent sorted set.
+    pub solved_formulas: Vec<Guarded>,
+    /// `lemmas`, canonicalized the same way.
+    pub lemmas: Vec<Guarded>,
+    pub eq_store: CanonicalEqStore,
+    pub subterm_store: CanonicalSubtermStore,
+    pub source_kind: Option<SourceKind>,
+    pub side: Option<Side>,
+}
+
+/// All four fields are `Ord` on their own, so this derives it directly
+/// (unlike [`CanonicalSystem`], which needs a custom comparison only
+/// because of its `Vec<Guarded>` fields).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CanonicalEqStore {
+    /// `eq_store.subst`, canonical-key sorted.
+    pub subst: Vec<(LNLit, LNTerm)>,
+    /// `eq_store.conj` -- `split_id` DROPPED (nothing references it once
+    /// `goals` is excluded, see PLAN.md). Each alternative is stored
+    /// fully canonicalized, not as a raw `LNSubstVFresh`: domain keys
+    /// renamed via the shared `theta`, each range term canonicalized via
+    /// a scoped/forked `CanonLabelling` pass (see
+    /// [`canonicalize_eq_disj_alternative`] -- currently a `todo!()`
+    /// stub). The middle `Vec` (one `EqDisj`'s alternatives) and the
+    /// outer `Vec` (the list of `EqDisj`s) are both sorted by their own
+    /// canonicalized content directly, as MULTISETS: duplicates from
+    /// alpha-equivalent alternatives/disjunctions are preserved, never
+    /// deduplicated (Tamarin's own solver keeps them distinct;
+    /// collapsing them changes real downstream proof-search behavior --
+    /// see PLAN.md's `eq_store.conj` write-up for the real regression
+    /// this guards against).
+    pub conj: Vec<Vec<Vec<(LNLit, LNTerm)>>>,
+}
+
+/// All four fields are `Ord` on their own, so this derives it directly --
+/// see [`CanonicalEqStore`]'s own doc comment.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CanonicalSubtermStore {
+    pub subterms: Vec<(LNTerm, LNTerm)>,
+    pub solved_subterms: Vec<(LNTerm, LNTerm)>,
+    pub contradictory: bool,
+    pub neg_subterms: Vec<(LNTerm, LNTerm)>,
+}
+
+/// Lexicographic comparison over [`CanonicalSystem`]'s fields, in the same
+/// order the driver ([`canonicalize_constraint_system`]) fills them in.
+/// Needed because `Guarded` has no `Ord` impl, so `CanonicalSystem` can't
+/// `#[derive(Ord)]` -- see its own doc comment. This is what Stage F's
+/// system-level tie-break (PLAN.md) minimizes over when
+/// `minimal_graph_part_labelings` returns more than one graph-part-level
+/// survivor.
+pub fn cmp_canonical_system(a: &CanonicalSystem, b: &CanonicalSystem) -> std::cmp::Ordering {
+    a.graph_part
+        .cmp(&b.graph_part)
+        .then_with(|| cmp_guarded_slice(&a.formulas, &b.formulas))
+        .then_with(|| cmp_guarded_slice(&a.solved_formulas, &b.solved_formulas))
+        .then_with(|| cmp_guarded_slice(&a.lemmas, &b.lemmas))
+        .then_with(|| a.eq_store.cmp(&b.eq_store))
+        .then_with(|| a.subterm_store.cmp(&b.subterm_store))
+        .then_with(|| a.source_kind.cmp(&b.source_kind))
+        .then_with(|| a.side.cmp(&b.side))
+}
+
+/// Lexicographic comparison of two already-canonical `Guarded` slices via
+/// `cmp_guarded` (there is no `Ord for Guarded` to fall back on -- see
+/// `cmp_canonical_system`'s own doc comment), tie-broken by length when one
+/// is a prefix of the other.
+fn cmp_guarded_slice(a: &[Guarded], b: &[Guarded]) -> std::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        let c = cmp_guarded(x, y);
+        if c != std::cmp::Ordering::Equal {
+            return c;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Sorts `v` via `cmp_guarded` (no `Ord for Guarded`, see above) and drops
+/// adjacent duplicates under that same order -- mirrors the existing
+/// `sort_dedup_guarded` local closure in
+/// `constraint/solver/rename_precise.rs` (its own comment: HS's `S.Set
+/// LNGuarded` rebuild sorts AND collision-dedups after every rename), just
+/// generalized from `Vec<Arc<Guarded>>` to owned `Vec<Guarded>` since a
+/// freshly-canonicalized formula has no reason to share an `Arc` with
+/// anything.
+fn sort_dedup_guarded(mut v: Vec<Guarded>) -> Vec<Guarded> {
+    v.sort_by(cmp_guarded);
+    v.dedup_by(|a, b| cmp_guarded(a, b) == std::cmp::Ordering::Equal);
+    v
+}
+
+/// The `_seeded` sibling of [`canonicalize_graph_part`] Stage F's driver
+/// needs: also returns the [`CanonLabelling`] the canonization produced,
+/// so a caller can CONTINUE it through the rest of the system instead of
+/// discarding it (flagged 2026-09-17 as needed once a graph-part tie must
+/// be broken using the rest of the system -- PLAN.md, Stage F -- since
+/// picking one of several tied survivors arbitrarily and discarding its
+/// labelling is exactly the bug that section rules out).
+pub fn canonicalize_graph_part_seeded(
+    ordered: &[&VertexKind],
+    edges: &BTreeSet<(usize, usize)>,
+) -> (LNTerm, CanonLabelling) {
+    let mut labelling = CanonLabelling::empty();
+    let term = canonicalize_alpha_eq_ac_seeded(&graph_part_to_term(ordered, edges), &mut labelling);
+    (term, labelling)
+}
+
+/// Canonizes a whole constraint `System` (Stage G, composing A-F): builds
+/// the graph part, asks bliss for its automorphism group, resolves
+/// "minimum over automorphisms" at the graph-part level (Stage F), then --
+/// for EVERY graph-part-level survivor, not just bliss's own pick --
+/// extends that survivor's own accumulated labelling through the rest of
+/// the system and takes the minimum `CanonicalSystem` over all of them
+/// (the system-level tie-break Stage F's own doc comment requires).
+///
+/// Fallible only through the two bliss subprocess steps
+/// (`graph_part_to_dimacs`/`run_bliss`); everything after that is pure.
+pub fn canonicalize_constraint_system(
+    sys: &System,
+    theory: &Theory,
+) -> Result<CanonicalSystem, BlissError> {
+    // Stage A+B: vertex/edge structure plus the theory's vertex coloring,
+    // in one call -- see `canon_graph`'s own module docs for why
+    // `GraphPart` owns its `ColorTable` rather than threading it
+    // separately.
+    let part = crate::canon_graph::extract_graph_part(sys, theory);
+
+    // Stage C: bliss's own canonical labeling plus a GENERATING set for
+    // the graph's automorphism group (not necessarily the full group --
+    // see `generate_group`'s own doc comment for why iterating just the
+    // raw generators can miss candidates).
+    let dimacs = crate::bliss_proc::graph_part_to_dimacs(&part)?;
+    let result = crate::bliss_proc::run_bliss(&dimacs)?;
+
+    // Stage F: every labeling in the CLOSED automorphism group achieving
+    // the minimum graph-part TERM (not just bliss's single pick) --
+    // `minimal_graph_part_labelings` deliberately returns every tied
+    // survivor rather than choosing one, because a graph-part-level tie
+    // is not always resolvable without looking at the rest of the system
+    // (PLAN.md, Stage F's own "Open, NOT implemented" paragraph explains
+    // the concrete counterexample).
+    let survivors = minimal_graph_part_labelings(&part, &result);
+    debug_assert!(
+        !survivors.is_empty(),
+        "bliss always returns at least the identity labeling as a candidate"
+    );
+
+    // Stage G: for EACH survivor, re-derive its own accumulated
+    // `CanonLabelling` (not just its term -- `minimal_graph_part_labelings`
+    // only returns the term, so this recomputes the same canonization a
+    // second time via the `_seeded` sibling to also recover the
+    // labelling; cheap relative to the bliss subprocess call this reuses
+    // no new invocation of) and extend it through formulas ->
+    // solved_formulas -> lemmas -> eq_store -> subterm_store -- a fixed,
+    // deterministic order (PLAN.md's "Driver shape" paragraph).
+    let mut candidates: Vec<CanonicalSystem> = Vec::with_capacity(survivors.len());
+    for (labeling, graph_term) in &survivors {
+        let ordered = crate::bliss_proc::canonical_vertex_order(&part, labeling);
+        let edges = crate::bliss_proc::canonical_edges(&part, labeling);
+        let (graph_term_again, labelling) = canonicalize_graph_part_seeded(&ordered, &edges);
+        debug_assert_eq!(
+            &graph_term_again, graph_term,
+            "re-running canonicalize_graph_part_seeded for a winning labeling must \
+             reproduce the same term minimal_graph_part_labelings already found"
+        );
+        candidates.push(canonicalize_system_content_seeded(
+            sys,
+            &labelling,
+            graph_term_again,
+        ));
+    }
+
+    // Stage F's system-level tie-break: the minimum CanonicalSystem over
+    // every graph-part-level survivor, via the dedicated comparison
+    // function `Guarded`'s missing `Ord` impl forces (see
+    // `cmp_canonical_system`'s own doc comment).
+    Ok(candidates
+        .into_iter()
+        .min_by(cmp_canonical_system)
+        .expect("`candidates` has one entry per (non-empty) `survivors` entry"))
+}
+
+/// Extends `labelling` (already seeded from a graph-part survivor) through
+/// every remaining "Core" field of `sys` (PLAN.md's field-audit table),
+/// building the rest of a [`CanonicalSystem`].
+///
+/// Read-only (`&CanonLabelling`, not `&mut`): nothing past the graph part
+/// ever discovers a new literal EXCEPT `eq_store.conj`'s per-alternative
+/// range terms, and even those are canonized against their own
+/// independent FORK of `labelling` (see
+/// [`canonicalize_eq_disj_alternative`]'s own doc comment for why),
+/// never `labelling` itself -- so `labelling` truly never changes once
+/// this function is called.
+fn canonicalize_system_content_seeded(
+    sys: &System,
+    labelling: &CanonLabelling,
+    graph_part: LNTerm,
+) -> CanonicalSystem {
+    // formulas / solved_formulas / lemmas: read-only against the `theta`
+    // accumulated by the graph part -- `canonicalize_guarded` assumes
+    // `theta` is EXHAUSTIVE (work.tex's guardedness argument: every free
+    // variable/name constant a formula mentions is bound elsewhere in the
+    // system) and panics on a miss rather than silently miscanonizing
+    // (see `lookup_theta`). Kept as three SEPARATE sets, not unioned --
+    // `solved_formulas` membership is live proof-search state, not pure
+    // memoization (PLAN.md's Stage G write-up has the concrete evidence:
+    // `ProofMethod::Induction`'s applicability and `isInitialSystem` both
+    // key off it).
+    let formulas = sort_dedup_guarded(
+        sys.formulas
+            .iter()
+            .map(|f| canonicalize_guarded(f, labelling.theta()))
+            .collect(),
+    );
+    let solved_formulas = sort_dedup_guarded(
+        sys.solved_formulas
+            .iter()
+            .map(|f| canonicalize_guarded(f, labelling.theta()))
+            .collect(),
+    );
+    let lemmas = sort_dedup_guarded(
+        sys.lemmas
+            .iter()
+            .map(|f| canonicalize_guarded(f, labelling.theta()))
+            .collect(),
+    );
+
+    let eq_store = canonicalize_eq_store(&sys.eq_store, labelling);
+    let subterm_store = canonicalize_subterm_store(&sys.subterm_store, labelling.theta());
+
+    CanonicalSystem {
+        graph_part,
+        formulas,
+        solved_formulas,
+        lemmas,
+        eq_store,
+        subterm_store,
+        source_kind: sys.source_kind,
+        side: sys.side,
+    }
+}
+
+/// Canonicalizes `store` (PLAN.md's `eq_store.subst`/`eq_store.conj`
+/// paragraphs).
+fn canonicalize_eq_store(store: &EquationStore, labelling: &CanonLabelling) -> CanonicalEqStore {
+    // eq_store.subst: domain vars are real, graph-reachable variables --
+    // same guardedness-style assumption as formulas, so a missing theta
+    // entry PANICS (`lookup_theta`) rather than silently passing the raw
+    // var through. The range rewrite reuses `apply_literal_renaming`
+    // as-is (silently passes through anything `theta` doesn't cover,
+    // matching its existing, tested behaviour at every other call site --
+    // PLAN.md flags this as intentional, not a gap).
+    let mut subst: Vec<(LNLit, LNTerm)> = store
+        .subst
+        .iter()
+        .map(|(v, t)| {
+            let canon_key = *lookup_theta(labelling.theta(), &Lit::Var(*v));
+            let canon_term = apply_literal_renaming(t, labelling.theta());
+            (canon_key, canon_term)
+        })
+        .collect();
+    subst.sort();
+
+    // eq_store.conj: `split_id` DROPPED (see this file's struct docs
+    // above). Each `EqDisj`'s alternatives are a MULTISET (see
+    // `CanonicalEqStore::conj`'s own doc comment for why duplicates must
+    // survive), sorted once canonical; likewise the outer list of
+    // `EqDisj`s.
+    let mut conj: Vec<Vec<Vec<(LNLit, LNTerm)>>> = store
+        .conj
+        .iter()
+        .map(|disj| canonicalize_eq_disj(disj, labelling))
+        .collect();
+    conj.sort();
+
+    CanonicalEqStore { subst, conj }
+}
+
+/// Canonicalizes one `EqDisj`'s alternatives, preserving multiplicity (no
+/// alpha-dedup -- see `CanonicalEqStore::conj`'s own doc comment) and
+/// sorting by the now-canonical content.
+fn canonicalize_eq_disj(disj: &EqDisj, labelling: &CanonLabelling) -> Vec<Vec<(LNLit, LNTerm)>> {
+    let mut alternatives: Vec<Vec<(LNLit, LNTerm)>> = disj
+        .substs
+        .iter()
+        .map(|alt| canonicalize_eq_disj_alternative(alt, labelling))
+        .collect();
+    alternatives.sort();
+    alternatives
+}
+
+/// Canonicalizes ONE alternative substitution (one `sigma_ij` in
+/// EquationStore.hs's `sigma_i1 ∨ … ∨ sigma_ik_i` notation) of an
+/// `EqDisj`.
+///
+/// **Domain keys** are real, graph-reachable variables (the `x_i` in
+/// EquationStore.hs's own semantics) -- canonicalized via the shared
+/// `theta` (panicking on a miss, same guardedness-style assumption as
+/// everywhere else -- see [`lookup_theta`]) and sorted by that CANONICAL
+/// identity, not raw `LVar` Ord, so the range terms below get visited
+/// (and their local witnesses numbered) in a content-driven,
+/// cross-system-stable order rather than one that depends on incidental
+/// proof-search allocation order.
+///
+/// **Range terms** are entirely, uniformly LOCAL/fresh: per `SubstVFresh`'s
+/// own contract, every variable in a range term is existentially bound to
+/// THIS ONE alternative, regardless of whether its raw identity happens
+/// to look like a real system variable's (PLAN.md's "Domain vs. range is
+/// a hard split" paragraph -- a routine case, not a corner case: Maude
+/// unifies actual terms containing actual system variables, and
+/// `freshen_witness_range` leaves a variable that legitimately belongs to
+/// the original input equations untouched). So:
+///
+/// 1. **Freshen the WHOLE alternative's range in one call**
+///    ([`LNSubstVFresh::fresh_to_free_avoiding`] -- shares one rename
+///    cache across every entry, so a variable repeated across two range
+///    terms gets the SAME fresh identity both times, and leaves domain
+///    keys untouched), with an allocator that avoids every raw variable
+///    index already claimed by `labelling.theta()`
+///    ([`raw_var_idx_avoid_floor`]).
+/// 2. **Canonize each freshened range term against a FRESH FORK of
+///    `labelling`** (`labelling.clone()`, mutated across this one
+///    alternative's own entries so a witness shared between two of its
+///    own range terms still gets tied together -- see
+///    `eq_disj_alternative_shares_a_witness_across_two_of_its_own_range_terms`),
+///    then DISCARD the fork. Never mutate the real, continuing
+///    `labelling` itself.
+///
+/// Step 2's fork is NOT optional, unlike an earlier revision of this
+/// function assumed. `EqDisj`'s alternatives (`sigma_i1 ∨ … ∨ sigma_ik_i`)
+/// are each other's INDEPENDENT existential scopes -- both within one
+/// `EqDisj` and across different ones -- so two alternatives with the
+/// EXACT SAME shape, differing only in raw witness identity (mirroring
+/// Maude's arbitrary per-call numbering), must canonize to the IDENTICAL
+/// result regardless of which one happens to be processed first. Canonizing
+/// against a SHARED, advancing `labelling` breaks that: whichever
+/// alternative runs first claims the lower canonical indices, and an
+/// otherwise-identical sibling processed after it is forced to discover
+/// its own local witnesses starting from wherever the first one left the
+/// counters, landing on DIFFERENT canonical names for the same shape --
+/// caught directly by
+/// `eq_disj_preserves_multiplicity_of_alpha_equivalent_alternatives`
+/// (which failed under that earlier revision). Forking wholesale and
+/// discarding afterward sidesteps this entirely: every alternative always
+/// starts from the exact same baseline `labelling`, so processing order
+/// can never leak into the result. This is safe to discard because
+/// nothing downstream of `eq_store.conj` ever discovers a new literal
+/// (`subterm_store` is the only field processed after it, and it's
+/// read-only against `theta`, same as every other field before
+/// `eq_store.conj` -- see `canonicalize_system_content_seeded`'s own doc
+/// comment), so there is no legitimate consumer for an advanced counter
+/// to be preserved for in the first place.
+fn canonicalize_eq_disj_alternative(
+    alt: &LNSubstVFresh,
+    labelling: &CanonLabelling,
+) -> Vec<(LNLit, LNTerm)> {
+    let mut entries: Vec<(LNLit, LVar)> = alt
+        .iter()
+        .map(|(v, _)| (*lookup_theta(labelling.theta(), &Lit::Var(*v)), *v))
+        .collect();
+    // `entries` is created from the alternative's domain keys; i.e., a BTreeMap's keys.
+    // Thus, each key is unique. This is important for the injectivity assertion below.
+    entries.sort_by_key(|(canon, _)| *canon);
+
+    // INVARIANT: `theta` is injective -- a core `Canonizer` guarantee, not
+    // an incidental implementation detail. Every newly-discovered literal
+    // gets a BRAND NEW canonical index (`Canonizer::canonize_literals`
+    // zips a batch's distinct original literals 1:1 against indices drawn
+    // from a monotonic, never-reset, never-reused counter; a literal
+    // already in `theta` is excluded from "uncanonicalized" before that
+    // even runs, so it's never reprocessed), so two DISTINCT domain keys
+    // of one alternative can never canonicalize to the SAME `LNLit`. If
+    // they somehow did (e.g. a `theta` hand-built via `CanonLabelling::
+    // from_theta` with a bug, bypassing the Canonizer's own accumulation
+    // entirely), the stable sort above would fall back to `alt`'s raw,
+    // incidental `BTreeMap` order to break the tie -- silently making
+    // which of their two (possibly different) range terms is associated
+    // with which output position depend on raw `LVar` identity rather
+    // than content, exactly the class of bug this whole design exists to
+    // rule out. Fail loudly instead of ever risking that silently.
+    for pair in entries.windows(2) {
+        assert_ne!(
+            pair[0].0, pair[1].0,
+            "canonicalize_eq_disj_alternative: two distinct domain keys \
+             canonicalized to the SAME literal ({:?}) -- theta is no \
+             longer injective, which should be impossible; the ordering \
+             between their (potentially different) range terms would be \
+             undefined",
+            pair[0].0
+        );
+    }
+
+    if entries.is_empty() {
+        // No domain keys, so no range terms either -- nothing to freshen
+        // or canonize.
+        return Vec::new();
+    }
+
+    let mut next_idx = raw_var_idx_avoid_floor(labelling.theta());
+    let freshened: LNSubst = alt.fresh_to_free_avoiding(|n| {
+        let start = next_idx;
+        next_idx += n;
+        start
+    });
+
+    let mut scratch = labelling.clone();
+    entries
+        .into_iter()
+        .map(|(canon_key, v)| {
+            // `fresh_to_free_avoiding`'s output drops a trivial `v -> v`
+            // mapping (`Subst::from_list`'s own trivial-drop) -- which
+            // can only happen if `v` had no occurrences anywhere in the
+            // alternative's range terms at all (freshening never
+            // reassigns a variable to its own original identity, since
+            // the allocator only ever hands out indices strictly above
+            // everything currently in scope). Either way, `v` itself
+            // (unchanged) is the correct range term to canonize.
+            let range_term = freshened
+                .image_of(&v)
+                .cloned()
+                .unwrap_or_else(|| var_term(v));
+            let canon_term = canonicalize_alpha_eq_ac_seeded(&range_term, &mut scratch);
+            (canon_key, canon_term)
+        })
+        .collect()
+}
+
+/// The smallest raw variable index guaranteed not to collide with any
+/// `Lit::Var` key already in `theta` -- the floor
+/// [`canonicalize_eq_disj_alternative`]'s range-freshening allocator must
+/// start from so a freshly-minted witness identity can never accidentally
+/// match an existing (and therefore already-resolved) literal. Only
+/// `theta`'s KEYS matter here (what a lookup is keyed by, and the raw
+/// literals originally seen -- proof-search-allocated indices, typically
+/// large and monotonically increasing over a run), not its VALUES (the
+/// canonical output literals, a completely separate, small,
+/// sequentially-counted namespace that a lookup is never keyed by) or
+/// `Con` keys (name constants -- freshening only ever touches `Var`
+/// occurrences, never `Con` ones, so a name constant can never collide
+/// with a freshened identity regardless).
+fn raw_var_idx_avoid_floor(theta: &std::collections::BTreeMap<LNLit, LNLit>) -> u64 {
+    theta
+        .keys()
+        .filter_map(|lit| match lit {
+            Lit::Var(v) => Some(v.idx),
+            Lit::Con(_) => None,
+        })
+        .max()
+        .map_or(0, |m| m + 1)
+}
+
+/// Canonicalizes `store` (PLAN.md's `subterm_store` paragraph): drops
+/// `propagated`/`old_neg_subterms` (Rust-only bookkeeping, excluded by the
+/// field audit), renames every term pair via `theta` (reusing
+/// `apply_literal_renaming`, same as `eq_store.subst`'s range), and
+/// re-sorts everything -- `neg_subterms` is already a sorted, deduplicated
+/// set pre-canonicalization, but renaming can change relative order and
+/// even collapse two distinct pairs into one, so the existing sort/dedup
+/// can't be trusted to survive it unchanged.
+fn canonicalize_subterm_store(
+    store: &SubtermStore,
+    theta: &std::collections::BTreeMap<LNLit, LNLit>,
+) -> CanonicalSubtermStore {
+    let canon_pair = |c: &SubtermConstraint| {
+        (
+            apply_literal_renaming(&c.small, theta),
+            apply_literal_renaming(&c.big, theta),
+        )
+    };
+
+    let mut subterms: Vec<(LNTerm, LNTerm)> = store.subterms.iter().map(canon_pair).collect();
+    subterms.sort();
+    let mut solved_subterms: Vec<(LNTerm, LNTerm)> =
+        store.solved_subterms.iter().map(canon_pair).collect();
+    solved_subterms.sort();
+    let mut neg_subterms: Vec<(LNTerm, LNTerm)> = store
+        .neg_subterms
+        .iter()
+        .map(|(a, b)| {
+            (
+                apply_literal_renaming(a, theta),
+                apply_literal_renaming(b, theta),
+            )
+        })
+        .collect();
+    neg_subterms.sort();
+    neg_subterms.dedup();
+
+    CanonicalSubtermStore {
+        subterms,
+        solved_subterms,
+        contradictory: store.contradictory,
+        neg_subterms,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tamarin_term::alpha_eq_ac::fingerprint_term;
+    use tamarin_term::function_symbols::pair_sym;
     use tamarin_term::lterm::{LSort, LVar};
+    use tamarin_term::term::{f_app_no_eq, Term};
     use tamarin_term::vterm::var_term;
 
     use crate::fact::{fresh_fact, in_fact, out_fact, proto_fact, Multiplicity};
@@ -1763,8 +2312,8 @@ mod tests {
     /// Installs a minimal, no-custom-functions signature -- `action_vertex_fact`'s
     /// precondition (mirrors `system_import.rs`'s own `install_test_signature`).
     fn install_empty_signature() -> crate::elaborate::UserFunsForTheoryGuard {
-        let thy =
-            tamarin_parser::parser::parse_theory("theory T begin\nend", &[]).expect("parse minimal theory");
+        let thy = tamarin_parser::parser::parse_theory("theory T begin\nend", &[])
+            .expect("parse minimal theory");
         crate::elaborate::set_user_funs_for_theory(&thy)
     }
 
@@ -2029,7 +2578,8 @@ mod tests {
     use crate::canon_color::ColorTable;
 
     fn theory(src: &str) -> crate::theory::Theory {
-        let parsed = tamarin_parser::parser::parse_theory(src, &[]).unwrap_or_else(|e| panic!("parse: {e}"));
+        let parsed =
+            tamarin_parser::parser::parse_theory(src, &[]).unwrap_or_else(|e| panic!("parse: {e}"));
         crate::elaborate::elaborate(&parsed).unwrap_or_else(|e| panic!("elaborate: {e:?}"))
     }
 
@@ -2085,10 +2635,7 @@ mod tests {
             VertexKind::RuleInstance(node(1), rule_with_conclusion("Leaf", z_fun)),
             VertexKind::RuleInstance(node(2), rule_with_conclusion("Leaf", a_fun)),
         ];
-        let edges = vec![
-            GraphEdge { src: 0, tgt: 1 },
-            GraphEdge { src: 0, tgt: 2 },
-        ];
+        let edges = vec![GraphEdge { src: 0, tgt: 1 }, GraphEdge { src: 0, tgt: 2 }];
         let part = GraphPart {
             vertices,
             edges,
@@ -2126,7 +2673,11 @@ mod tests {
                 canonicalize_graph_part(&ordered, &edges)
             })
             .collect();
-        assert_eq!(all_terms.len(), 2, "Aut(G) = {{id, swap}} has exactly 2 elements");
+        assert_eq!(
+            all_terms.len(),
+            2,
+            "Aut(G) = {{id, swap}} has exactly 2 elements"
+        );
         assert_eq!(&survivors[0].1, all_terms.iter().min().unwrap());
         assert!(
             all_terms.iter().any(|t| *t != survivors[0].1),
@@ -2159,7 +2710,8 @@ mod tests {
             return;
         }
         use crate::bliss_proc::{
-            canonical_edges, canonical_vertex_order, generate_group, graph_part_to_dimacs, run_bliss,
+            canonical_edges, canonical_vertex_order, generate_group, graph_part_to_dimacs,
+            run_bliss,
         };
         use crate::canon_graph::{GraphEdge, GraphPart};
 
@@ -2182,11 +2734,23 @@ mod tests {
         // test's own doc comment.
         let vertices = vec![
             VertexKind::RuleInstance(node(0), rule_ac_inst("HubA", vec![], vec![], vec![])), // 0
-            VertexKind::RuleInstance(node(1), rule_with_conclusion("LeafA", zero_ary_fun_term("aaa"))), // 1
-            VertexKind::RuleInstance(node(2), rule_with_conclusion("LeafA", zero_ary_fun_term("zzz"))), // 2
+            VertexKind::RuleInstance(
+                node(1),
+                rule_with_conclusion("LeafA", zero_ary_fun_term("aaa")),
+            ), // 1
+            VertexKind::RuleInstance(
+                node(2),
+                rule_with_conclusion("LeafA", zero_ary_fun_term("zzz")),
+            ), // 2
             VertexKind::RuleInstance(node(3), rule_ac_inst("HubB", vec![], vec![], vec![])), // 3
-            VertexKind::RuleInstance(node(4), rule_with_conclusion("LeafB", zero_ary_fun_term("aaa"))), // 4
-            VertexKind::RuleInstance(node(5), rule_with_conclusion("LeafB", zero_ary_fun_term("zzz"))), // 5
+            VertexKind::RuleInstance(
+                node(4),
+                rule_with_conclusion("LeafB", zero_ary_fun_term("aaa")),
+            ), // 4
+            VertexKind::RuleInstance(
+                node(5),
+                rule_with_conclusion("LeafB", zero_ary_fun_term("zzz")),
+            ), // 5
         ];
         let edges = vec![
             GraphEdge { src: 0, tgt: 1 },
@@ -2219,11 +2783,16 @@ mod tests {
         // "Naive" iteration: only {id} ∪ the raw generators bliss
         // reported -- i.e. exactly what a caller would try if it skipped
         // `generate_group`'s closure step.
-        let naive_candidates: Vec<crate::bliss_proc::Permutation> =
-            std::iter::once(crate::bliss_proc::Permutation::identity(part.vertices.len()))
-                .chain(result.generators.iter().cloned())
-                .collect();
-        assert_eq!(naive_candidates.len(), 3, "naive set: id + 2 raw generators");
+        let naive_candidates: Vec<crate::bliss_proc::Permutation> = std::iter::once(
+            crate::bliss_proc::Permutation::identity(part.vertices.len()),
+        )
+        .chain(result.generators.iter().cloned())
+        .collect();
+        assert_eq!(
+            naive_candidates.len(),
+            3,
+            "naive set: id + 2 raw generators"
+        );
         let naive_min = naive_candidates
             .iter()
             .map(|g| {
@@ -2246,6 +2815,223 @@ mod tests {
              be strictly smaller than whatever naive {{id}} ∪ raw-generators iteration \
              finds -- otherwise this test isn't actually exercising the gap group \
              closure fixes"
+        );
+    }
+
+    // -- Stage G: eq_store.conj --------------------------------------------
+
+    /// A `CanonLabelling` whose theta already covers `domain_vars`, each
+    /// mapped to its own distinct canonical var of the same sort -- enough
+    /// to satisfy `lookup_theta`'s panic-on-miss for a domain-key lookup,
+    /// without running a real graph-part/formula canonization pass first.
+    /// Canonical keys are handed out in `domain_vars`' own order (index 0,
+    /// 1, ...), so a test can predict which output entry belongs to which
+    /// input domain var.
+    fn labelling_covering(domain_vars: &[LVar]) -> CanonLabelling {
+        let mut theta: std::collections::BTreeMap<LNLit, LNLit> = std::collections::BTreeMap::new();
+        for (i, dv) in domain_vars.iter().enumerate() {
+            theta.insert(Lit::Var(*dv), Lit::Var(LVar::new("cv", dv.sort, i as u64)));
+        }
+        CanonLabelling::from_theta(theta)
+    }
+
+    #[test]
+    fn eq_disj_alternative_with_no_domain_keys_is_empty() {
+        let alt: LNSubstVFresh = LNSubstVFresh::from_list(Vec::<(LVar, LNTerm)>::new());
+        let labelling = CanonLabelling::empty();
+        assert_eq!(
+            canonicalize_eq_disj_alternative(&alt, &labelling),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn eq_disj_alternative_domain_via_theta_range_discovered_fresh() {
+        let x = LVar::new("x", LSort::Msg, 7);
+        let w = LVar::new("w", LSort::Msg, 900); // an undiscovered witness
+        let alt: LNSubstVFresh = LNSubstVFresh::from_list(vec![(x, var_term(w))]);
+        let labelling = labelling_covering(&[x]);
+
+        let out = canonicalize_eq_disj_alternative(&alt, &labelling);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, Lit::Var(LVar::new("cv", LSort::Msg, 0)));
+        // The witness got SOME fresh canonical literal of its own -- not
+        // `w` itself (which was never a canonical form to begin with),
+        // and not x's own canonical key.
+        assert_ne!(out[0].1, var_term(w));
+        assert_ne!(out[0].1, LNTerm::Lit(out[0].0));
+    }
+
+    /// The core correctness property: two alternatives with the SAME
+    /// logical shape but DIFFERENT raw witness identities (mirroring
+    /// Maude's arbitrary per-call witness numbering) canonize to the
+    /// IDENTICAL result.
+    #[test]
+    fn eq_disj_alternative_is_witness_numbering_invariant() {
+        let x = LVar::new("x", LSort::Msg, 7);
+        let alt_a: LNSubstVFresh = LNSubstVFresh::from_list(vec![(
+            x,
+            f_app_no_eq(
+                pair_sym(),
+                vec![
+                    var_term(LVar::new("w", LSort::Msg, 100)),
+                    var_term(LVar::new("w", LSort::Msg, 101)),
+                ],
+            ),
+        )]);
+        let alt_b: LNSubstVFresh = LNSubstVFresh::from_list(vec![(
+            x,
+            f_app_no_eq(
+                pair_sym(),
+                vec![
+                    var_term(LVar::new("z", LSort::Msg, 500)),
+                    var_term(LVar::new("z", LSort::Msg, 501)),
+                ],
+            ),
+        )]);
+
+        let labelling_a = labelling_covering(&[x]);
+        let labelling_b = labelling_covering(&[x]);
+
+        let out_a = canonicalize_eq_disj_alternative(&alt_a, &labelling_a);
+        let out_b = canonicalize_eq_disj_alternative(&alt_b, &labelling_b);
+
+        assert_eq!(out_a, out_b);
+    }
+
+    /// A witness appearing in TWO of an alternative's own range terms (not
+    /// just twice within one) must canonize to the SAME canonical literal
+    /// both times -- confirming the per-entry `canonicalize_alpha_eq_ac_seeded`
+    /// calls correctly share identity via the one mutable `labelling`
+    /// threaded across them, the same way two different graph vertices
+    /// sharing a variable already do (Stage D).
+    #[test]
+    fn eq_disj_alternative_shares_a_witness_across_two_of_its_own_range_terms() {
+        let p = LVar::new("p", LSort::Msg, 7);
+        let q = LVar::new("q", LSort::Msg, 8);
+        let w = LVar::new("w", LSort::Msg, 900);
+        let alt: LNSubstVFresh = LNSubstVFresh::from_list(vec![
+            (p, f_app_no_eq(pair_sym(), vec![var_term(w), var_term(w)])),
+            (q, var_term(w)),
+        ]);
+        let labelling = labelling_covering(&[p, q]);
+
+        let out = canonicalize_eq_disj_alternative(&alt, &labelling);
+
+        assert_eq!(out.len(), 2);
+        let p_key = Lit::Var(LVar::new("cv", LSort::Msg, 0));
+        let q_key = Lit::Var(LVar::new("cv", LSort::Msg, 1));
+        let p_range = &out.iter().find(|(k, _)| *k == p_key).expect("p entry").1;
+        let q_range = &out.iter().find(|(k, _)| *k == q_key).expect("q entry").1;
+        match p_range {
+            Term::App(_, args) => {
+                assert_eq!(args.len(), 2);
+                // Both occurrences of `w` WITHIN p's own pair(..) term
+                // share one canonical literal.
+                assert_eq!(args[0], args[1]);
+                // AND q's lone range term (just `w`) matches that SAME
+                // literal -- the shared identity crosses entries, not
+                // just occurrences within one.
+                assert_eq!(&args[0], q_range);
+            }
+            other => panic!("expected a pair(..) term, got {other:?}"),
+        }
+    }
+
+    /// Regression test for the exact collision risk `canonicalize_eq_disj_alternative`'s
+    /// own doc comment describes: a range variable whose raw `LVar`
+    /// happens to coincide with an UNRELATED real variable already
+    /// covered by `theta`. `SubstVFresh`'s "range vars are fresh" is only
+    /// an interpretive convention (not a data-level guarantee), so this
+    /// raw-identity collision must not cause the witness to be silently
+    /// treated as the real variable it happens to share an `LVar` with.
+    #[test]
+    fn eq_disj_alternative_range_witness_does_not_alias_an_unrelated_real_variable() {
+        let x = LVar::new("x", LSort::Msg, 7);
+        let y = LVar::new("y", LSort::Msg, 42);
+        // `w` deliberately reuses `y`'s exact raw identity.
+        let w = y;
+        let alt: LNSubstVFresh = LNSubstVFresh::from_list(vec![(x, var_term(w))]);
+        let labelling = labelling_covering(&[x, y]);
+        let y_canonical = *labelling
+            .theta()
+            .get(&Lit::Var(y))
+            .expect("labelling_covering covers y");
+
+        let out = canonicalize_eq_disj_alternative(&alt, &labelling);
+
+        assert_eq!(out.len(), 1);
+        assert_ne!(
+            out[0].1,
+            LNTerm::Lit(y_canonical),
+            "the witness (raw-identical to `y`) must get its OWN canonical \
+             identity, not `y`'s -- aliasing them would silently fuse an \
+             existentially-local witness with an unrelated real variable"
+        );
+    }
+
+    /// Reviewed corner case, found IMPOSSIBLE under normal operation: two
+    /// distinct domain keys of one alternative canonicalizing to the SAME
+    /// literal, with DIFFERENT range terms -- which would make the
+    /// domain-key sort's tie-break (and thus which range term ends up
+    /// associated with that canonical position) depend on incidental raw
+    /// `LVar` order rather than content. `theta` is injective by
+    /// construction (every `Canonizer`-discovered literal gets a
+    /// brand-new canonical index -- see `canonicalize_eq_disj_alternative`'s
+    /// own doc comment), so this can't happen via the real accumulation
+    /// path; every OTHER test in this file builds its labelling that way.
+    /// This test instead hand-constructs a `theta` that violates
+    /// injectivity directly (via `CanonLabelling::from_theta`, bypassing
+    /// the `Canonizer` entirely -- something production code never does),
+    /// to confirm the function fails LOUDLY rather than silently picking
+    /// an arbitrary, non-deterministic order if that invariant is ever
+    /// broken some other way in the future.
+    #[test]
+    #[should_panic(expected = "theta is no longer injective")]
+    fn eq_disj_alternative_panics_if_theta_is_not_injective() {
+        let v1 = LVar::new("v1", LSort::Msg, 1);
+        let v2 = LVar::new("v2", LSort::Msg, 2);
+        let shared_canonical = LVar::new("cv", LSort::Msg, 0);
+        let mut theta: std::collections::BTreeMap<LNLit, LNLit> = std::collections::BTreeMap::new();
+        // Deliberately broken: two DIFFERENT raw domain vars mapped to the
+        // SAME canonical literal -- impossible via real accumulation.
+        theta.insert(Lit::Var(v1), Lit::Var(shared_canonical));
+        theta.insert(Lit::Var(v2), Lit::Var(shared_canonical));
+        let labelling = CanonLabelling::from_theta(theta);
+
+        let alt: LNSubstVFresh = LNSubstVFresh::from_list(vec![
+            (v1, var_term(LVar::new("w", LSort::Msg, 100))),
+            (v2, var_term(LVar::new("w", LSort::Msg, 200))),
+        ]);
+
+        canonicalize_eq_disj_alternative(&alt, &labelling);
+    }
+
+    #[test]
+    fn eq_disj_preserves_multiplicity_of_alpha_equivalent_alternatives() {
+        let x = LVar::new("x", LSort::Msg, 7);
+        let alt_a: LNSubstVFresh =
+            LNSubstVFresh::from_list(vec![(x, var_term(LVar::new("w", LSort::Msg, 100)))]);
+        let alt_b: LNSubstVFresh =
+            LNSubstVFresh::from_list(vec![(x, var_term(LVar::new("w", LSort::Msg, 200)))]);
+        let disj = EqDisj {
+            split_id: crate::tools::equation_store::SplitId(0),
+            substs: vec![alt_a, alt_b],
+        };
+        let labelling = labelling_covering(&[x]);
+
+        let out = canonicalize_eq_disj(&disj, &labelling);
+
+        assert_eq!(
+            out.len(),
+            2,
+            "two alpha-equivalent alternatives must NOT be deduplicated -- \
+             Tamarin's own solver keeps them distinct (see PLAN.md)"
+        );
+        assert_eq!(
+            out[0], out[1],
+            "and their canonical forms must actually be equal"
         );
     }
 }
