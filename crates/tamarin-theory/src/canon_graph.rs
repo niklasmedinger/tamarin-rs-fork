@@ -59,11 +59,10 @@ use std::fmt::Write as _;
 use crate::canon_color::{Color, ColorTable};
 use crate::constraint::constraints::NodeId;
 use crate::constraint::system::System;
-use crate::guarded::{cmp_fact, BVar, GAtom, GFact, GTerm, Guarded};
-use crate::pretty_formula::pretty_guarded;
+use crate::fact::LNFact;
+use crate::guarded::{BVar, GAtom, GFact, GTerm, Guarded};
 use crate::pretty_system::pretty_fact;
 use crate::rule::{rule_name_string, ConcIdx, PremIdx, RuleACInst};
-use crate::theory::Theory;
 
 use tamarin_parser::ast::{SortHint, SuffixSort, VarSpec};
 use tamarin_term::lterm::{LSort, LVar};
@@ -90,7 +89,20 @@ pub enum VertexKind {
     /// the graph canonizer's own automorphism search resolve that
     /// permutation as an ordinary part of finding `Aut(G)`, with no
     /// separate AC-wrapping tie-break mechanism needed at all.
-    Action(NodeId, GFact),
+    ///
+    /// Payload is `LNFact`, not the `GFact` a formula atom's own action
+    /// is originally found in (`collect_action_atoms` still walks
+    /// `Guarded`/`GFact` -- that structure is unavoidable while formulas
+    /// are the source), and not the raw `LNFact` a `Goal::Action` already
+    /// carries either -- both get bridged/normalized to this ONE shape
+    /// HERE, at extraction time (`action_vertex_fact` for the
+    /// `GFact` case), rather than each caller downstream (`vertex_to_term`,
+    /// the `ColorTable`, the DOT renderer) handling two different payload
+    /// types. Changed 2026-09-23 (was `GFact`) specifically so a
+    /// `Goal::Action(nid, fact)` -- which already IS an `LNFact`, no
+    /// elaboration needed -- can become a vertex through the exact same
+    /// path a formula-derived action does, with no parallel vertex kind.
+    Action(NodeId, LNFact),
     /// A `NodeId` with neither a rule instance nor an action atom of its
     /// own, referenced only via a relation endpoint or `last_atom`.
     /// Mirrors `graph::repr::NodeType::Missing`'s reason for existing:
@@ -173,11 +185,17 @@ impl GraphPart {
 }
 
 /// Extracts the graph part from `sys` (Stage A — see the module docs),
-/// building its `colors` table from `theory` ([`crate::canon_color`],
-/// Stage B) in the same call — `theory` must be the SAME (elaborated)
-/// theory `sys` was produced from, or vertex coloring later panics on a
-/// rule/action name this table wasn't built to cover.
-pub fn extract_graph_part(sys: &System, theory: &Theory) -> GraphPart {
+/// pairing it with the caller-supplied `colors` table ([`crate::canon_color`],
+/// Stage B) in the same call — `colors` must be the table for the SAME
+/// (elaborated) theory `sys` was produced from, or vertex coloring later
+/// panics on a rule/action name this table wasn't built to cover. This
+/// function needs no `&Theory` at all: `colors` is unique per theory and
+/// the caller — whoever elaborated the theory / built the `ProofContext`
+/// a real proof search runs under, or a test constructing both directly
+/// — already has one on hand (see [`ColorTable::build`]'s own doc
+/// comment for why it takes `&[OpenProtoRule]` + `&IntrRuleCache` rather
+/// than `&Theory`).
+pub fn extract_graph_part(sys: &System, colors: &ColorTable) -> GraphPart {
     let mut vertices: Vec<VertexKind> = Vec::new();
     let mut edges: Vec<GraphEdge> = Vec::new();
     // NodeId -> index of its RuleInstance/Dummy vertex. Every NodeId the
@@ -245,13 +263,43 @@ pub fn extract_graph_part(sys: &System, theory: &Theory) -> GraphPart {
     //    graph-part model has no lemma-derived vertex kind to begin
     //    with. Each action's link to its timepoint is reified as
     //    `action -> AtTimepointRelation -> timepoint`.
-    let mut actions: Vec<(NodeId, GFact)> = Vec::new();
+    //
+    //    ALSO one per `Goal::Action(nid, fact)` in `sys.goals` -- regardless
+    //    of `GoalStatus::solved` (a solved goal is kept "for replay", per
+    //    its own doc comment, not folded back into `formulas`, so its
+    //    content would otherwise never appear ANYWHERE the graph part
+    //    looks). This closes a real gap: `!KU(_)` sub-goals synthesized by
+    //    `insert_goal_with_loop_flag`'s pair/inv/prod decomposition
+    //    (`reduction.rs`) carry genuinely new term content -- e.g. two
+    //    sibling `!KU(mac1)`/`!KU(mac2)` goals -- that never reaches
+    //    `sys.formulas` at all, so before this it was invisible to
+    //    canonicalization entirely: the goal's own `NodeId` fell back to a
+    //    bare content-free `Dummy` vertex, silently discarding which TERM
+    //    was actually pending derivation there. Deduped against the
+    //    formula-derived actions below (a goal-action that also happens
+    //    to already be a formula atom must still yield only ONE vertex).
+    let mut raw_actions: Vec<(NodeId, GFact)> = Vec::new();
     for f in sys.formulas.iter().chain(sys.solved_formulas.iter()) {
-        collect_action_atoms(f, &mut actions);
+        collect_action_atoms(f, &mut raw_actions);
     }
-    actions.sort_by(|(n1, f1), (n2, f2)| n1.cmp(n2).then_with(|| cmp_fact(f1, f2)));
-    actions
-        .dedup_by(|(n1, f1), (n2, f2)| n1 == n2 && cmp_fact(f1, f2) == std::cmp::Ordering::Equal);
+    // Bridge each `GFact` to the `LNFact` `VertexKind::Action` now holds
+    // (`action_vertex_fact`) BEFORE sorting/deduping -- two syntactically
+    // different `GFact`s can still elaborate to the identical `LNFact`
+    // (e.g. differing only in a spelling the signature normalizes), so
+    // deduping on the POST-elaboration form is the semantically correct
+    // one, not just a convenient side effect of `LNFact` already
+    // deriving `Ord` (dropping the bespoke `cmp_fact` comparator).
+    let mut actions: Vec<(NodeId, LNFact)> = raw_actions
+        .into_iter()
+        .map(|(nid, gfact)| (nid, action_vertex_fact(&gfact)))
+        .collect();
+    for (goal, _status) in sys.goals.iter() {
+        if let crate::constraint::constraints::Goal::Action(nid, fact) = goal {
+            actions.push((*nid, fact.clone()));
+        }
+    }
+    actions.sort();
+    actions.dedup();
 
     for (nid, fact) in actions {
         let node_idx = get_vertex_or_create_dummy_vertex(nid, &mut vertices, &mut node_vertex);
@@ -269,7 +317,7 @@ pub fn extract_graph_part(sys: &System, theory: &Theory) -> GraphPart {
     GraphPart {
         vertices,
         edges,
-        colors: ColorTable::build(theory),
+        colors: colors.clone(),
     }
 }
 
@@ -340,6 +388,48 @@ fn collect_action_atoms(g: &Guarded, out: &mut Vec<(NodeId, GFact)>) {
         }
         _ => {}
     }
+}
+
+/// Converts a formula-derived action atom's `GFact` to the `LNFact`
+/// [`VertexKind::Action`] actually holds, so a formula-sourced action and
+/// a `Goal::Action`'s already-`LNFact` action become the exact same
+/// vertex shape (see `VertexKind::Action`'s own doc comment for why this
+/// unification exists).
+///
+/// Reuses the SAME bridge `system_import::parse_fact` already uses in
+/// production to reconstruct `LNFact`s from a captured `System`'s formula
+/// atoms: [`crate::guarded::gfact_to_fact`] (purely structural, no
+/// signature needed) then [`crate::elaborate::fact_to_lnfact`] (resolves
+/// the fact's function-symbol names against the CURRENTLY INSTALLED
+/// signature — see `elaborate::set_user_funs_for_theory`'s own doc
+/// comment). The caller ([`extract_graph_part`]) must have that signature
+/// installed for the SAME theory `sys` came from — the same precondition
+/// `extract_graph_part`'s own doc comment already states for its
+/// caller-supplied `ColorTable`.
+///
+/// **Panics** if `gfact` still carries a `Bound` variable, or if the
+/// installed signature can't elaborate one of its terms. Both are
+/// treated as caller-contract violations, not recoverable runtime
+/// conditions: [`collect_action_atoms`] only ever extracts a `GFact` from
+/// a GROUND, already-committed conjunct (never from inside a
+/// `Guarded::Disj` alternative or a `GGuarded` binder's body — see that
+/// function's own doc comment), so every `GFact` this is actually called
+/// on is assumed already closed: a leftover `Bound` var surfacing here
+/// means that extraction discipline was violated somewhere upstream,
+/// which should fail loudly rather than silently mis-canonize. This is
+/// why [`crate::guarded::gfact_to_fact`] is used deliberately instead of
+/// the fallible `crate::guarded::try_gfact_to_fact`: a violation surfaces
+/// immediately, at the point of conversion, instead of limping forward as
+/// a `None`/`Result::Err` a caller could mishandle.
+fn action_vertex_fact(gfact: &GFact) -> LNFact {
+    let pfact = crate::guarded::gfact_to_fact(gfact);
+    crate::elaborate::fact_to_lnfact(&pfact).unwrap_or_else(|e| {
+        panic!(
+            "action_vertex_fact: {e} -- {gfact:?} did not elaborate under the currently \
+             installed signature (wrong/missing set_user_funs_for_theory guard for this \
+             system's theory?)"
+        )
+    })
 }
 
 /// Whether a parser-AST sort hint denotes `LSort::Node` — covers both the
@@ -494,7 +584,7 @@ fn write_vertex(out: &mut String, idx: usize, v: &VertexKind, fill: &str) {
             .ok();
         }
         VertexKind::Action(nid, fact) => {
-            let fact_str = pretty_guarded(&Guarded::Atom(GAtom::Pred(fact.clone())));
+            let fact_str = pretty_fact(fact);
             let label = escape_dot_label(&format!("V{idx}  {fact_str} @ {nid}"));
             writeln!(
                 out,
@@ -584,15 +674,36 @@ mod tests {
     use crate::rule::{
         ConcIdx, PremIdx, ProtoRuleACInstInfo, ProtoRuleName, Rule, RuleAttributes, RuleInfo,
     };
+    use crate::theory::Theory;
     use std::sync::Arc;
     use tamarin_parser::parser::{parse_formula_str, parse_theory};
 
-    /// Parses+elaborates `src` into the `&Theory` [`extract_graph_part`]
-    /// needs — mirrors `canon_color.rs`'s own test helper of the same
-    /// name/shape.
+    /// Parses+elaborates `src` — mirrors `canon_color.rs`'s own test
+    /// helper of the same name/shape.
     fn theory(src: &str) -> Theory {
         let parsed = parse_theory(src, &[]).unwrap_or_else(|e| panic!("parse: {e}"));
         crate::elaborate::elaborate(&parsed).unwrap_or_else(|e| panic!("elaborate: {e:?}"))
+    }
+
+    /// The `&ColorTable` [`extract_graph_part`] needs, built from `src`'s
+    /// own protocol rules and an EMPTY `IntrRuleCache` — none of this
+    /// module's tests color a `RuleInfo::Intr` vertex (only
+    /// `to_graphviz_renders_a_well_formed_digraph_document`/
+    /// `same_timepoint_actions_render_as_two_ellipses_with_attimepoint_relations`
+    /// actually query colors at all, and only for THIS theory's own
+    /// declared rules/actions), so an empty cache is both correct here
+    /// and avoids needing a real maude process for tests that are
+    /// otherwise purely structural. See `canon_color.rs`'s own test
+    /// module for the maude-backed helper real intruder-rule coverage
+    /// needs.
+    fn color_table(src: &str) -> ColorTable {
+        let elaborated = theory(src);
+        let protocol_rules: Vec<crate::theory::OpenProtoRule> =
+            elaborated.rules().cloned().collect();
+        ColorTable::build(
+            &protocol_rules,
+            &crate::constraint::solver::context::IntrRuleCache::from(Vec::new()),
+        )
     }
 
     const EMPTY: &str = "theory T begin\nend";
@@ -621,12 +732,66 @@ mod tests {
         formula_to_guarded(&f).unwrap_or_else(|e| panic!("formula_to_guarded {s:?}: {e}"))
     }
 
+    /// Parses `s` as a bare fact (reusing [`g`]'s formula-parser path) and
+    /// unwraps the `GAtom::Pred` atom it must produce -- the same shape
+    /// [`collect_action_atoms`] hands to [`action_vertex_fact`].
+    fn gfact(s: &str) -> GFact {
+        match g(s) {
+            Guarded::Atom(GAtom::Pred(f)) => f,
+            other => panic!("{s:?} did not parse as a bare fact (Pred atom): {other:?}"),
+        }
+    }
+
+    /// Installs a minimal, no-custom-functions signature --
+    /// `action_vertex_fact`'s precondition (mirrors `system_import.rs`'s
+    /// own `install_test_signature`).
+    fn install_empty_signature() -> crate::elaborate::UserFunsForTheoryGuard {
+        let thy = parse_theory("theory T begin\nend", &[]).expect("parse minimal theory");
+        crate::elaborate::set_user_funs_for_theory(&thy)
+    }
+
+    #[test]
+    fn action_vertex_fact_converts_a_ground_gfact_to_the_matching_lnfact() {
+        let _guard = install_empty_signature();
+        let converted = action_vertex_fact(&gfact("P(x)"));
+        let expected = crate::fact::proto_fact(
+            crate::fact::Multiplicity::Linear,
+            "P",
+            vec![tamarin_term::vterm::var_term(LVar::new(
+                "x",
+                LSort::Msg,
+                0,
+            ))],
+        );
+        assert_eq!(converted, expected);
+    }
+
+    /// The explicit invariant this design relies on: an action vertex's
+    /// `GFact` is assumed already closed (no leftover `Bound` var) by
+    /// construction ([`collect_action_atoms`] never extracts one from
+    /// inside a `Disj`/`GGuarded` scope). A violation must panic loudly,
+    /// not be swallowed by a fallible conversion.
+    #[test]
+    #[should_panic(expected = "left-over bound variable")]
+    fn action_vertex_fact_panics_on_a_leftover_bound_variable() {
+        let _guard = install_empty_signature();
+        let bound_gfact = GFact {
+            persistent: false,
+            name: "P".to_string(),
+            args: std::sync::Arc::from([GTerm::Var(BVar::Bound(0))]),
+            annotations: Vec::new(),
+        };
+        let _ = action_vertex_fact(&bound_gfact);
+    }
+
     fn action_fact_names(part: &GraphPart) -> Vec<(NodeId, String)> {
         let mut out: Vec<(NodeId, String)> = part
             .vertices
             .iter()
             .filter_map(|v| match v {
-                VertexKind::Action(nid, fact) => Some((*nid, fact.name.clone())),
+                VertexKind::Action(nid, fact) => {
+                    Some((*nid, crate::fact::fact_tag_name(&fact.tag)))
+                }
                 _ => None,
             })
             .collect();
@@ -663,7 +828,7 @@ mod tests {
             tgt: (nid("i", 2), PremIdx(0)),
         });
 
-        let part = extract_graph_part(&sys, &theory(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(EMPTY));
 
         // 2 rule instances + 1 reified EdgeRelation vertex.
         assert_eq!(part.vertices.len(), 3);
@@ -683,7 +848,7 @@ mod tests {
             tgt: (nid("i", 2), PremIdx(0)),
         });
 
-        let part = extract_graph_part(&sys, &theory(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(EMPTY));
 
         // 1 rule instance + 1 dummy + 1 reified EdgeRelation vertex.
         assert_eq!(part.vertices.len(), 3);
@@ -699,7 +864,7 @@ mod tests {
             .less_atoms
             .push(LessAtom::new(nid("i", 1), nid("i", 2), Reason::Formula));
 
-        let part = extract_graph_part(&sys, &theory(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(EMPTY));
 
         // 2 dummies + 1 reified LessRelation vertex.
         assert_eq!(part.vertices.len(), 3);
@@ -714,7 +879,7 @@ mod tests {
         let mut sys = System::default();
         sys.content_mut().last_atom = Some(nid("i", 7));
 
-        let part = extract_graph_part(&sys, &theory(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(EMPTY));
 
         // A Dummy for the target NodeId, PLUS a LastAtomRelation marker
         // reifying that it specifically is `last_atom` (see
@@ -755,8 +920,8 @@ mod tests {
         sys_b.add_node(nid("i", 2), proto_rule("A"));
         sys_b.content_mut().last_atom = Some(nid("i", 2));
 
-        let part_a = extract_graph_part(&sys_a, &theory(EMPTY));
-        let part_b = extract_graph_part(&sys_b, &theory(EMPTY));
+        let part_a = extract_graph_part(&sys_a, &color_table(EMPTY));
+        let part_b = extract_graph_part(&sys_b, &color_table(EMPTY));
 
         // Same vertex set (both nodes have rule instances, plus the
         // LastAtomRelation marker), but the marker's edge target differs.
@@ -777,7 +942,7 @@ mod tests {
             .formulas
             .push(Arc::new(g("P(x) @ #i & Q(y) @ #i")));
 
-        let part = extract_graph_part(&sys, &theory(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(EMPTY));
 
         assert_eq!(
             action_fact_names(&part),
@@ -814,7 +979,7 @@ mod tests {
             .solved_formulas
             .push(Arc::new(g("P(x) @ #i")));
 
-        let part = extract_graph_part(&sys, &theory(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(EMPTY));
 
         assert_eq!(
             action_fact_names(&part),
@@ -833,7 +998,7 @@ mod tests {
             .formulas
             .push(Arc::new(g("P(z) @ #j & Ex x #i. Q(x) @ #i")));
 
-        let part = extract_graph_part(&sys, &theory(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(EMPTY));
 
         assert_eq!(
             action_fact_names(&part),
@@ -882,9 +1047,16 @@ mod tests {
 
     #[test]
     fn to_graphviz_renders_a_well_formed_digraph_document() {
+        // A has a conclusion, B a premise -- matching the manual `Edge`
+        // below (A's ConcIdx(0) -> B's PremIdx(0)). The `EdgeRelation`
+        // sub-block's bounds now come entirely from what `color_table`'s
+        // rules/cache actually declare (no more artificial widening from
+        // hardcoded fixed-rule premise counts), so a theory template
+        // with FEWER ports than an edge references would make
+        // `edge_relation_color` panic as out-of-range.
         const RULES_A_AND_B: &str = "theory T begin\n\
-            rule A:\n  [] --> []\n\
-            rule B:\n  [] --> []\n\
+            rule A:\n  [] --> [ M() ]\n\
+            rule B:\n  [ M() ] --> []\n\
             end";
         let mut sys = System::default();
         sys.add_node(nid("i", 1), proto_rule("A"));
@@ -893,7 +1065,7 @@ mod tests {
             src: (nid("i", 1), ConcIdx(0)),
             tgt: (nid("i", 2), PremIdx(0)),
         });
-        let part = extract_graph_part(&sys, &theory(RULES_A_AND_B));
+        let part = extract_graph_part(&sys, &color_table(RULES_A_AND_B));
 
         let dot = to_graphviz(&part);
 
@@ -923,7 +1095,7 @@ mod tests {
         sys.content_mut()
             .formulas
             .push(Arc::new(g("P(x) @ #i & Q(y) @ #i")));
-        let part = extract_graph_part(&sys, &theory(RULE_WITH_P_AND_Q_ACTIONS));
+        let part = extract_graph_part(&sys, &color_table(RULE_WITH_P_AND_Q_ACTIONS));
 
         let dot = to_graphviz(&part);
 
@@ -939,7 +1111,7 @@ mod tests {
     fn dummy_vertex_renders_as_a_dashed_diamond() {
         let mut sys = System::default();
         sys.content_mut().last_atom = Some(nid("i", 7));
-        let part = extract_graph_part(&sys, &theory(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(EMPTY));
 
         let dot = to_graphviz(&part);
 
@@ -956,7 +1128,7 @@ mod tests {
         sys.content_mut()
             .less_atoms
             .push(LessAtom::new(nid("i", 1), nid("i", 2), Reason::Formula));
-        let part = extract_graph_part(&sys, &theory(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(EMPTY));
 
         let dot = to_graphviz(&part);
 

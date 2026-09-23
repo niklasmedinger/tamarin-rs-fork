@@ -66,7 +66,7 @@ use tamarin_term::term::f_app_list;
 
 use crate::canon_graph::VertexKind;
 use crate::fact::{FactTag, LNFact};
-use crate::rule::Rule;
+use crate::rule::{ConcIdx, PremIdx, Rule};
 
 /// A NUL-prefixed marker name for `tag`, distinct for every distinct
 /// `FactTag` (the variant name is baked into the string, so e.g. a
@@ -161,64 +161,15 @@ pub fn canonicalize_rule_seeded<I>(rule: &Rule<I>, labelling: &mut CanonLabellin
 // Action-formula vertices (`canon_graph::VertexKind::Action`)
 // =============================================================================
 //
-// An action-formula vertex's payload is a `GFact` -- the locally-nameless
-// formula IR's fact type -- not an `LNFact` like a rule instance's own
-// premises/actions/conclusions are. Bridging the two needs a
-// SIGNATURE-aware step (resolving a fact's argument terms' function
-// symbols to their real arity/privacy/AC-ness), which only the
-// currently-installed `elaborate` signature context can do; see
-// `action_vertex_fact`'s own doc comment for the exact precondition and
-// why this deliberately does NOT use the fallible `try_gfact_to_fact`.
-
-/// Converts an action-formula vertex's `GFact`
-/// (`canon_graph::VertexKind::Action`'s payload) to the `LNFact` it
-/// denotes, so it can be canonized exactly like a rule instance's own
-/// facts ([`canonicalize_fact_seeded`]).
-///
-/// Reuses the SAME bridge `system_import::parse_fact` already uses in
-/// production to reconstruct `LNFact`s from a captured `System`'s
-/// formula atoms: [`guarded::gfact_to_fact`] (purely structural, no
-/// signature needed) then [`crate::elaborate::fact_to_lnfact`] (resolves
-/// the fact's function-symbol names against the CURRENTLY INSTALLED
-/// signature -- see `elaborate::set_user_funs_for_theory`'s own doc
-/// comment). The caller must have that signature installed for the SAME
-/// theory `gfact` came from -- exactly the precondition
-/// `canon_graph::extract_graph_part`'s own `&Theory` parameter already
-/// implies for whoever built the `GraphPart` this vertex came from.
-///
-/// **Panics** if `gfact` still carries a `Bound` variable, or if the
-/// installed signature can't elaborate one of its terms. Both are
-/// treated as caller-contract violations, not recoverable runtime
-/// conditions: `canon_graph::collect_action_atoms` only ever extracts a
-/// `VertexKind::Action` from a GROUND, already-committed conjunct
-/// (never from inside a `Guarded::Disj` alternative or a `GGuarded`
-/// binder's body -- see that function's own doc comment), so every
-/// `GFact` this is actually called on is assumed already closed: a
-/// leftover `Bound` var surfacing here means that extraction discipline
-/// was violated somewhere upstream, which should fail loudly rather than
-/// silently mis-canonize. This is why [`guarded::gfact_to_fact`] is used
-/// deliberately instead of the fallible `guarded::try_gfact_to_fact`: a
-/// violation surfaces immediately, at the point of conversion, instead of
-/// limping forward as a `None`/`Result::Err` a caller could mishandle.
-pub fn action_vertex_fact(gfact: &GFact) -> LNFact {
-    let pfact = guarded::gfact_to_fact(gfact);
-    crate::elaborate::fact_to_lnfact(&pfact).unwrap_or_else(|e| {
-        panic!(
-            "action_vertex_fact: {e} -- {gfact:?} did not elaborate under the currently \
-             installed signature (wrong/missing set_user_funs_for_theory guard for this \
-             system's theory?)"
-        )
-    })
-}
-
-/// Canonizes an action-formula vertex's fact w.r.t. $\alphaeqac$,
-/// accumulating into `labelling` -- the [`canonicalize_fact_seeded`]
-/// counterpart for a `canon_graph::VertexKind::Action` vertex. See
-/// [`action_vertex_fact`] for the conversion this composes and its
-/// panic precondition.
-pub fn canonicalize_action_fact_seeded(gfact: &GFact, labelling: &mut CanonLabelling) -> LNTerm {
-    canonicalize_fact_seeded(&action_vertex_fact(gfact), labelling)
-}
+// `VertexKind::Action`'s payload is `LNFact` (changed 2026-09-23, was
+// `GFact`): the `GFact -> LNFact` signature-aware bridge a formula-derived
+// action needs now happens once, at extraction time, in
+// `canon_graph::action_vertex_fact` -- called from
+// `canon_graph::extract_graph_part` itself, so a `VertexKind::Action`
+// reaching this module is already fully resolved and canonizes through
+// the exact same path a rule instance's own facts do
+// ([`canonicalize_fact_seeded`]), with no separate bridging step or
+// dedicated combinator needed here at all.
 
 // =============================================================================
 // Graph parts (Stage D/G assembly: a whole `GraphPart`, in canonical vertex
@@ -236,6 +187,19 @@ pub fn canonicalize_action_fact_seeded(gfact: &GFact, labelling: &mut CanonLabel
 // (structural ones via a marker, exactly like `fact_tag_marker` marks a
 // fact's tag) and the edge set (as pairs of canonical-position markers) into
 // the same term.
+//
+// REVISED 2026-09-23, per direct user instruction: every intermediate term
+// this section builds is now wrapped in a TYPE-TAGGED NoEq function
+// (`graph_tag`/`graph_marker`) instead of a raw, untagged `f_app_list` --
+// `VerticesTerm(...)`/`EdgesTerm(...)`/`EdgeTerm(src, tgt)`/`GraphPartTerm(vertices, edges)`
+// at the `graph_part_to_term` level, `RuleInstanceVertexTerm(nid, content)`/
+// `ActionVertexTerm(nid, content)`/`DummyVertexTerm(nid)` at the per-vertex
+// level. Purely a clarity/collision-avoidance change, not a new gap fix:
+// every one of these terms was already injective before this revision (the
+// content/position embedded inside each `List` already made it
+// well-defined), but an untagged `List(x, y)` gave a reader/debugger
+// inspecting the raw term no way to tell WHICH kind of pairing they were
+// looking at without also inspecting its position in the tree.
 
 /// A NUL,NUL-prefixed marker name for `suffix`, distinct from both a real
 /// function symbol (no valid Tamarin identifier contains a NUL byte) and
@@ -248,34 +212,86 @@ fn graph_marker_name(suffix: &str) -> Vec<u8> {
     name
 }
 
+/// An `args.len()`-ary NoEq function named `tag` (via [`graph_marker_name`],
+/// so it's collision-proof against both real theory-declared function
+/// symbols and [`fact_tag_marker`]'s own marker family — see that
+/// function's own doc comment). Used to TYPE-tag `graph_part_to_term`'s own
+/// intermediate terms (REVISED 2026-09-23, per direct user instruction:
+/// was built from raw, untagged `f_app_list` calls — e.g. a graph part's
+/// outer `(vertices, edges)` pairing was structurally indistinguishable
+/// from any other 2-element `List` elsewhere in the term, and a
+/// `RuleInstance`/`Action`/`Dummy` vertex's own `(NodeId, content)` pairing
+/// all shared that same untagged shape too), so two structurally-similar
+/// but conceptually-different sub-terms can never collide, and a debugger
+/// inspecting the raw term sees which kind of thing it's looking at
+/// directly in the function symbol's own name rather than having to infer
+/// it from shape/position alone.
+fn graph_tag(tag: &str, args: Vec<LNTerm>) -> LNTerm {
+    let sym = NoEqSym::new(
+        graph_marker_name(tag),
+        args.len(),
+        Privacy::Public,
+        Constructability::Constructor,
+    );
+    LNTerm::App(FunSym::NoEq(sym), args.into())
+}
+
 /// The 0-ary marker term for `suffix` (see [`graph_marker_name`]) — a
 /// function symbol, never a literal, so it is NEVER renamed by
 /// `CAN_alphaeqac` (unlike e.g. a public name, which — being a literal —
 /// the canonizer would try to assign a fresh canonical name to, making it
-/// useless as a fixed marker of vertex/edge IDENTITY).
+/// useless as a fixed marker of vertex/edge IDENTITY). A 0-ary special
+/// case of [`graph_tag`].
 fn graph_marker(suffix: &str) -> LNTerm {
-    let sym = NoEqSym::new(
-        graph_marker_name(suffix),
-        0,
-        Privacy::Public,
-        Constructability::Constructor,
-    );
-    LNTerm::App(FunSym::NoEq(sym), Arc::from([]))
+    graph_tag(suffix, Vec::new())
 }
 
-/// Lifts one graph vertex to a term: a `RuleInstance`/`Action` vertex
-/// lifts its own content (via [`rule_to_term`], or [`fact_to_term`] after
-/// bridging through [`action_vertex_fact`]); a structural vertex
-/// (`Dummy`/`EdgeRelation`/`LessRelation`/`AtTimepointRelation`/
+/// Lifts one graph vertex to a term: a `RuleInstance`/`Action`/`Dummy`
+/// vertex lifts as a type-tagged `RuleInstanceVertexTerm(node_id_term(nid), content)` /
+/// `ActionVertexTerm(node_id_term(nid), content)` / `DummyVertexTerm(node_id_term(nid))`
+/// -- ITS OWN NodeId FIRST, as a bare variable literal, directly before the
+/// vertex's own content ([`rule_to_term`]; [`fact_to_term`], `VertexKind::Action`'s
+/// payload already being a plain `LNFact`; or nothing at all for `Dummy`,
+/// whose tag alone already identifies it). A structural,
+/// NodeId-free vertex (`EdgeRelation`/`LessRelation`/`AtTimepointRelation`/
 /// `LastAtomRelation`) lifts to a marker identifying its KIND (and, for
 /// `EdgeRelation`, its port indices — the same information its
 /// `ColorTable` color already encodes, here reified as a term instead of
 /// a side-channel integer).
+///
+/// **Embedding the NodeId is not cosmetic — it closes a real theta-coverage
+/// gap.** Before this, a vertex's OWN `NodeId` was discarded entirely
+/// (`RuleInstance(_, ru) => rule_to_term(ru)`, `_` dropping the id): a
+/// `NodeId` never appeared as a literal ANYWHERE in the graph-part term,
+/// so `theta` (built purely from literals the Canonizer discovers while
+/// walking that term) never contained an entry for any `NodeId`, ever --
+/// regardless of how well-connected that node's vertex was. That was
+/// invisible as long as every formula only ever referenced a `NodeId`
+/// while BOUND (bound variables need no theta lookup at all — see
+/// `subst_via_theta_guarded`'s own doc comment), which held for every
+/// fixture this pipeline had been tested against. It breaks the moment a
+/// formula references a `NodeId` FREE: `guarded::to_induction_hypothesis`
+/// (the `ginduct`/`Induction` proof method) does exactly that, injecting
+/// a free top-level `Last(v)` disjunct per Node-sorted quantified
+/// variable — `canonicalize_guarded`'s `lookup_theta` then panics on the
+/// very first such formula it meets, since `theta` never had anywhere to
+/// put that entry. Embedding each vertex's `NodeId` as a literal, in
+/// canonical vertex order and directly before that vertex's own content,
+/// makes the Canonizer discover and canonically rename it exactly like
+/// any other literal (to `canonical_var(LSort::Node, _)`'s reserved
+/// `"tv"` family, previously dead code for want of a caller) — so
+/// `theta` becomes genuinely exhaustive over `NodeId`s, not just over
+/// vertex content, closing the gap at its source rather than papering
+/// over one formula at a time.
 fn vertex_to_term(v: &VertexKind) -> LNTerm {
     match v {
-        VertexKind::RuleInstance(_, ru) => rule_to_term(ru),
-        VertexKind::Action(_, gfact) => fact_to_term(&action_vertex_fact(gfact)),
-        VertexKind::Dummy(_) => graph_marker("Dummy"),
+        VertexKind::RuleInstance(nid, ru) => {
+            graph_tag("RuleInstanceVertexTerm", vec![node_id_term(*nid), rule_to_term(ru)])
+        }
+        VertexKind::Action(nid, fact) => {
+            graph_tag("ActionVertexTerm", vec![node_id_term(*nid), fact_to_term(fact)])
+        }
+        VertexKind::Dummy(nid) => graph_tag("DummyVertexTerm", vec![node_id_term(*nid)]),
         VertexKind::EdgeRelation(conc, prem) => {
             graph_marker(&format!("EdgeRelation:{}:{}", conc.0, prem.0))
         }
@@ -283,6 +299,14 @@ fn vertex_to_term(v: &VertexKind) -> LNTerm {
         VertexKind::AtTimepointRelation => graph_marker("AtTimepointRelation"),
         VertexKind::LastAtomRelation => graph_marker("LastAtomRelation"),
     }
+}
+
+/// Lifts a `NodeId` (an `LVar` of `LSort::Node`) to a bare variable
+/// literal term, so it participates in Canonizer discovery exactly like
+/// any other literal — see [`vertex_to_term`]'s own doc comment for why
+/// this exists.
+fn node_id_term(nid: crate::constraint::constraints::NodeId) -> LNTerm {
+    tamarin_term::vterm::var_term(nid)
 }
 
 /// A marker term naming canonical vertex position `i` — used to encode an
@@ -299,23 +323,32 @@ fn index_marker(i: usize) -> LNTerm {
 /// canonical-position edge set (`bliss_proc::canonical_edges`'s output)
 /// to ONE term — the constraint-system-wide generalization of
 /// [`rule_to_term`]/[`fact_to_term`]: every vertex becomes its own
-/// sub-term ([`vertex_to_term`]), nested inside one `List` in vertex
-/// order, paired with a second `List` of edges (each edge itself a pair
-/// of [`index_marker`]s). `List` is not AC, so both orderings are
-/// significant: the vertex order is what makes two isomorphic-but-
-/// differently-numbered systems line up position-for-position once each
-/// is in its OWN bliss canonical order; `edges` is expected pre-sorted
-/// (a `BTreeSet`, as `canonical_edges` returns) so the edge list doesn't
-/// depend on `GraphPart::edges`'s own creation order.
+/// sub-term ([`vertex_to_term`]), nested inside one type-tagged
+/// `VerticesTerm(...)` in vertex order, paired with a second type-tagged
+/// `EdgesTerm(...)` of edges (each edge itself a type-tagged
+/// `EdgeTerm(src, tgt)` of [`index_marker`]s), the two combined under an
+/// outer `GraphPartTerm(vertices, edges)` (all via [`graph_tag`] --
+/// REVISED 2026-09-23 from raw, untagged `f_app_list`/`List` applications,
+/// see this section's own module doc comment for why). None of these
+/// wrapper functions are AC, so every ordering here stays significant: the
+/// vertex order is what makes two isomorphic-but-differently-numbered
+/// systems line up position-for-position once each is in its OWN bliss
+/// canonical order; `edges` is expected pre-sorted (a `BTreeSet`, as
+/// `canonical_edges` returns) so the edge list doesn't depend on
+/// `GraphPart::edges`'s own creation order.
 pub fn graph_part_to_term(ordered: &[&VertexKind], edges: &BTreeSet<(usize, usize)>) -> LNTerm {
-    let vertices_term = f_app_list(ordered.iter().map(|v| vertex_to_term(v)).collect());
-    let edges_term = f_app_list(
+    let vertices_term = graph_tag(
+        "VerticesTerm",
+        ordered.iter().map(|v| vertex_to_term(v)).collect(),
+    );
+    let edges_term = graph_tag(
+        "EdgesTerm",
         edges
             .iter()
-            .map(|&(src, tgt)| f_app_list(vec![index_marker(src), index_marker(tgt)]))
+            .map(|&(src, tgt)| graph_tag("EdgeTerm", vec![index_marker(src), index_marker(tgt)]))
             .collect(),
     );
-    f_app_list(vec![vertices_term, edges_term])
+    graph_tag("GraphPartTerm", vec![vertices_term, edges_term])
 }
 
 /// Canonizes a graph part w.r.t. $\alphaeqac$ (see
@@ -1110,8 +1143,8 @@ fn hash_sort_hint(h: &mut FingerprintHasher, s: p::SortHint) {
 // through and unit-tested directly (`tests::eq_disj_alternative_*`).
 
 use crate::bliss_proc::BlissError;
-use crate::constraint::system::{Side, SourceKind, System};
-use crate::theory::Theory;
+use crate::constraint::constraints::Goal;
+use crate::constraint::system::{GoalStatus, Side, SourceKind, System};
 use crate::tools::equation_store::{EqDisj, EquationStore, LNSubst, LNSubstVFresh};
 use crate::tools::subterm_store::{SubtermConstraint, SubtermStore};
 use tamarin_term::alpha_eq_ac::apply_literal_renaming;
@@ -1131,21 +1164,78 @@ pub struct CanonicalSystem {
     /// everything [`graph_part_to_term`] covers.
     pub graph_part: LNTerm,
     /// `formulas`: canonicalized via the graph part's accumulated
-    /// labelling, deduplicated, sorted via `cmp_guarded`. KEPT SEPARATE
+    /// labelling, sorted via `cmp_guarded` -- **NOT deduplicated**
+    /// (REVISED 2026-09-23, per direct user instruction: `stores_contains`
+    /// only prevents RAW-syntactic duplicates at insertion, not
+    /// alpha-equivalent ones, so two solver-tracked-as-distinct formulas
+    /// could canonicalize identically; see [`sort_guarded`]'s own doc
+    /// comment for the full reasoning, which mirrors `eq_store.conj`'s
+    /// pre-existing multiset-preservation policy). KEPT SEPARATE
     /// from `solved_formulas` -- membership in one store vs. the other is
     /// live proof-search state (e.g. `ProofMethod::Induction`'s
     /// applicability, `isInitialSystem`), not pure memoization, so
     /// merging them would conflate two non-interchangeable systems.
     pub formulas: Vec<Guarded>,
-    /// `solved_formulas`, canonicalized the same way as `formulas`, as
-    /// its own independent sorted set.
+    /// `solved_formulas`, canonicalized the same way as `formulas`
+    /// (sorted, not deduplicated), as its own independent list.
     pub solved_formulas: Vec<Guarded>,
     /// `lemmas`, canonicalized the same way.
     pub lemmas: Vec<Guarded>,
     pub eq_store: CanonicalEqStore,
     pub subterm_store: CanonicalSubtermStore,
+    /// `sys.goals`, minus `Goal::Action` (already a real `VertexKind::Action`
+    /// vertex in `graph_part` -- see `canon_graph::extract_graph_part`'s
+    /// own doc comment) and `Goal::Split` (dropped -- it only NAMES an
+    /// `EqDisj` already present in `eq_store.conj`; nothing else ever
+    /// reads its raw id, the exact same reasoning that already dropped
+    /// `EqDisj::split_id` itself). See [`canonicalize_goals`] for the
+    /// remaining four variants' canonicalization and why `GoalStatus::solved`
+    /// is kept (content-relevant: gates whether `candidate_methods` offers
+    /// the goal again) while `::looping`/`::nr` are not (pure
+    /// heuristic-ranking / path-dependent bookkeeping). Sorted, NOT
+    /// deduplicated -- see [`canonicalize_goals`]'s own doc comment.
+    pub goals: Vec<CanonicalGoal>,
     pub source_kind: Option<SourceKind>,
     pub side: Option<Side>,
+}
+
+/// Canonicalized form of one non-`Action`/non-`Split` [`Goal`], paired
+/// with whether it's currently solved -- see [`CanonicalSystem::goals`]'s
+/// own doc comment.
+///
+/// `PartialEq` only, no `Eq`/`Ord`: `Disj` embeds `Vec<Guarded>`, and
+/// `Guarded` itself has no `Ord`/`Eq` -- same reason [`CanonicalSystem`]
+/// itself only derives `PartialEq`. [`cmp_canonical_goal`] is the total
+/// order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanonicalGoal {
+    pub kind: CanonicalGoalKind,
+    pub solved: bool,
+}
+
+/// The canonicalized payload of one [`CanonicalGoal`] -- see
+/// [`canonicalize_goals`] for exactly how each variant is derived from
+/// the matching [`Goal`] variant.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanonicalGoalKind {
+    /// `Goal::Chain(NodeConc, NodePrem)`: both endpoints' `NodeId`s
+    /// canonicalized via the graph part's `theta` -- no new literal, the
+    /// port indices need no renaming.
+    Chain(LNLit, ConcIdx, LNLit, PremIdx),
+    /// `Goal::Premise(NodePrem, LNFact)`: the `NodeId` canonicalized the
+    /// same way as `Chain`'s endpoints, plus the fact itself
+    /// canonicalized via `theta` (its own literals should already be
+    /// covered -- `NodePrem` names an EXISTING rule instance's own
+    /// premise slot, whose fact the graph part already discovered).
+    Premise(LNLit, PremIdx, LNTerm),
+    /// `Goal::Disj(Disj<Guarded>)`: each alternative canonicalized via
+    /// `canonicalize_guarded` against `theta`, then sorted -- NOT
+    /// deduplicated, same treatment as `formulas`/`solved_formulas`/`lemmas`.
+    Disj(Vec<Guarded>),
+    /// `Goal::Subterm((LNTerm, LNTerm))`: both terms canonicalized via
+    /// `apply_literal_renaming` -- same treatment as `subterm_store`'s
+    /// pairs.
+    Subterm(LNTerm, LNTerm),
 }
 
 /// All four fields are `Ord` on their own, so this derives it directly
@@ -1156,9 +1246,10 @@ pub struct CanonicalEqStore {
     /// `eq_store.subst`, canonical-key sorted.
     pub subst: Vec<(LNLit, LNTerm)>,
     /// `eq_store.conj` -- `split_id` DROPPED: its only consumer is
-    /// `Goal::Split`, and `goals` is excluded from the canonical form
-    /// entirely (fully computable from `nodes`/`edges`/`formulas`), so
-    /// nothing ever reads a `split_id` value. Each alternative is stored
+    /// `Goal::Split`, which `CanonicalSystem::goals` drops too (it only
+    /// NAMES an `EqDisj` already present here; nothing else ever reads a
+    /// `split_id` value -- see `CanonicalSystem::goals`'s own doc
+    /// comment). Each alternative is stored
     /// fully canonicalized, not as a raw `LNSubstVFresh`: domain keys
     /// renamed via the shared `theta`, each range term canonicalized via
     /// a per-alternative-forked `CanonLabelling` pass (see
@@ -1201,8 +1292,78 @@ pub fn cmp_canonical_system(a: &CanonicalSystem, b: &CanonicalSystem) -> std::cm
         .then_with(|| cmp_guarded_slice(&a.lemmas, &b.lemmas))
         .then_with(|| a.eq_store.cmp(&b.eq_store))
         .then_with(|| a.subterm_store.cmp(&b.subterm_store))
+        .then_with(|| cmp_canonical_goal_slice(&a.goals, &b.goals))
         .then_with(|| a.source_kind.cmp(&b.source_kind))
         .then_with(|| a.side.cmp(&b.side))
+}
+
+/// Lexicographic comparison of two already-canonical [`CanonicalGoal`]
+/// slices via [`cmp_canonical_goal`] (no `Ord for CanonicalGoal` -- see
+/// its own doc comment), tie-broken by length -- same shape as
+/// [`cmp_guarded_slice`], just for goals.
+fn cmp_canonical_goal_slice(a: &[CanonicalGoal], b: &[CanonicalGoal]) -> std::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        let c = cmp_canonical_goal(x, y);
+        if c != std::cmp::Ordering::Equal {
+            return c;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Total order over [`CanonicalGoal`] -- constructor rank
+/// (`Chain < Premise < Disj < Subterm`, this enum's declaration order,
+/// mirroring [`crate::constraint::constraints::cmp_goal`]'s own style)
+/// then payload, `solved` last (so two goals with the same canonicalized
+/// content but different solved-status sort adjacently, not scattered).
+fn cmp_canonical_goal(a: &CanonicalGoal, b: &CanonicalGoal) -> std::cmp::Ordering {
+    cmp_canonical_goal_kind(&a.kind, &b.kind).then_with(|| a.solved.cmp(&b.solved))
+}
+
+fn cmp_canonical_goal_kind(a: &CanonicalGoalKind, b: &CanonicalGoalKind) -> std::cmp::Ordering {
+    fn rank(k: &CanonicalGoalKind) -> u8 {
+        match k {
+            CanonicalGoalKind::Chain(..) => 0,
+            CanonicalGoalKind::Premise(..) => 1,
+            CanonicalGoalKind::Disj(_) => 2,
+            CanonicalGoalKind::Subterm(..) => 3,
+        }
+    }
+    let (ra, rb) = (rank(a), rank(b));
+    if ra != rb {
+        return ra.cmp(&rb);
+    }
+    // Rank equality above guarantees the same variant, so each `let …
+    // else` binding of `b` is infallible.
+    match a {
+        CanonicalGoalKind::Chain(cl1, ci1, pl1, pi1) => {
+            let CanonicalGoalKind::Chain(cl2, ci2, pl2, pi2) = b else {
+                unreachable!("rank matched Chain")
+            };
+            cl1.cmp(cl2)
+                .then_with(|| ci1.cmp(ci2))
+                .then_with(|| pl1.cmp(pl2))
+                .then_with(|| pi1.cmp(pi2))
+        }
+        CanonicalGoalKind::Premise(pl1, pi1, f1) => {
+            let CanonicalGoalKind::Premise(pl2, pi2, f2) = b else {
+                unreachable!("rank matched Premise")
+            };
+            pl1.cmp(pl2).then_with(|| pi1.cmp(pi2)).then_with(|| f1.cmp(f2))
+        }
+        CanonicalGoalKind::Disj(d1) => {
+            let CanonicalGoalKind::Disj(d2) = b else {
+                unreachable!("rank matched Disj")
+            };
+            cmp_guarded_slice(d1, d2)
+        }
+        CanonicalGoalKind::Subterm(a1, b1) => {
+            let CanonicalGoalKind::Subterm(a2, b2) = b else {
+                unreachable!("rank matched Subterm")
+            };
+            a1.cmp(a2).then_with(|| b1.cmp(b2))
+        }
+    }
 }
 
 /// Lexicographic comparison of two already-canonical `Guarded` slices via
@@ -1219,17 +1380,26 @@ fn cmp_guarded_slice(a: &[Guarded], b: &[Guarded]) -> std::cmp::Ordering {
     a.len().cmp(&b.len())
 }
 
-/// Sorts `v` via `cmp_guarded` (no `Ord for Guarded`, see above) and drops
-/// adjacent duplicates under that same order -- mirrors the existing
-/// `sort_dedup_guarded` local closure in
-/// `constraint/solver/rename_precise.rs` (its own comment: HS's `S.Set
-/// LNGuarded` rebuild sorts AND collision-dedups after every rename), just
-/// generalized from `Vec<Arc<Guarded>>` to owned `Vec<Guarded>` since a
-/// freshly-canonicalized formula has no reason to share an `Arc` with
-/// anything.
-fn sort_dedup_guarded(mut v: Vec<Guarded>) -> Vec<Guarded> {
+/// Sorts `v` via `cmp_guarded` (no `Ord for Guarded`, see above) into a
+/// content-driven, cross-system-stable order -- **deliberately does NOT
+/// dedup**, unlike the similarly-named `sort_dedup_guarded` local closure
+/// in `constraint/solver/rename_precise.rs` (that one mirrors HS's `S.Set
+/// LNGuarded` rebuild, which sorts AND collision-dedups after every
+/// rename -- a real solver-internal behavior, not this function's
+/// concern). REVISED 2026-09-23, per direct user instruction: every
+/// `CanonicalSystem` field built from a `System` `Vec` (not an
+/// already-deduplicated `Set`-typed field, e.g. `neg_subterms`) must
+/// preserve its exact multiplicity, not just its distinct content --
+/// exactly the same principle `eq_store.conj`'s multiset preservation was
+/// already built on (see `CanonicalEqStore::conj`'s own doc comment: a
+/// solver-level dedup can silently drop a real split case, confirmed on a
+/// real regression). `formulas`/`solved_formulas`/`lemmas` (`Vec<Arc<Guarded>>`
+/// in `System`) and a `Goal::Disj`'s own alternatives (`Vec<Guarded>`) are
+/// exactly this shape -- two syntactically-identical entries are not
+/// assumed to be redundant, since nothing here has proven the solver never
+/// produces a real duplicate.
+fn sort_guarded(mut v: Vec<Guarded>) -> Vec<Guarded> {
     v.sort_by(cmp_guarded);
-    v.dedup_by(|a, b| cmp_guarded(a, b) == std::cmp::Ordering::Equal);
     v
 }
 
@@ -1262,13 +1432,34 @@ pub fn canonicalize_graph_part_seeded(
 /// (`graph_part_to_dimacs`/`run_bliss`); everything after that is pure.
 pub fn canonicalize_constraint_system(
     sys: &System,
-    theory: &Theory,
+    colors: &crate::canon_color::ColorTable,
 ) -> Result<CanonicalSystem, BlissError> {
-    // Stage A+B: vertex/edge structure plus the theory's vertex coloring,
-    // in one call -- see `canon_graph`'s own module docs for why
-    // `GraphPart` owns its `ColorTable` rather than threading it
-    // separately.
-    let part = crate::canon_graph::extract_graph_part(sys, theory);
+    // Stage A+B: vertex/edge structure plus the caller-supplied vertex
+    // coloring, in one call -- see `canon_graph`'s own module docs for
+    // why `GraphPart` owns its `ColorTable` rather than threading it
+    // separately. No `&Theory` needed here at all: `colors` is unique per
+    // theory and the caller already has one on hand (a `ProofContext`
+    // carries its own `color_table`; see `canon_color.rs`'s own "why this
+    // table takes..." doc section).
+    let part = crate::canon_graph::extract_graph_part(sys, colors);
+
+    // An empty graph part (no rule-instance/action/dummy vertices at all
+    // -- e.g. the root of a proof, before Simplify/goal-solving
+    // introduces any rule instances, or induction's `empty_trace` base
+    // case) is TRIVIALLY canonical: there is exactly one empty vertex
+    // sequence and one empty edge set, so there is nothing for an
+    // automorphism search to resolve. Bliss itself refuses a 0-vertex
+    // graph (`graph_part_to_dimacs` returns `BlissError::EmptyGraph`
+    // rather than handing bliss a DIMACS header it would choke on), so
+    // skip Stage C/F entirely here rather than hard-failing a case that
+    // has a perfectly well-defined canonical form and plenty of other
+    // canonicalizable content (formulas, eq_store, ...) still to process.
+    if part.vertices.is_empty() {
+        let (graph_term, labelling) = canonicalize_graph_part_seeded(&[], &BTreeSet::new());
+        return Ok(canonicalize_system_content_seeded(
+            sys, &labelling, graph_term,
+        ));
+    }
 
     // Stage C: bliss's own canonical labeling plus a GENERATING set for
     // the graph's automorphism group (not necessarily the full group --
@@ -1336,7 +1527,11 @@ pub fn canonicalize_constraint_system(
 /// [`canonicalize_eq_disj_alternative`]'s own doc comment for why),
 /// never `labelling` itself -- so `labelling` truly never changes once
 /// this function is called.
-fn canonicalize_system_content_seeded(
+///
+/// `pub(crate)` (not private) so [`canonicalize_system_content_seeded_profiled`]'s
+/// own doc comment -- and any other crate-internal profiling -- can
+/// reference it directly; still not part of the crate's public API.
+pub(crate) fn canonicalize_system_content_seeded(
     sys: &System,
     labelling: &CanonLabelling,
     graph_part: LNTerm,
@@ -1350,19 +1545,19 @@ fn canonicalize_system_content_seeded(
     // `solved_formulas` membership is live proof-search state, not pure
     // memoization: `ProofMethod::Induction`'s applicability and
     // `isInitialSystem` both key off it.
-    let formulas = sort_dedup_guarded(
+    let formulas = sort_guarded(
         sys.formulas
             .iter()
             .map(|f| canonicalize_guarded(f, labelling.theta()))
             .collect(),
     );
-    let solved_formulas = sort_dedup_guarded(
+    let solved_formulas = sort_guarded(
         sys.solved_formulas
             .iter()
             .map(|f| canonicalize_guarded(f, labelling.theta()))
             .collect(),
     );
-    let lemmas = sort_dedup_guarded(
+    let lemmas = sort_guarded(
         sys.lemmas
             .iter()
             .map(|f| canonicalize_guarded(f, labelling.theta()))
@@ -1371,6 +1566,7 @@ fn canonicalize_system_content_seeded(
 
     let eq_store = canonicalize_eq_store(&sys.eq_store, labelling);
     let subterm_store = canonicalize_subterm_store(&sys.subterm_store, labelling.theta());
+    let goals = canonicalize_goals(&sys.goals, labelling.theta());
 
     CanonicalSystem {
         graph_part,
@@ -1379,9 +1575,166 @@ fn canonicalize_system_content_seeded(
         lemmas,
         eq_store,
         subterm_store,
+        goals,
         source_kind: sys.source_kind,
         side: sys.side,
     }
+}
+
+/// Per-field wall-time and size breakdown of Stage G
+/// ([`canonicalize_system_content_seeded_profiled`]) -- everything past
+/// the graph part: formulas/solved_formulas/lemmas, `eq_store.subst` vs
+/// `eq_store.conj` (split out separately since `conj` alone runs
+/// [`canonicalize_eq_disj_alternative`]'s per-alternative
+/// `CanonLabelling` fork-and-discard machinery, the one part of Stage G
+/// with a plausibly different cost profile from a flat per-item map),
+/// and `subterm_store`.
+///
+/// Exists because `canonicalize_system_content_seeded` itself isn't
+/// public (this crate's canonicalization internals are not meant to be
+/// a stable external API), so a caller outside `canon.rs` -- e.g.
+/// `explore_canonical_matches.rs`'s `PROFILE_CANON=1` -- has no other way
+/// to see where Stage G's time goes; `canonicalize_constraint_system`'s
+/// own timing (measured externally) only accounts for it by
+/// SUBTRACTION, as one opaque lump.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ContentStageTimes {
+    pub formulas: std::time::Duration,
+    pub solved_formulas: std::time::Duration,
+    pub lemmas: std::time::Duration,
+    pub eq_store_subst: std::time::Duration,
+    pub eq_store_conj: std::time::Duration,
+    pub subterm_store: std::time::Duration,
+    pub goals: std::time::Duration,
+    pub num_formulas: usize,
+    pub num_solved_formulas: usize,
+    pub num_lemmas: usize,
+    pub num_eq_store_subst: usize,
+    /// Number of `EqDisj` entries in `eq_store.conj` -- NOT the number of
+    /// alternatives (see `num_eq_store_conj_alternatives`): one `EqDisj`
+    /// can hold many alternatives (`sigma_i1 ∨ … ∨ sigma_ik_i`), each of
+    /// which pays its own `canonicalize_eq_disj_alternative` fork cost.
+    pub num_eq_store_conj: usize,
+    /// Total alternatives summed across every `EqDisj` in `eq_store.conj`
+    /// -- the real multiplier on `canonicalize_eq_disj_alternative`
+    /// calls (and so on `eq_store_conj`'s own time), not
+    /// `num_eq_store_conj` alone.
+    pub num_eq_store_conj_alternatives: usize,
+    pub num_subterms: usize,
+    pub num_solved_subterms: usize,
+    pub num_neg_subterms: usize,
+    /// `sys.goals.len()` BEFORE dropping `Action`/`Split` -- the raw
+    /// count, not `CanonicalSystem::goals.len()` (which excludes both).
+    pub num_goals: usize,
+}
+
+/// The [`canonicalize_system_content_seeded`] this function's own doc
+/// comment describes, reimplemented here (same private helpers this
+/// module already has, just called directly instead of through the one
+/// monolithic function) with a [`std::time::Instant`] wrapped around each
+/// stage and size counters recorded alongside -- see
+/// [`ContentStageTimes`] for exactly what each field means.
+///
+/// `canonicalize_constraint_system`'s own hot path keeps calling the
+/// plain, non-instrumented `canonicalize_system_content_seeded` --
+/// nothing about its behavior or performance changes. This is a
+/// deliberately separate, `pub` sibling for profiling callers only.
+pub fn canonicalize_system_content_seeded_profiled(
+    sys: &System,
+    labelling: &CanonLabelling,
+    graph_part: LNTerm,
+) -> (CanonicalSystem, ContentStageTimes) {
+    let mut stats = ContentStageTimes {
+        num_formulas: sys.formulas.len(),
+        num_solved_formulas: sys.solved_formulas.len(),
+        num_lemmas: sys.lemmas.len(),
+        num_eq_store_subst: sys.eq_store.subst.len(),
+        num_eq_store_conj: sys.eq_store.conj.len(),
+        num_eq_store_conj_alternatives: sys.eq_store.conj.iter().map(|d| d.substs.len()).sum(),
+        num_subterms: sys.subterm_store.subterms.len(),
+        num_solved_subterms: sys.subterm_store.solved_subterms.len(),
+        num_neg_subterms: sys.subterm_store.neg_subterms.len(),
+        num_goals: sys.goals.len(),
+        ..Default::default()
+    };
+
+    let t = std::time::Instant::now();
+    let formulas = sort_guarded(
+        sys.formulas
+            .iter()
+            .map(|f| canonicalize_guarded(f, labelling.theta()))
+            .collect(),
+    );
+    stats.formulas = t.elapsed();
+
+    let t = std::time::Instant::now();
+    let solved_formulas = sort_guarded(
+        sys.solved_formulas
+            .iter()
+            .map(|f| canonicalize_guarded(f, labelling.theta()))
+            .collect(),
+    );
+    stats.solved_formulas = t.elapsed();
+
+    let t = std::time::Instant::now();
+    let lemmas = sort_guarded(
+        sys.lemmas
+            .iter()
+            .map(|f| canonicalize_guarded(f, labelling.theta()))
+            .collect(),
+    );
+    stats.lemmas = t.elapsed();
+
+    // `eq_store.subst` and `eq_store.conj`, timed SEPARATELY -- mirrors
+    // `canonicalize_eq_store`'s own body exactly, just split so the
+    // per-alternative fork cost in `conj` doesn't hide inside a single
+    // `eq_store` bucket.
+    let t = std::time::Instant::now();
+    let mut subst: Vec<(LNLit, LNTerm)> = sys
+        .eq_store
+        .subst
+        .iter()
+        .map(|(v, term)| {
+            let canon_key = *lookup_theta(labelling.theta(), &Lit::Var(*v));
+            let canon_term = apply_literal_renaming(term, labelling.theta());
+            (canon_key, canon_term)
+        })
+        .collect();
+    subst.sort();
+    stats.eq_store_subst = t.elapsed();
+
+    let t = std::time::Instant::now();
+    let mut conj: Vec<Vec<Vec<(LNLit, LNTerm)>>> = sys
+        .eq_store
+        .conj
+        .iter()
+        .map(|disj| canonicalize_eq_disj(disj, labelling))
+        .collect();
+    conj.sort();
+    stats.eq_store_conj = t.elapsed();
+
+    let eq_store = CanonicalEqStore { subst, conj };
+
+    let t = std::time::Instant::now();
+    let subterm_store = canonicalize_subterm_store(&sys.subterm_store, labelling.theta());
+    stats.subterm_store = t.elapsed();
+
+    let t = std::time::Instant::now();
+    let goals = canonicalize_goals(&sys.goals, labelling.theta());
+    stats.goals = t.elapsed();
+
+    let canon = CanonicalSystem {
+        graph_part,
+        formulas,
+        solved_formulas,
+        lemmas,
+        eq_store,
+        subterm_store,
+        goals,
+        source_kind: sys.source_kind,
+        side: sys.side,
+    };
+    (canon, stats)
 }
 
 /// Canonicalizes `store` -- `eq_store.subst` and `eq_store.conj`.
@@ -1634,6 +1987,70 @@ fn canonicalize_subterm_store(
         contradictory: store.contradictory,
         neg_subterms,
     }
+}
+
+/// Canonicalizes `sys.goals` into [`CanonicalGoal`]s -- read-only against
+/// `theta`, same guardedness-style assumption as every other Stage G
+/// field (a missing entry panics via [`lookup_theta`]/
+/// [`apply_literal_renaming`], not a silent fallback).
+///
+/// `Goal::Action` is skipped entirely: it's already a real
+/// `VertexKind::Action` vertex in the graph part (`canon_graph::extract_graph_part`
+/// adds one per `Goal::Action`, deduped against formula-derived actions
+/// -- see that function's own doc comment), so canonicalizing it again
+/// here would double-count the exact same content under a different
+/// field. `Goal::Split` is skipped too: it only NAMES an `EqDisj` already
+/// in `eq_store.conj` (see [`CanonicalSystem::goals`]'s own doc comment).
+///
+/// The remaining four variants keep [`GoalStatus::solved`] (content-relevant
+/// -- see [`CanonicalGoal`]'s own doc comment) but drop `::looping`/`::nr`
+/// (pure heuristic-ranking / path-dependent bookkeeping, matching
+/// `next_goal_nr`'s own exclusion from the canonical form). Sorted, but
+/// **NOT deduped** (REVISED 2026-09-23, per direct user instruction --
+/// same reasoning as [`sort_guarded`]'s own doc comment): although
+/// `add_goal_with_loop_flag`'s own insertion-time dedup (`canonical_goal_for_dedup`,
+/// `constraint/system.rs`) makes `sys.goals` map-like under RAW `Goal`
+/// equality, that's raw identity, not alpha-equivalence -- two goals that
+/// are raw-distinct (e.g. a `Disj` over different free-variable
+/// identities) but canonicalize to the SAME `CanonicalGoal` are exactly
+/// the kind of real, solver-tracked-as-distinct entries a post-rename
+/// dedup here would silently collapse.
+fn canonicalize_goals(
+    goals: &[(Goal, GoalStatus)],
+    theta: &std::collections::BTreeMap<LNLit, LNLit>,
+) -> Vec<CanonicalGoal> {
+    let mut out: Vec<CanonicalGoal> = goals
+        .iter()
+        .filter_map(|(goal, status)| {
+            let kind = match goal {
+                Goal::Action(..) | Goal::Split(_) => return None,
+                Goal::Chain((conc_nid, conc_idx), (prem_nid, prem_idx)) => CanonicalGoalKind::Chain(
+                    *lookup_theta(theta, &Lit::Var(*conc_nid)),
+                    *conc_idx,
+                    *lookup_theta(theta, &Lit::Var(*prem_nid)),
+                    *prem_idx,
+                ),
+                Goal::Premise((prem_nid, prem_idx), fact) => CanonicalGoalKind::Premise(
+                    *lookup_theta(theta, &Lit::Var(*prem_nid)),
+                    *prem_idx,
+                    apply_literal_renaming(&fact_to_term(fact), theta),
+                ),
+                Goal::Disj(disj) => CanonicalGoalKind::Disj(sort_guarded(
+                    disj.0.iter().map(|g| canonicalize_guarded(g, theta)).collect(),
+                )),
+                Goal::Subterm((small, big)) => CanonicalGoalKind::Subterm(
+                    apply_literal_renaming(small, theta),
+                    apply_literal_renaming(big, theta),
+                ),
+            };
+            Some(CanonicalGoal {
+                kind,
+                solved: status.solved,
+            })
+        })
+        .collect();
+    out.sort_by(cmp_canonical_goal);
+    out
 }
 
 #[cfg(test)]
@@ -2293,37 +2710,26 @@ mod tests {
         assert_eq!(fingerprint_guarded(&once), fingerprint_guarded(&twice));
     }
 
-    // -- Accumulating (seeded) canonization / action-formula vertices ------
+    // -- Accumulating (seeded) canonization -------------------------------
     //
-    // `canonicalize_fact_seeded`/`canonicalize_rule_seeded`/
-    // `canonicalize_action_fact_seeded` are what a constraint-system-wide
-    // vertex loop (canonizing every `RuleInstance`/`Action` graph vertex
-    // in canonical order, per `canon_graph::VertexKind`) would actually
-    // call, one per vertex, threading ONE `CanonLabelling` through all of
-    // them. These tests pin the property that machinery depends on: a
-    // variable shared between DIFFERENT vertices (a rule instance's own
-    // fact, an action-formula vertex's fact) canonizes to the SAME
-    // literal in both, and does so identically regardless of what the
-    // shared variable happened to be named originally.
-
-    /// Parses `s` as a bare fact (reusing [`g`]'s formula-parser path) and
-    /// unwraps the `GAtom::Pred` atom it must produce -- the same shape
-    /// `system_import::parse_fact`/`canon_graph::collect_action_atoms`
-    /// hand to a real `VertexKind::Action`.
-    fn gfact(s: &str) -> GFact {
-        match g(s) {
-            Guarded::Atom(GAtom::Pred(f)) => f,
-            other => panic!("{s:?} did not parse as a bare fact (Pred atom): {other:?}"),
-        }
-    }
-
-    /// Installs a minimal, no-custom-functions signature -- `action_vertex_fact`'s
-    /// precondition (mirrors `system_import.rs`'s own `install_test_signature`).
-    fn install_empty_signature() -> crate::elaborate::UserFunsForTheoryGuard {
-        let thy = tamarin_parser::parser::parse_theory("theory T begin\nend", &[])
-            .expect("parse minimal theory");
-        crate::elaborate::set_user_funs_for_theory(&thy)
-    }
+    // `canonicalize_fact_seeded`/`canonicalize_rule_seeded` are what a
+    // constraint-system-wide vertex loop (canonizing every
+    // `RuleInstance`/`Action` graph vertex in canonical order, per
+    // `canon_graph::VertexKind`) would actually call, one per vertex,
+    // threading ONE `CanonLabelling` through all of them -- `VertexKind::Action`
+    // holds a plain `LNFact` (see its own doc comment for why: bridging a
+    // formula-derived action's `GFact` now happens once, at graph
+    // EXTRACTION time, in `canon_graph::action_vertex_fact` -- see that
+    // module's own tests for the bridge itself), so an action vertex's
+    // fact canonizes through this EXACT SAME call as a rule instance's
+    // own facts, no separate combinator needed. This test pins the
+    // property that machinery depends on: a variable shared between
+    // DIFFERENT `canonicalize_fact_seeded`/`canonicalize_rule_seeded`
+    // calls canonizes to the SAME literal in both, regardless of what the
+    // shared variable happened to be named originally -- the graph-part
+    // level counterpart (`graph_part_shares_a_variable_between_a_rule_instance_and_an_action_vertex`,
+    // below) confirms this holds for a REAL `VertexKind::Action`/`RuleInstance`
+    // pair specifically, not just two arbitrary facts.
 
     #[test]
     fn canonicalize_fact_seeded_and_rule_seeded_agree_regardless_of_the_shared_variables_name() {
@@ -2344,62 +2750,6 @@ mod tests {
 
         assert_eq!(fact_term_a, fact_term_b);
         assert_eq!(rule_term_a, rule_term_b);
-    }
-
-    #[test]
-    fn action_vertex_fact_converts_a_ground_gfact_to_the_matching_lnfact() {
-        let _guard = install_empty_signature();
-        let converted = action_vertex_fact(&gfact("P(x)"));
-        let expected = proto_fact(Multiplicity::Linear, "P", vec![v("x", LSort::Msg)]);
-        assert_eq!(converted, expected);
-    }
-
-    /// The end-to-end property this whole bridge exists for: a
-    /// `RuleInstance` vertex's own fact and an `Action` vertex's `GFact`
-    /// -- two DIFFERENT payload types -- canonize to the SAME literal for
-    /// a variable they share, via one accumulated labelling, exactly like
-    /// two `RuleInstance` vertices already do above.
-    #[test]
-    fn action_vertex_and_rule_instance_share_a_variable_via_one_labelling() {
-        let _guard = install_empty_signature();
-
-        let rule_a = rule(vec![in_fact(v("shared", LSort::Msg))], vec![], vec![]);
-        let action_a = gfact("Foo(shared)");
-        let rule_b = rule(vec![in_fact(v("s", LSort::Msg))], vec![], vec![]);
-        let action_b = gfact("Foo(s)");
-
-        let mut labelling_a = CanonLabelling::empty();
-        let rule_term_a = canonicalize_rule_seeded(&rule_a, &mut labelling_a);
-        let action_term_a = canonicalize_action_fact_seeded(&action_a, &mut labelling_a);
-
-        let mut labelling_b = CanonLabelling::empty();
-        let rule_term_b = canonicalize_rule_seeded(&rule_b, &mut labelling_b);
-        let action_term_b = canonicalize_action_fact_seeded(&action_b, &mut labelling_b);
-
-        assert_eq!(rule_term_a, rule_term_b);
-        assert_eq!(
-            action_term_a, action_term_b,
-            "the action vertex's variable must canonize to the same literal as the \
-             rule instance's shared variable, regardless of its original name"
-        );
-    }
-
-    /// The explicit invariant this session's design relies on: an action
-    /// vertex's `GFact` is assumed already closed (no leftover `Bound`
-    /// var) by construction (`canon_graph::collect_action_atoms` never
-    /// extracts one from inside a `Disj`/`GGuarded` scope). A violation
-    /// must panic loudly, not be swallowed by a fallible conversion.
-    #[test]
-    #[should_panic(expected = "left-over bound variable")]
-    fn action_vertex_fact_panics_on_a_leftover_bound_variable() {
-        let _guard = install_empty_signature();
-        let bound_gfact = GFact {
-            persistent: false,
-            name: "P".to_string(),
-            args: std::sync::Arc::from([GTerm::Var(BVar::Bound(0))]),
-            annotations: Vec::new(),
-        };
-        let _ = action_vertex_fact(&bound_gfact);
     }
 
     // -- Graph parts (`graph_part_to_term`/`canonicalize_graph_part`) --
@@ -2438,10 +2788,76 @@ mod tests {
         let ordered: Vec<&VertexKind> = vertices.iter().collect();
         let edges = BTreeSet::from([(0usize, 1usize)]);
 
-        let expected_vertices = f_app_list(vec![rule_to_term(&r1), rule_to_term(&r2)]);
-        let expected_edges = f_app_list(vec![f_app_list(vec![index_marker(0), index_marker(1)])]);
-        let expected = f_app_list(vec![expected_vertices, expected_edges]);
+        let expected_vertices = graph_tag(
+            "VerticesTerm",
+            vec![
+                graph_tag("RuleInstanceVertexTerm", vec![node_id_term(node(0)), rule_to_term(&r1)]),
+                graph_tag("RuleInstanceVertexTerm", vec![node_id_term(node(1)), rule_to_term(&r2)]),
+            ],
+        );
+        let expected_edges = graph_tag(
+            "EdgesTerm",
+            vec![graph_tag("EdgeTerm", vec![index_marker(0), index_marker(1)])],
+        );
+        let expected = graph_tag("GraphPartTerm", vec![expected_vertices, expected_edges]);
         assert_eq!(graph_part_to_term(&ordered, &edges), expected);
+    }
+
+    /// Direct test of the fix's mechanism: a vertex's own `NodeId` must
+    /// now be covered by `theta` after graph-part canonization -- before
+    /// `vertex_to_term` embedded it as a literal, `theta` never had an
+    /// entry for ANY `NodeId`, regardless of how well-connected its
+    /// vertex was (see `vertex_to_term`'s own doc comment for the full
+    /// story).
+    #[test]
+    fn canonicalize_graph_part_seeded_covers_each_vertexs_own_node_id() {
+        let r1 = rule_ac_inst("A", vec![], vec![], vec![]);
+        let vertices = [VertexKind::RuleInstance(node(0), r1)];
+        let ordered: Vec<&VertexKind> = vertices.iter().collect();
+        let edges = BTreeSet::new();
+
+        let (_, labelling) = canonicalize_graph_part_seeded(&ordered, &edges);
+
+        let key = Lit::Var(node(0));
+        assert!(
+            labelling.theta().contains_key(&key),
+            "expected theta to cover the vertex's own NodeId, got {:?}",
+            labelling.theta()
+        );
+    }
+
+    /// Regression test for the exact bug this fix closes:
+    /// `guarded::to_induction_hypothesis` (the `ginduct`/`Induction` proof
+    /// method) can produce a formula referencing a `NodeId` FREE -- e.g.
+    /// `last(#i)`, outside any quantifier -- which used to panic in
+    /// `canonicalize_guarded` because `theta` never had an entry for any
+    /// `NodeId` at all. Confirmed directly against a real captured proof
+    /// state too (`examples/explore_canonical_matches.rs` against
+    /// `Tutorial.spthy`'s `Client_session_key_secrecy`, `induction
+    /// [non_empty_trace]`): panicked before this fix, canonicalizes
+    /// cleanly after it.
+    #[test]
+    fn a_formula_referencing_a_vertexs_node_id_via_last_canonicalizes_without_panicking() {
+        let r1 = rule_ac_inst("A", vec![], vec![], vec![]);
+        let vertices = [VertexKind::RuleInstance(node(0), r1)];
+        let ordered: Vec<&VertexKind> = vertices.iter().collect();
+        let edges = BTreeSet::new();
+
+        let (_, labelling) = canonicalize_graph_part_seeded(&ordered, &edges);
+
+        let last_i = Guarded::Atom(GAtom::Last(GTerm::Var(BVar::Free(lvar_to_varspec(&node(
+            0,
+        ))))));
+        let canonicalized = canonicalize_guarded(&last_i, labelling.theta());
+        // The canonical form must reference the CANONICAL name, not the
+        // raw NodeId unchanged -- confirming it was actually renamed via
+        // theta, not silently passed through.
+        match canonicalized {
+            Guarded::Atom(GAtom::Last(GTerm::Var(BVar::Free(vs)))) => {
+                assert_ne!(varspec_to_lvar(&vs), node(0));
+            }
+            other => panic!("expected a Last atom, got {other:?}"),
+        }
     }
 
     /// THE regression test for the false positive this redesign fixes
@@ -2553,17 +2969,15 @@ mod tests {
     /// its OWN separate call).
     #[test]
     fn graph_part_shares_a_variable_between_a_rule_instance_and_an_action_vertex() {
-        let _guard = install_empty_signature();
-
         let rule_a = rule_ac_inst("R", vec![in_fact(v("shared", LSort::Msg))], vec![], vec![]);
-        let action_a = gfact("Foo(shared)");
+        let action_a = proto_fact(Multiplicity::Linear, "Foo", vec![v("shared", LSort::Msg)]);
         let seq_a = [
             VertexKind::RuleInstance(node(0), rule_a),
             VertexKind::Action(node(0), action_a),
         ];
 
         let rule_b = rule_ac_inst("R", vec![in_fact(v("s", LSort::Msg))], vec![], vec![]);
-        let action_b = gfact("Foo(s)");
+        let action_b = proto_fact(Multiplicity::Linear, "Foo", vec![v("s", LSort::Msg)]);
         let seq_b = [
             VertexKind::RuleInstance(node(0), rule_b),
             VertexKind::Action(node(0), action_b),
@@ -2591,6 +3005,32 @@ mod tests {
         crate::elaborate::elaborate(&parsed).unwrap_or_else(|e| panic!("elaborate: {e:?}"))
     }
 
+    /// A `ColorTable` built from no protocol rules and an empty
+    /// `IntrRuleCache` -- correct (if not exhaustive) for any test whose
+    /// `System` has no graph-part vertices to color at all (see the
+    /// empty-graph-part tests below), and needs no maude process.
+    fn empty_color_table() -> ColorTable {
+        ColorTable::build(
+            &[],
+            &crate::constraint::solver::context::IntrRuleCache::from(Vec::new()),
+        )
+    }
+
+    /// The `ColorTable` for `thy`'s own declared protocol rules, paired
+    /// with an EMPTY `IntrRuleCache` -- correct (if not exhaustive) for
+    /// any test below that colors only `RuleInfo::Proto` vertices (every
+    /// one of them; none of these hand-built `GraphPart`s uses a
+    /// `RuleInfo::Intr` instance), and avoids needing a real maude
+    /// process. See `canon_color.rs`'s own test module for the
+    /// maude-backed helper real intruder-rule coverage needs.
+    fn color_table(thy: &crate::theory::Theory) -> ColorTable {
+        let protocol_rules: Vec<crate::theory::OpenProtoRule> = thy.rules().cloned().collect();
+        ColorTable::build(
+            &protocol_rules,
+            &crate::constraint::solver::context::IntrRuleCache::from(Vec::new()),
+        )
+    }
+
     /// A ground 0-ary NoEq function symbol term, e.g. for `name = "aaa"`
     /// a term that is never renamed by `CAN_alphaeqac` (unlike a name/var
     /// literal) and orders by NAME -- exactly what's needed to build
@@ -2604,6 +3044,23 @@ mod tests {
             Constructability::Constructor,
         );
         LNTerm::App(FunSym::NoEq(sym), Arc::from([]))
+    }
+
+    /// A ground-symbol (but not ground-ARGUMENT) 2-ary NoEq function
+    /// term, e.g. `binary_fun_term("f", a, b)` = `f(a, b)` -- same
+    /// no-signature-needed construction as [`zero_ary_fun_term`], just
+    /// with real argument terms and a nonzero arity. `f`'s own NoEq-ness
+    /// means it has no equational theory: no AC, no commutativity, so
+    /// `f(a, b)` and `f(b, a)` are genuinely different terms whenever
+    /// `a != b`.
+    fn binary_fun_term(name: &'static str, a: LNTerm, b: LNTerm) -> LNTerm {
+        let sym = NoEqSym::new(
+            name.as_bytes().to_vec(),
+            2,
+            Privacy::Public,
+            Constructability::Constructor,
+        );
+        LNTerm::App(FunSym::NoEq(sym), Arc::from([a, b]))
     }
 
     fn rule_with_conclusion(name: &'static str, concl: LNTerm) -> crate::rule::RuleACInst {
@@ -2625,7 +3082,7 @@ mod tests {
         use crate::bliss_proc::{graph_part_to_dimacs, run_bliss};
         use crate::canon_graph::{GraphEdge, GraphPart};
 
-        let colors = ColorTable::build(&theory(
+        let colors = color_table(&theory(
             "theory T begin\n\
              rule Hub:\n  [] --> []\n\
              rule Leaf:\n  [] --> []\n\
@@ -2723,7 +3180,7 @@ mod tests {
         };
         use crate::canon_graph::{GraphEdge, GraphPart};
 
-        let colors = ColorTable::build(&theory(
+        let colors = color_table(&theory(
             "theory T begin\n\
              rule HubA:\n  [] --> []\n\
              rule HubB:\n  [] --> []\n\
@@ -2826,19 +3283,154 @@ mod tests {
         );
     }
 
+    /// A THIRD `minimal_graph_part_labelings` scenario, distinct from the
+    /// two above: here the automorphism itself is genuine (bliss is
+    /// right that swapping the two `Fr` vertices preserves the graph's
+    /// COLOR/STRUCTURE), but the swap is NOT actually content-preserving
+    /// once real vertex CONTENT (not just color) is considered --
+    /// because a THIRD vertex, `K(f(x, y))`, references BOTH `Fr`
+    /// vertices' own variables ASYMMETRICALLY through `f`, a function
+    /// symbol with NO equational theory (no commutativity to make
+    /// `f(_, _)`'s two argument orders equal).
+    ///
+    /// Concretely: `Fr(x)`/`Fr(y)` are colored identically (same action
+    /// tag, same arity) and have no edges distinguishing them, so bliss
+    /// reports exactly one generator swapping them -- `Aut(G) = {id,
+    /// swap}`, size 2. Which one of `{x, y}` gets canonized to the
+    /// canonical variable `mv(0)` (vs. `mv(1)`) depends entirely on
+    /// vertex ORDER (the Canonizer discovers literals in graph-part
+    /// vertex-sequence order -- see `vertex_to_term`'s own doc comment):
+    /// under the identity ordering `x` is discovered first (`x -> mv(0)`,
+    /// `y -> mv(1)`), giving `K(f(mv(0), mv(1)))`; under the swapped
+    /// ordering `y` is discovered first (`y -> mv(0)`, `x -> mv(1)`),
+    /// giving `K(f(mv(1), mv(0)))` -- `x` and `y` trade canonical
+    /// identities, but `f`'s own two ARGUMENT POSITIONS never move, so
+    /// the two candidate terms are genuinely different (not just
+    /// differently-labelled). `minimal_graph_part_labelings` must -- and,
+    /// per this test, does -- pick the lexicographically smaller of the
+    /// two: `K(f(mv(0), mv(1)))` (`mv(0) < mv(1)` as canonical literals),
+    /// discarding the swapped ordering's `K(f(mv(1), mv(0)))` even though
+    /// it comes from an equally-real graph automorphism.
+    #[test]
+    fn minimal_graph_part_labelings_discards_a_real_automorphism_whose_content_actually_differs() {
+        if !bliss_available() {
+            return;
+        }
+        use crate::bliss_proc::{graph_part_to_dimacs, run_bliss};
+        use crate::canon_graph::GraphPart;
+
+        // `VertexKind::Action` holds a plain `LNFact` now, so `f(x, y)`
+        // is built directly via `NoEqSym::new` -- same as `zero_ary_fun_term`,
+        // just 2-ary -- with NO signature/elaboration needed at all: a
+        // plain free/NoEq symbol, no AC, no commutativity, nothing that
+        // could make `f(a, b) = f(b, a)`.
+        let fxy = binary_fun_term("f", v("x", LSort::Msg), v("y", LSort::Msg));
+
+        // `Fr`/`K` are both fixed `BUILTIN_ACTION_NAMES` entries, colored
+        // the same regardless of theory -- no protocol rules/actions of
+        // our own to declare, so the empty table already covers them.
+        let colors = empty_color_table();
+
+        let vertices = vec![
+            VertexKind::Action(
+                node(0),
+                proto_fact(Multiplicity::Linear, "Fr", vec![v("x", LSort::Msg)]),
+            ),
+            VertexKind::Action(
+                node(1),
+                proto_fact(Multiplicity::Linear, "Fr", vec![v("y", LSort::Msg)]),
+            ),
+            VertexKind::Action(node(2), proto_fact(Multiplicity::Linear, "K", vec![fxy])),
+        ];
+        let part = GraphPart {
+            vertices,
+            edges: Vec::new(),
+            colors,
+        };
+
+        let dimacs = graph_part_to_dimacs(&part).unwrap_or_else(|e| panic!("dimacs: {e}"));
+        let result = run_bliss(&dimacs).unwrap_or_else(|e| panic!("run_bliss: {e}"));
+        assert_eq!(
+            result.generators.len(),
+            1,
+            "the two identically-colored, edge-free Fr vertices should give bliss exactly \
+             one generator (the swap); the K vertex, differently colored, must stay fixed"
+        );
+        let group = crate::bliss_proc::generate_group(&result.generators, part.vertices.len());
+        assert_eq!(
+            group.len(),
+            2,
+            "Aut(G) = {{id, swap}} has exactly 2 elements"
+        );
+
+        let survivors = minimal_graph_part_labelings(&part, &result);
+        assert_eq!(
+            survivors.len(),
+            1,
+            "f has no equational theory, so f(mv(0), mv(1)) and f(mv(1), mv(0)) are \
+             genuinely different terms -- the tie must resolve to a SINGLE survivor, not \
+             both (contrast a scenario where the swapped content is ALSO identical, which \
+             would leave both as ties)"
+        );
+
+        // Pin down exactly which candidate wins, not just that a unique
+        // one does: identity order (`Fr(x)` first) must be the survivor,
+        // and it must be the STRICTLY smaller of the two candidates.
+        let identity_order: Vec<&VertexKind> = part.vertices.iter().collect();
+        let swapped_order: Vec<&VertexKind> =
+            vec![&part.vertices[1], &part.vertices[0], &part.vertices[2]];
+        let no_edges = BTreeSet::new();
+        let identity_term = canonicalize_graph_part(&identity_order, &no_edges);
+        let swapped_term = canonicalize_graph_part(&swapped_order, &no_edges);
+
+        assert_ne!(
+            identity_term, swapped_term,
+            "the two candidates must actually differ, or this test isn't exercising the \
+             content-based tie-break at all"
+        );
+        assert!(
+            identity_term < swapped_term,
+            "canonizing Fr(x) before Fr(y) (giving K(f(mv(0), mv(1)))) must be the \
+             LEXICOGRAPHICALLY SMALLER candidate -- the one minimization is expected to keep"
+        );
+        assert_eq!(
+            survivors[0].1, identity_term,
+            "minimal_graph_part_labelings must pick the K(f(mv(0), mv(1))) variant -- the \
+             one from canonizing Fr(x) before Fr(y) -- discarding the swapped K(f(mv(1), \
+             mv(0))) variant even though bliss reported the swap as a real automorphism"
+        );
+    }
+
     // -- Stage G: eq_store.conj --------------------------------------------
 
     /// A `CanonLabelling` whose theta already covers `domain_vars`, each
     /// mapped to its own distinct canonical var of the same sort -- enough
     /// to satisfy `lookup_theta`'s panic-on-miss for a domain-key lookup,
     /// without running a real graph-part/formula canonization pass first.
-    /// Canonical keys are handed out in `domain_vars`' own order (index 0,
-    /// 1, ...), so a test can predict which output entry belongs to which
-    /// input domain var.
+    /// Uses the SAME per-sort naming as the real scheme (`canonical_var` in
+    /// `tamarin-term/src/alpha_eq_ac.rs`: `mv`/`fv`/`pv`/`tv`/`nv` for
+    /// msg/fresh/pub/node/nat) rather than one sort-blind `cv` family, so a
+    /// reader of these tests sees the same convention `CanonLabelling`
+    /// itself produces -- NOT the real `CanonLabelling` scheme otherwise
+    /// (this hands out indices purely by `domain_vars`' own order, one
+    /// counter per sort, rather than by any real Canonizer discovery
+    /// order). Canonical keys are handed out in `domain_vars`' own order
+    /// within each sort (index 0, 1, ...), so a test can predict which
+    /// output entry belongs to which input domain var.
     fn labelling_covering(domain_vars: &[LVar]) -> CanonLabelling {
         let mut theta: std::collections::BTreeMap<LNLit, LNLit> = std::collections::BTreeMap::new();
-        for (i, dv) in domain_vars.iter().enumerate() {
-            theta.insert(Lit::Var(*dv), Lit::Var(LVar::new("cv", dv.sort, i as u64)));
+        let mut next_idx: std::collections::BTreeMap<LSort, u64> = std::collections::BTreeMap::new();
+        for dv in domain_vars {
+            let idx = next_idx.entry(dv.sort).or_insert(0);
+            let name = match dv.sort {
+                LSort::Msg => "mv",
+                LSort::Fresh => "fv",
+                LSort::Pub => "pv",
+                LSort::Node => "tv",
+                LSort::Nat => "nv",
+            };
+            theta.insert(Lit::Var(*dv), Lit::Var(LVar::new(name, dv.sort, *idx)));
+            *idx += 1;
         }
         CanonLabelling::from_theta(theta)
     }
@@ -2863,7 +3455,7 @@ mod tests {
         let out = canonicalize_eq_disj_alternative(&alt, &labelling);
 
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0, Lit::Var(LVar::new("cv", LSort::Msg, 0)));
+        assert_eq!(out[0].0, Lit::Var(LVar::new("mv", LSort::Msg, 0)));
         // The witness got SOME fresh canonical literal of its own -- not
         // `w` itself (which was never a canonical form to begin with),
         // and not x's own canonical key.
@@ -2928,8 +3520,8 @@ mod tests {
         let out = canonicalize_eq_disj_alternative(&alt, &labelling);
 
         assert_eq!(out.len(), 2);
-        let p_key = Lit::Var(LVar::new("cv", LSort::Msg, 0));
-        let q_key = Lit::Var(LVar::new("cv", LSort::Msg, 1));
+        let p_key = Lit::Var(LVar::new("mv", LSort::Msg, 0));
+        let q_key = Lit::Var(LVar::new("mv", LSort::Msg, 1));
         let p_range = &out.iter().find(|(k, _)| *k == p_key).expect("p entry").1;
         let q_range = &out.iter().find(|(k, _)| *k == q_key).expect("q entry").1;
         match p_range {
@@ -3000,7 +3592,7 @@ mod tests {
     fn eq_disj_alternative_panics_if_theta_is_not_injective() {
         let v1 = LVar::new("v1", LSort::Msg, 1);
         let v2 = LVar::new("v2", LSort::Msg, 2);
-        let shared_canonical = LVar::new("cv", LSort::Msg, 0);
+        let shared_canonical = LVar::new("mv", LSort::Msg, 0);
         let mut theta: std::collections::BTreeMap<LNLit, LNLit> = std::collections::BTreeMap::new();
         // Deliberately broken: two DIFFERENT raw domain vars mapped to the
         // SAME canonical literal -- impossible via real accumulation.
@@ -3043,5 +3635,251 @@ mod tests {
             out[0], out[1],
             "and their canonical forms must actually be equal"
         );
+    }
+
+    // -- Stage G: goals (`canonicalize_goals`) -----------------------------
+
+    #[test]
+    fn canonicalize_goals_drops_action_and_split_goals() {
+        let nid = node(0);
+        let labelling = labelling_covering(&[nid]);
+        let goals = vec![
+            (
+                Goal::Action(nid, proto_fact(Multiplicity::Linear, "P", vec![])),
+                GoalStatus::default(),
+            ),
+            (
+                Goal::Split(crate::tools::equation_store::SplitId(0)),
+                GoalStatus::default(),
+            ),
+        ];
+        let out = canonicalize_goals(&goals, labelling.theta());
+        assert!(
+            out.is_empty(),
+            "Action (already a graph-part vertex) and Split (only names an \
+             EqDisj already in eq_store.conj) must not appear in the \
+             canonical goal list: {out:?}"
+        );
+    }
+
+    #[test]
+    fn canonicalize_goals_canonicalizes_chain_via_theta() {
+        let conc_nid = node(0);
+        let prem_nid = node(1);
+        let labelling = labelling_covering(&[conc_nid, prem_nid]);
+        let goals = vec![(
+            Goal::Chain((conc_nid, ConcIdx(0)), (prem_nid, PremIdx(1))),
+            GoalStatus {
+                solved: true,
+                ..Default::default()
+            },
+        )];
+
+        let out = canonicalize_goals(&goals, labelling.theta());
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].kind,
+            CanonicalGoalKind::Chain(
+                Lit::Var(LVar::new("tv", LSort::Node, 0)),
+                ConcIdx(0),
+                Lit::Var(LVar::new("tv", LSort::Node, 1)),
+                PremIdx(1),
+            )
+        );
+        assert!(out[0].solved, "GoalStatus::solved must survive canonicalization");
+    }
+
+    #[test]
+    fn canonicalize_goals_canonicalizes_premise_fact_via_theta() {
+        let prem_nid = node(0);
+        let x = LVar::new("x", LSort::Msg, 0);
+        let labelling = labelling_covering(&[prem_nid, x]);
+        let fact = in_fact(v("x", LSort::Msg));
+        let goals = vec![(
+            Goal::Premise((prem_nid, PremIdx(2)), fact.clone()),
+            GoalStatus::default(),
+        )];
+
+        let out = canonicalize_goals(&goals, labelling.theta());
+
+        assert_eq!(out.len(), 1);
+        let expected_fact_term = apply_literal_renaming(&fact_to_term(&fact), labelling.theta());
+        assert_eq!(
+            out[0].kind,
+            CanonicalGoalKind::Premise(
+                Lit::Var(LVar::new("tv", LSort::Node, 0)),
+                PremIdx(2),
+                expected_fact_term,
+            )
+        );
+    }
+
+    #[test]
+    fn canonicalize_goals_canonicalizes_disj_and_preserves_alternative_multiplicity() {
+        let x = LVar::new("x", LSort::Msg, 0);
+        let labelling = labelling_covering(&[x]);
+        // Two IDENTICAL alternatives -- must NOT collapse to one (REVISED
+        // 2026-09-23: `sort_guarded` no longer dedups, same reasoning as
+        // `eq_store.conj`'s multiset preservation -- a solver-level
+        // duplicate is not assumed redundant).
+        let goals = vec![(
+            Goal::Disj(crate::constraint::constraints::Disj(vec![g("Foo(x)"), g("Foo(x)")])),
+            GoalStatus::default(),
+        )];
+
+        let out = canonicalize_goals(&goals, labelling.theta());
+
+        assert_eq!(out.len(), 1);
+        match &out[0].kind {
+            CanonicalGoalKind::Disj(alts) => {
+                assert_eq!(
+                    alts.len(),
+                    2,
+                    "two identical alternatives must NOT be deduplicated -- multiplicity \
+                     must survive canonicalization"
+                );
+                assert_eq!(alts[0], canonicalize_guarded(&g("Foo(x)"), labelling.theta()));
+                assert_eq!(alts[1], canonicalize_guarded(&g("Foo(x)"), labelling.theta()));
+            }
+            other => panic!("expected Disj, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonicalize_goals_canonicalizes_subterm_via_theta() {
+        let x = LVar::new("x", LSort::Msg, 0);
+        // `v(name, sort)` always builds idx 0 -- `y` must match that, or
+        // `labelling_covering` seeds a DIFFERENT literal than the one
+        // `v("y", ..)` below actually produces.
+        let y = LVar::new("y", LSort::Msg, 0);
+        let labelling = labelling_covering(&[x, y]);
+        let goals = vec![(
+            Goal::Subterm((v("x", LSort::Msg), v("y", LSort::Msg))),
+            GoalStatus::default(),
+        )];
+
+        let out = canonicalize_goals(&goals, labelling.theta());
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].kind,
+            CanonicalGoalKind::Subterm(
+                var_term(LVar::new("mv", LSort::Msg, 0)),
+                var_term(LVar::new("mv", LSort::Msg, 1)),
+            )
+        );
+    }
+
+    /// The exhaustiveness contract every other Stage G field already has
+    /// (`lookup_theta`/`apply_literal_renaming` panic on a miss, not
+    /// silently pass through -- see `apply_literal_renaming`'s own doc
+    /// comment in `tamarin-term`) applies to goals too: a `Chain` goal
+    /// referencing a `NodeId` the graph part never discovered must panic
+    /// loudly, not silently drop the reference.
+    #[test]
+    #[should_panic(expected = "no entry in theta")]
+    fn canonicalize_goals_panics_on_a_node_id_missing_from_theta() {
+        let uncovered_nid = node(99);
+        let goals = vec![(
+            Goal::Chain((uncovered_nid, ConcIdx(0)), (uncovered_nid, PremIdx(0))),
+            GoalStatus::default(),
+        )];
+        let empty_theta = std::collections::BTreeMap::new();
+        let _ = canonicalize_goals(&goals, &empty_theta);
+    }
+
+    /// THE regression test this whole feature exists for, at the
+    /// `canonicalize_constraint_system` level (not just `canonicalize_goals`
+    /// in isolation): a system with a genuine pending goal must NOT
+    /// canonicalize identically to an otherwise-identical system without
+    /// it. Confirmed via real wireguard.spthy data before this fix: two
+    /// sibling `!KU(mac1)`/`!KU(mac2)` sub-goals (synthesized by
+    /// `insert_goal_with_loop_flag`'s pair-decomposition, `reduction.rs`)
+    /// were completely invisible to canonicalization -- their `NodeId`s
+    /// fell back to bare content-free `Dummy` vertices, and their own
+    /// term content (which SPECIFIC message was pending derivation)
+    /// appeared NOWHERE in the canonical form at all. Uses an otherwise
+    /// EMPTY graph part (ground `zero_ary_fun_term`s for the `Subterm`
+    /// pair, so no literal needs `theta` coverage) specifically so this
+    /// test needs no bliss subprocess -- matches
+    /// `empty_graph_part_systems_with_different_formulas_are_not_alpha_eq`'s
+    /// own precedent for the same reason.
+    #[test]
+    fn systems_differing_only_in_a_pending_goal_are_not_alpha_eq() {
+        let colors = empty_color_table();
+
+        let mut sys_a = System::empty();
+        sys_a.content_mut().goals = std::sync::Arc::new(vec![(
+            Goal::Subterm((zero_ary_fun_term("small"), zero_ary_fun_term("big"))),
+            GoalStatus::default(),
+        )]);
+        let sys_b = System::empty();
+
+        let canon_a = canonicalize_constraint_system(&sys_a, &colors)
+            .unwrap_or_else(|e| panic!("canonicalize a: {e:?}"));
+        let canon_b = canonicalize_constraint_system(&sys_b, &colors)
+            .unwrap_or_else(|e| panic!("canonicalize b: {e:?}"));
+
+        assert_ne!(
+            canon_a, canon_b,
+            "a system with a genuine pending Subterm goal must not canonicalize \
+             identically to one without it"
+        );
+    }
+
+    // -- canonicalize_constraint_system: empty graph parts --
+
+    /// Regression test for the `EmptyGraph` bug: a system with NO nodes at
+    /// all (the root of every proof, before Simplify/goal-solving
+    /// introduces any rule instances; induction's `empty_trace` base
+    /// case) has a graph part with zero vertices, which bliss itself
+    /// refuses to canonicalize. `canonicalize_constraint_system` must
+    /// special-case this rather than propagating `BlissError::EmptyGraph`
+    /// -- an empty graph part is trivially canonical (exactly one empty
+    /// vertex sequence, one empty edge set), and there's plenty of OTHER
+    /// canonicalizable content (formulas here) that shouldn't be blocked
+    /// by it. Deliberately does NOT gate on `bliss_available()`: the
+    /// whole point of the fix is that this path never touches bliss.
+    #[test]
+    fn empty_graph_part_canonicalizes_via_the_trivial_form_not_bliss() {
+        use crate::guarded::gtrue;
+        let mut sys = System::empty();
+        sys.formulas_mut().push(std::sync::Arc::new(gtrue()));
+        // Colors are never queried here -- an empty-graph-part `System`
+        // has no vertices at all, so an empty table (no maude needed) is
+        // as good as a real theory's.
+        let colors = empty_color_table();
+
+        let canon = canonicalize_constraint_system(&sys, &colors)
+            .unwrap_or_else(|e| panic!("canonicalize_constraint_system: {e:?}"));
+
+        assert_eq!(
+            canon.graph_part,
+            canonicalize_graph_part(&[], &BTreeSet::new()),
+            "an empty graph part's canonical term must be the same fixed \
+             trivial term every time"
+        );
+        assert_eq!(canon.formulas, vec![gtrue()]);
+    }
+
+    /// Two DIFFERENT empty-graph-part systems (different formulas) must
+    /// still canonicalize to DIFFERENT `CanonicalSystem`s -- the trivial
+    /// graph-part shortcut must not collapse everything with no nodes
+    /// into one indistinguishable bucket.
+    #[test]
+    fn empty_graph_part_systems_with_different_formulas_are_not_alpha_eq() {
+        use crate::guarded::{gfalse, gtrue};
+        let colors = empty_color_table();
+
+        let mut sys_a = System::empty();
+        sys_a.formulas_mut().push(std::sync::Arc::new(gtrue()));
+        let canon_a = canonicalize_constraint_system(&sys_a, &colors).expect("canonicalize a");
+
+        let mut sys_b = System::empty();
+        sys_b.formulas_mut().push(std::sync::Arc::new(gfalse()));
+        let canon_b = canonicalize_constraint_system(&sys_b, &colors).expect("canonicalize b");
+
+        assert_ne!(canon_a, canon_b);
     }
 }

@@ -106,7 +106,11 @@ mod tests {
     /// - `crates/tamarin-term/src/test_maude.rs` — the bottom crate's own
     ///   shared probe, and the twin of this file.  It is in
     ///   [`SKIPS_SILENTLY`].
-    const ALLOWED: [&str; 8] = [
+    /// - `crates/tamarin-theory/tests/common/mod.rs` — the harness this
+    ///   crate's own integration tests use for a real maude-backed
+    ///   `IntrRuleCache`/`ColorTable` (added alongside `canon_color.rs`'s
+    ///   caller-supplies-everything redesign, 2026-09-22).
+    const ALLOWED: [&str; 9] = [
         "crates/tamarin-prover/tests/common/mod.rs",
         "crates/tamarin-server/src/handlers/proof_tree.rs",
         "crates/tamarin-server/tests/common/mod.rs",
@@ -114,6 +118,7 @@ mod tests {
         "crates/tamarin-term/src/test_maude.rs",
         "crates/tamarin-theory/examples/common/mod.rs",
         "crates/tamarin-theory/src/test_maude.rs",
+        "crates/tamarin-theory/tests/common/mod.rs",
         "crates/tamarin-theory/tests/oracle_solver.rs",
     ];
 
@@ -125,12 +130,13 @@ mod tests {
     /// the ladder of candidates.  A `MAUDE_PATH` that is set but names a file
     /// that does not exist must panic.  A probe that resolves nothing at all
     /// must also panic, unless the opt-out is named.
-    const MUST_BE_LOUD: [&str; 6] = [
+    const MUST_BE_LOUD: [&str; 7] = [
         "crates/tamarin-prover/tests/common/mod.rs",
         "crates/tamarin-server/src/handlers/proof_tree.rs",
         "crates/tamarin-server/tests/common/mod.rs",
         "crates/tamarin-server/tests/theory_io_ndc.rs",
         "crates/tamarin-theory/src/test_maude.rs",
+        "crates/tamarin-theory/tests/common/mod.rs",
         "crates/tamarin-theory/tests/oracle_solver.rs",
     ];
 

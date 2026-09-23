@@ -1475,17 +1475,48 @@ pub fn prove_lemma(
 /// once-per-load NDC-checked intruder cache, injected into the context so
 /// the fallback path never re-runs the check; the borrowed handle lets a
 /// whole per-lemma loop share one cache allocation.
-pub fn prove_lemma_with_pool_file_heuristic(
+/// Builds the `(ProofContext, System)` pair [`prove_lemma_with_pool_file_heuristic`]
+/// hands to either [`crate::replay::replace_sorry_prove`] (when the lemma
+/// carries a parsed skeleton) or [`run_proof_search`] (auto-prover from
+/// scratch) — everything that function does BEFORE that dispatch:
+/// elaboration, guarded-formula conversion, the initial `System`
+/// (`formula_to_system` + reuse-lemma insertion), `ProofContext`
+/// construction, heuristic resolution, source saturation, and the
+/// `[use_induction]`/`[sources]` induction-forcing check.
+///
+/// Factored out (2026-09-22) so a caller that wants to drive the SAME
+/// per-lemma setup but walk the proof tree itself — e.g. exploring every
+/// applicable [`crate::constraint::solver::search::candidate_methods`] at
+/// each node instead of only the heuristic's top pick, to empirically test
+/// constraint-system canonicalization/fingerprinting across a real search
+/// tree — doesn't have to duplicate (and risk drifting from) this setup.
+///
+/// Returns the lemma's parsed proof skeleton too (`None` for a fresh
+/// auto-prover run), and the [`crate::elaborate::UserFunsForTheoryGuard`]
+/// RAII guard: `elaborate()`'s own guard only covers elaboration itself,
+/// but `term_to_lnterm` calls during search need the thread-local
+/// user-declared-function-symbol set to stay installed for as long as
+/// `ctx`/`sys` are used — the CALLER must hold this guard alive for that
+/// whole span (mirroring Haskell's `funSig` staying available through the
+/// whole prover lifetime), not just drop it immediately.
+pub fn build_lemma_proof_context(
     parser_theory: &p::Theory,
     lemma_name: &str,
     maude: tamarin_term::maude_proc::MaudeHandle,
     pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
-    proof_bound: usize,
     in_file: &str,
     cli_heuristic: &CliHeuristic,
     cut: crate::constraint::solver::context::CutStrategy,
     ndc_cache: Option<&IntrRuleCache>,
-) -> Result<ProofNode, ProveError> {
+) -> Result<
+    (
+        ProofContext,
+        crate::constraint::system::System,
+        Option<tamarin_parser::ast::ParsedProofTree>,
+        crate::elaborate::UserFunsForTheoryGuard,
+    ),
+    ProveError,
+> {
     let trace = tamarin_utils::env_gate!("TAM_DBG_PHASE");
     // Per-phase wall-clock instrumentation, gated by TAM_DBG_PHASE.
     // `Option<Instant>` keeps the disabled-path branch-predictable to
@@ -1701,22 +1732,6 @@ pub fn prove_lemma_with_pool_file_heuristic(
             t_sat.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())
         );
     }
-    let t_search: Option<std::time::Instant> = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    if trace {
-        eprintln!("[phase] run_proof_search start");
-    }
-    // Phase marker so TAM_RS_DBG_* counts can be filtered to the
-    // lemma-proof phase only.  Pair with HS's `[Saturating Sources]
-    // Done` marker for HS↔Rust diffing of just the lemma proof
-    // (excludes precompute/saturation).  Gated behind TAM_RS_DBG_PHASE
-    // so default --prove stderr stays HS-faithful.
-    if tamarin_utils::env_gate!("TAM_RS_DBG_PHASE") {
-        eprintln!("[rs-phase] lemma-proof START");
-    }
     // Honour the `[use_induction]` and `[sources]` attributes by
     // forcing the first proof method to be Induction. Haskell's
     // `ClosedTheory.hs` flips `pcUseInduction = UseInduction` for
@@ -1732,18 +1747,75 @@ pub fn prove_lemma_with_pool_file_heuristic(
         ctx.use_induction = crate::constraint::solver::context::UseInduction::UseInduction;
     }
 
-    // HS-faithful `replaceSorryProver` (Theory/Proof.hs:642-650):
-    // when the lemma carries a parsed skeleton, walk that skeleton and
-    // invoke the auto-prover only at `by sorry` leaves.  Otherwise (no
-    // skeleton or parser couldn't structure it) fall through to the
-    // pre-existing auto-prover-from-scratch behavior.
-    if let Some(tree) = lemma.proof.tree.clone() {
+    if trace {
+        eprintln!(
+            "[phase] build_lemma_proof_context done dt={:.3}s",
+            t_phase.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())
+        );
+    }
+    Ok((ctx, sys, lemma.proof.tree.clone(), _user_funs_guard))
+}
+
+/// Like [`prove_lemma`] but accepts a `MaudePool` (consulted ONLY inside
+/// `par_iter` closures — see `sources.rs::saturate_sources_with_simp_opt`),
+/// the source file path (oracle path resolution, HS `oraclePath oracle =
+/// takeDirectory inFile </> normalise relPath`, System.hs:574-575,
+/// Theory/Text/Parser.hs:309), and the CLI
+/// `--heuristic`/`--oraclename`/`--oracle-only` (HS `AutoProver`).  This is
+/// the per-lemma (non-session) fallback path; when `cli_heuristic.raw` is
+/// `Some` it OVERRIDES the per-lemma / theory heuristic (HS `selectHeuristic`,
+/// Theory/Proof.hs:705-716, see line 707).  `ndc_cache` is the theory's
+/// once-per-load NDC-checked intruder cache, injected into the context so
+/// the fallback path never re-runs the check; the borrowed handle lets a
+/// whole per-lemma loop share one cache allocation.
+///
+/// Builds `(ctx, sys)` via [`build_lemma_proof_context`], then dispatches:
+/// HS-faithful `replaceSorryProver` (Theory/Proof.hs:642-650) when the
+/// lemma carries a parsed skeleton (walk that skeleton, invoking the
+/// auto-prover only at `by sorry` leaves), else [`run_proof_search`]
+/// (fresh auto-prover run) — mirrors this function's own previous,
+/// unextracted body exactly.
+pub fn prove_lemma_with_pool_file_heuristic(
+    parser_theory: &p::Theory,
+    lemma_name: &str,
+    maude: tamarin_term::maude_proc::MaudeHandle,
+    pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
+    proof_bound: usize,
+    in_file: &str,
+    cli_heuristic: &CliHeuristic,
+    cut: crate::constraint::solver::context::CutStrategy,
+    ndc_cache: Option<&IntrRuleCache>,
+) -> Result<ProofNode, ProveError> {
+    let trace = tamarin_utils::env_gate!("TAM_DBG_PHASE");
+    let t_phase: Option<std::time::Instant> = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
+    let (ctx, sys, skeleton_tree, _user_funs_guard) = build_lemma_proof_context(
+        parser_theory,
+        lemma_name,
+        maude,
+        pool,
+        in_file,
+        cli_heuristic,
+        cut,
+        ndc_cache,
+    )?;
+
+    // Phase marker so TAM_RS_DBG_* counts can be filtered to the
+    // lemma-proof phase only.  Pair with HS's `[Saturating Sources]
+    // Done` marker for HS↔Rust diffing of just the lemma proof
+    // (excludes precompute/saturation).  Gated behind TAM_RS_DBG_PHASE
+    // so default --prove stderr stays HS-faithful.
+    if tamarin_utils::env_gate!("TAM_RS_DBG_PHASE") {
+        eprintln!("[rs-phase] lemma-proof START");
+    }
+
+    if let Some(tree) = skeleton_tree {
         if tamarin_utils::env_gate!("TAM_DBG_REPLAY") {
-            eprintln!(
-                "[replay] firing skeleton replay for `{}` (raw {} bytes)",
-                lemma_name,
-                lemma.proof.raw.len()
-            );
+            eprintln!("[replay] firing skeleton replay for `{lemma_name}`");
         }
         return Ok(crate::replay::replace_sorry_prove(
             &ctx,
@@ -1752,11 +1824,15 @@ pub fn prove_lemma_with_pool_file_heuristic(
             proof_bound,
         ));
     } else if tamarin_utils::env_gate!("TAM_DBG_REPLAY") {
-        eprintln!(
-            "[replay] NO tree on `{}` (raw {} bytes) — falling through to auto-prover",
-            lemma_name,
-            lemma.proof.raw.len()
-        );
+        eprintln!("[replay] NO tree on `{lemma_name}` — falling through to auto-prover");
+    }
+    let t_search: Option<std::time::Instant> = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    if trace {
+        eprintln!("[phase] run_proof_search start");
     }
     let r = run_proof_search(&ctx, sys, proof_bound);
     if trace {

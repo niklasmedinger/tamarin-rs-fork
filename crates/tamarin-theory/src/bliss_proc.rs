@@ -545,7 +545,7 @@ pub fn canonicalize(part: &GraphPart) -> Result<CanonicalGraph, BlissError> {
 /// just check the graph's shape.
 ///
 /// Unlike [`apply_labeling`], this keeps each vertex's FULL `VertexKind`
-/// payload (the `RuleACInst`/`GFact`/`NodeId` it carries) instead of
+/// payload (the `RuleACInst`/`LNFact`/`NodeId` it carries) instead of
 /// collapsing it to a bare `Color` — `CanonicalGraph` deliberately throws
 /// that content away to stay a pure, naming-insensitive shape digest
 /// (see its own doc comment): two $\alphaeqac$ systems have genuinely

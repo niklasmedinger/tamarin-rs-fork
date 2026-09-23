@@ -39,17 +39,16 @@ use tamarin_theory::bliss_proc::{
 };
 use tamarin_theory::canon::canonicalize_graph_part;
 use tamarin_theory::canon_graph::extract_graph_part;
-use tamarin_theory::elaborate::{elaborate, set_user_funs_for_theory};
+use tamarin_theory::constraint::solver::context::ProofContext;
+use tamarin_theory::elaborate::set_user_funs_for_theory;
 use tamarin_theory::system_import::system_from_json;
+
+mod common;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
         .join(name)
-}
-
-fn tutorial_theory_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tamarin-prover/examples/Tutorial.spthy")
 }
 
 fn load_system(fixture_name: &str) -> tamarin_theory::constraint::system::System {
@@ -65,18 +64,30 @@ fn tutorial_khu_client_and_client_khu_systems_canonicalize_identically() {
     if !bliss_available() {
         return;
     }
-
-    let src = std::fs::read_to_string(tutorial_theory_path())
-        .unwrap_or_else(|e| panic!("read Tutorial.spthy: {e}"));
-    let parsed = tamarin_parser::parse_theory(&src, &[]).expect("parse Tutorial.spthy");
+    // Tutorial.spthy declares its own functions (`h`/`aenc`/`adec`/`pk`),
+    // so its real `IntrRuleCache` contains theory-specific Constr/Destr
+    // rules alongside the fixed special ones -- building the `ColorTable`
+    // needs a real maude process, not just an elaborated `Theory` (see
+    // `canon_color.rs`'s own "why this table takes..." doc section). A
+    // `ProofContext` is the natural way to get one: it's the SAME table a
+    // real proof search would use, built once at `ProofContext::new` time
+    // from its own `rules`/`intruder_rules` (`ctx.color_table`).
+    let Some((parsed, elaborated, maude)) =
+        common::load_theory_with_maude(&common::tutorial_theory_path())
+    else {
+        return;
+    };
     let _guard = set_user_funs_for_theory(&parsed);
-    let elaborated = elaborate(&parsed).expect("elaborate Tutorial.spthy");
+    let protocol_rules: Vec<tamarin_theory::theory::OpenProtoRule> =
+        elaborated.rules().cloned().collect();
+    let ctx = ProofContext::new(maude, protocol_rules);
+    let colors = &ctx.color_table;
 
     let sys_a = load_system("tutorial_khu_client_system.json");
     let sys_b = load_system("tutorial_client_khu_system.json");
 
-    let part_a = extract_graph_part(&sys_a, &elaborated);
-    let part_b = extract_graph_part(&sys_b, &elaborated);
+    let part_a = extract_graph_part(&sys_a, colors);
+    let part_b = extract_graph_part(&sys_b, colors);
 
     // Sanity check before asking bliss anything: if the two graph parts
     // don't even have the same SHAPE (vertex/edge counts), they cannot

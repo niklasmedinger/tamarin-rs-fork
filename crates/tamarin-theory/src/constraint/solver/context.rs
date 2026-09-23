@@ -22,6 +22,7 @@
 
 use tamarin_term::maude_proc::{MaudeHandle, MaudePool};
 
+use crate::canon_color::ColorTable;
 use crate::rule::IntrRuleAC;
 use crate::theory::OpenProtoRule;
 
@@ -116,6 +117,17 @@ pub struct ProofContextShared {
     /// shared [`IntrRuleCache`] handle, so cloning the bundle shares the
     /// rule list instead of copying it.
     pub intruder_rules: IntrRuleCache,
+    /// The theory's vertex-coloring table for $\alphaeqac$
+    /// canonicalization ([`crate::canon_color`]) — built once here,
+    /// alongside `intruder_rules`, from this same `rules`/`intruder_rules`
+    /// pair (see [`ColorTable::build`]'s own doc comment for why it takes
+    /// `&[OpenProtoRule]` + `&IntrRuleCache` rather than `&Theory`: a
+    /// `ProofContext` is exactly the kind of caller that already has
+    /// both on hand). Reused across a whole proof search — every
+    /// `System` reached under this theory is colored with the SAME
+    /// table — rather than rebuilt per `canonicalize_constraint_system`
+    /// call.
+    pub color_table: ColorTable,
     /// Precomputed unique sources — for each fact tag with exactly
     /// one producing rule, we cache the producer name. Lets goal
     /// solving short-circuit candidate enumeration.
@@ -177,6 +189,7 @@ impl Clone for ProofContextShared {
         let state = *self.saturate_state.lock().unwrap();
         ProofContextShared {
             intruder_rules: self.intruder_rules.clone(),
+            color_table: self.color_table.clone(),
             unique_sources: self.unique_sources.clone(),
             is_diff: self.is_diff,
             full_sources: self.full_sources.clone(),
@@ -1125,6 +1138,12 @@ impl ProofContext {
             .iter()
             .filter(|r| crate::rule::is_destr_rule_info(&r.info))
             .all(|r| crate::rule::is_subterm_rule_info(&r.info));
+        // Built here, once per theory load, from the SAME `rules`/
+        // `intruder_rules` this context itself is about to own -- see
+        // `ColorTable::build`'s own doc comment for why it takes
+        // `&[OpenProtoRule]` + `&IntrRuleCache` rather than `&Theory`.
+        // Must happen before `rules` moves into the struct literal below.
+        let color_table = ColorTable::build(&rules, &intruder_rules);
         let mut ctx = ProofContext {
             maude,
             maude_pool,
@@ -1139,6 +1158,7 @@ impl ProofContext {
             theory_file: String::new(),
             shared: std::sync::Arc::new(ProofContextShared {
                 intruder_rules,
+                color_table,
                 unique_sources: Vec::new(),
                 is_diff: false,
                 full_sources: Vec::new(),

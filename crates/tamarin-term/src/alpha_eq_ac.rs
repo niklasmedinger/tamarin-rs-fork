@@ -1039,7 +1039,30 @@ fn canonical_name(sort: LSort, idx: u64) -> Name {
 
 /// Applies a literal-to-literal renaming to `t`, rebuilding through the
 /// term's smart constructors ([`f_app`]) so the result stays in `CAN_AC`
-/// normal form. Literals outside `ren`'s domain are left unchanged.
+/// normal form.
+///
+/// **Panics if `t` mentions a literal outside `ren`'s domain.** Every
+/// caller of this function -- [`Canonizer::canonize`] itself (above, once
+/// `next_literals` has run to exhaustion, so `ren` is exhaustive over
+/// every literal `t` contains by construction) and
+/// `tamarin_theory::canon`'s Stage G rewrites (`eq_store.subst`'s range,
+/// `subterm_store`'s pairs) -- runs strictly AFTER the graph part (plus,
+/// as of the goals-canonicalization work, every `Goal`) has already
+/// discovered and canonized every literal the system can legitimately
+/// contain, via `work.tex`'s own guardedness argument: everything past
+/// that point is read-only against an already-exhaustive `theta`.
+/// Silently passing an uncovered literal through used to look like a
+/// harmless fallback, but it is exactly the shape of bug this crate's
+/// canonicalization is built to catch loudly rather than hide: a
+/// literal that reaches here uncovered means some earlier stage failed
+/// to discover real system content (the `sys.goals` gap this comment was
+/// added for — a `Goal`'s own term was never being canonized until the
+/// graph part learned to fold every `Goal` in, exactly the kind of
+/// silent gap that would otherwise let two NON-alpha-equivalent systems
+/// canonicalize identically). A raw pass-through would leave that
+/// literal's ORIGINAL, un-canonicalized identity leaking into the
+/// "canonical" result -- unsound, and silently so. Panicking turns a
+/// silent soundness gap into a loud, immediately-diagnosable crash.
 ///
 /// `pub`, not `pub(crate)`: `tamarin_theory::canon`'s whole-system assembly
 /// (Stage G) reuses this directly for `eq_store.subst`'s range rewrite
@@ -1047,7 +1070,15 @@ fn canonical_name(sort: LSort, idx: u64) -> Name {
 /// from this one, so `pub(crate)` would not have been visible there.
 pub fn apply_literal_renaming(t: &LNTerm, ren: &BTreeMap<LNLit, LNLit>) -> LNTerm {
     match t {
-        Term::Lit(l) => Term::Lit(*ren.get(l).unwrap_or(l)),
+        Term::Lit(l) => Term::Lit(*ren.get(l).unwrap_or_else(|| {
+            panic!(
+                "apply_literal_renaming: literal {l:?} is not covered by the renaming -- \
+                 every literal reaching this point should already be exhaustively covered \
+                 (see this function's own doc comment); an uncovered literal here means an \
+                 earlier stage failed to discover real system content, not that a fallback \
+                 is needed"
+            )
+        })),
         Term::App(sym, args) => {
             let mapped: Vec<LNTerm> = args
                 .iter()

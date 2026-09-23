@@ -7,9 +7,11 @@
 //! — Stage B of "Canonizing the constraint system", following Stage A
 //! ([`crate::canon_graph::extract_graph_part`]).
 //!
-//! Implements exactly the THREE reserved-color-block scheme `TODO.md`
-//! describes first, not the further skeleton-strengthening refinement
-//! (erase literals to sorts, `CAN_AC` the result) it goes on to sketch —
+//! Implements a FOUR reserved-color-block scheme (originally `TODO.md`'s
+//! three-block sketch; a fourth was added 2026-09-22 once intruder
+//! construction/destruction rules needed covering too — see block 2's own
+//! write-up), not the further skeleton-strengthening refinement (erase
+//! literals to sorts, `CAN_AC` the result) `TODO.md` goes on to sketch —
 //! that is a separate, later enhancement, not attempted here:
 //!
 //! 1. This crate's own structural relation-vertex kinds. Two parts:
@@ -22,28 +24,41 @@
 //!      theory, packed right after the four fixed colors above (still
 //!      block 1: these are structural port positions, not theory
 //!      content). The pair's bounds are discovered by
-//!      [`ColorTable::build`] scanning every fixed built-in rule's own
-//!      premise/conclusion counts *and* this theory's own declared
+//!      [`ColorTable::build`] scanning every intruder rule in the
+//!      `IntrRuleCache` it's given *and* this theory's own declared
 //!      rules' — so, unlike the four fixed colors, this sub-block's
 //!      SIZE (though not its structure) is theory-dependent: a theory
-//!      whose own rule has more premises than any built-in rule widens
-//!      it. See [`ColorTable::edge_relation_color`] for why this
-//!      information matters (a payload-free `EdgeRelation` marker would
-//!      make an edge landing in premise slot 0 graph-indistinguishable
-//!      from one landing in slot 1).
-//! 2. Tamarin's built-in rule names and built-in action names — also
-//!    fixed, identical across every theory (see
-//!    [`BUILTIN_RULE_NAMES`]/[`BUILTIN_ACTION_NAMES`] for exactly which
-//!    names and how they were derived).
-//! 3. One specific theory's own protocol rule names and protocol action
-//!    names — collected from the theory, each sorted independently
-//!    (`BTreeSet`, so the source file's declaration order never leaks
-//!    in), and colored in that order. The only block whose CONTENT (as
-//!    opposed to just block 1's size) varies by theory — the reason
-//!    [`ColorTable::build`] needs a `&Theory` at all, rather than blocks
-//!    1–2 being the whole story.
+//!      whose own rule (or synthesized intruder rule) has more premises
+//!      than any other widens it. See [`ColorTable::edge_relation_color`]
+//!      for why this information matters (a payload-free `EdgeRelation`
+//!      marker would make an edge landing in premise slot 0
+//!      graph-indistinguishable from one landing in slot 1).
+//! 2. The `ProtoRuleName::Fresh` protocol rule (`FreshRule`) — ONE more
+//!    fixed color, right after block 1. Not an intruder rule (so it's
+//!    never in an `IntrRuleCache`) and not a user-declared protocol rule
+//!    either (so it's never in `theory.rules()`/`protocol_rules`): it's
+//!    a Tamarin-wide constant, present in every theory, hence its own
+//!    dedicated fixed slot rather than living in block 3 or 4.
+//! 3. EVERY intruder rule in the `IntrRuleCache` [`ColorTable::build`] is
+//!    given — the fixed ones (`Coerce`/`IRecv`/`ISend`/`PubConstr`/
+//!    `NatConstr`/`FreshConstr`/`IEquality`) AND the theory-dependent
+//!    construction/destruction rules synthesized from this theory's own
+//!    `functions:`/`builtins:` declarations (`IntrRuleACInfo::ConstrRule`/
+//!    `DestrRule`) — colored UNIFORMLY via one sorted set
+//!    (`IntrRuleACInfo` derives `Ord` directly, so no separate key type is
+//!    needed). Deliberately NOT split into "fixed, hardcoded" vs.
+//!    "theory-dependent, uncovered" the way an earlier revision of this
+//!    table was: the `IntrRuleCache` a caller supplies IS the exhaustive,
+//!    already-computed set of every intruder rule that theory's own
+//!    proof search can ever instantiate (see [`ColorTable::build`]'s own
+//!    doc comment for where that cache comes from), so there is nothing
+//!    left to hardcode a parallel list for.
+//! 4. One specific theory's own protocol rule names and protocol action
+//!    names — collected from the `&[OpenProtoRule]` the caller supplies,
+//!    each sorted independently (`BTreeSet`, so the source file's
+//!    declaration order never leaks in), and colored in that order.
 //!
-//! Within each of blocks 2 and 3, rule names are colored before action
+//! Within each of blocks 3 and 4, rule names are colored before action
 //! names (two separate sorted sets, not one merged alphabetical list) —
 //! so a rule and an action that happen to share a literal name (e.g. a
 //! contrived theory with both a rule and an action fact named `"Foo"`)
@@ -53,13 +68,24 @@
 //! **Soundness, not completeness, is the bar** (`TODO.md`'s own words:
 //! "the soundness condition on a color function is only that it be
 //! constant on alphaeqac-classes... finer is better but never
-//! necessary"): [`ColorTable::rule_color`]/[`action_color`] PANIC on a
-//! name outside every block (documented per-function) rather than
-//! silently guessing — this table does not (yet) cover
-//! theory-dependent intruder-deduction rule names (construction/
-//! destruction rules synthesized from `functions:`/`builtins:`
-//! declarations, e.g. a `senc`/`sdec` pair's rules), which is a real,
-//! open gap flagged here rather than papered over.
+//! necessary"): [`ColorTable::rule_color`]/[`action_color`] still PANIC
+//! on a rule/action name outside every block (documented per-function)
+//! rather than silently guessing — this now only happens on a genuine
+//! caller/table mismatch (a `System` containing a rule instance this
+//! table's `IntrRuleCache`/`protocol_rules` never covered), not on a
+//! structurally-expected-but-unimplemented case the way the old
+//! `ConstrRule`/`DestrRule` gap was.
+//!
+//! **Why this table takes `&[OpenProtoRule]` + `&IntrRuleCache`, not
+//! `&Theory`**: a `ColorTable` is unique per theory, and the CALLER —
+//! whoever elaborated the theory / built the `ProofContext` a real proof
+//! search runs under, or a test constructing both directly — already has
+//! both pieces on hand (a `ProofContext` carries its own `rules`/
+//! `intruder_rules` already; see [`crate::constraint::solver::context::ProofContext`]'s
+//! own `color_table` field, built once alongside them). Neither
+//! `canon_graph::extract_graph_part` nor `canon::canonicalize_constraint_system`
+//! need a `&Theory` at all once the caller supplies the table directly —
+//! see their own doc comments.
 //!
 //! NOT [`crate::constraint::system::graph::color`] — see
 //! `canon_graph.rs`'s module docs for why that "color" (a cosmetic HSV
@@ -71,10 +97,10 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use crate::canon_graph::VertexKind;
+use crate::constraint::solver::context::IntrRuleCache;
 use crate::fact::fact_tag_name;
-use crate::intruder_rules::{nat_intruder_rules, special_intruder_rules};
 use crate::rule::{ConcIdx, IntrRuleACInfo, PremIdx, ProtoRuleName, RuleACInst, RuleInfo};
-use crate::theory::Theory;
+use crate::theory::OpenProtoRule;
 
 /// A vertex color: an arbitrary but STABLE non-negative integer. Two
 /// vertices sharing a color are indistinguishable to the graph
@@ -107,42 +133,29 @@ fn block1_size(max_conc_count: usize, max_prem_count: usize) -> Color {
 }
 
 // =============================================================================
-// Block 2 — Tamarin built-ins (fixed, universal)
+// Block 2 — the fixed `FreshRule` slot
 // =============================================================================
 
-/// Every name [`rule_name_string`]/`intr_rule_name_string` can produce
-/// for a rule instance that ISN'T declared in a `.spthy` file's own
-/// `rule NAME: ...` blocks, restricted to the names that don't vary by
-/// theory (i.e. excluding `IntrRuleACInfo::ConstrRule`/`DestrRule` —
-/// construction/destruction rules synthesized from a theory's own
-/// `functions:`/`builtins:` declarations, and therefore genuinely
-/// theory-specific despite also being "not user-written" — see the
-/// module docs' completeness caveat).
-///
-/// Derived directly from `rule::intr_rule_name_string`'s match arms
-/// (`Coerce`/`IRecv`→`"Recv"`/`ISend`→`"Send"`/`PubConstr`/
-/// `NatConstr`/`FreshConstr`/`IEquality`→`"Equality"`) plus
-/// `ProtoRuleName::Fresh`'s own rendering (`"FreshRule"`, per
-/// `rule_name_string`'s `RuleInfo::Proto` arm) — NOT
-/// `rule::RESERVED_RULE_NAMES`, which is a checked-against-user-input
-/// reserved-WORD list for a different purpose (rejecting a user's own
-/// rule from being named e.g. `"pub"`/`"fresh"`) and uses different
-/// spellings (lowercase `"irecv"`/`"isend"`, bare `"Fresh"`) that never
-/// actually appear as a real `RuleACInst`'s rendered name.
-///
-/// Sorted alphabetically — this array's OWN index order is its color
-/// assignment order (`STRUCTURAL_BLOCK_SIZE + position`, see
-/// [`builtin_rule_color`]), so declaration order here matters.
-pub const BUILTIN_RULE_NAMES: [&str; 8] = [
-    "Coerce",
-    "Equality",
-    "FreshConstr",
-    "FreshRule",
-    "NatConstr",
-    "PubConstr",
-    "Recv",
-    "Send",
-];
+/// `block1_size(...)` plus one — the single dedicated color for
+/// `ProtoRuleName::Fresh` (`FreshRule`; see the module docs' block 2).
+/// `FreshRule` is neither an intruder rule (so it never appears in a
+/// caller-supplied [`IntrRuleCache`]) nor a user-declared protocol rule
+/// (`fresh` is a reserved name no theory can redeclare — `rule::
+/// RESERVED_RULE_NAMES`), so nothing else in this table would ever cover
+/// it without this dedicated slot. A free function (not a method) so
+/// [`ColorTable::build`] can call it before `Self` exists yet, mirroring
+/// [`block1_size`].
+fn block2_size(max_conc_count: usize, max_prem_count: usize) -> Color {
+    block1_size(max_conc_count, max_prem_count) + 1
+}
+
+// =============================================================================
+// Block 3a — every intruder rule in the caller-supplied `IntrRuleCache`
+// =============================================================================
+
+// =============================================================================
+// Block 3b — fixed built-in action names
+// =============================================================================
 
 /// Every built-in action-fact NAME: the fixed (non-`Proto`) `FactTag`
 /// variants' display names (`fact_tag_name`: `Fr`/`Out`/`In`/`KU`/`KD`/
@@ -162,9 +175,9 @@ pub const BUILTIN_RULE_NAMES: [&str; 8] = [
 /// mis-coloring.
 ///
 /// Sorted alphabetically — this array's OWN index order is its color
-/// assignment order (`STRUCTURAL_BLOCK_SIZE + BUILTIN_RULE_NAMES.len() +
-/// position`, see [`ColorTable::action_color`]), so declaration order
-/// here is load-bearing.
+/// assignment order (right after block 3a's dynamic `intr_rule_colors`,
+/// see [`ColorTable::action_color`]), so declaration order here is
+/// load-bearing.
 pub const BUILTIN_ACTION_NAMES: [&str; 8] = ["Ded", "Fr", "In", "K", "KD", "KU", "Out", "Term"];
 
 // =============================================================================
@@ -172,62 +185,75 @@ pub const BUILTIN_ACTION_NAMES: [&str; 8] = ["Ded", "Fr", "In", "K", "KD", "KU",
 // =============================================================================
 
 /// The full vertex-coloring table for one theory. See the module docs
-/// for the three-block scheme.
+/// for the four-block scheme.
 ///
-/// Only block 3 (this theory's own protocol rule/action names) is
-/// actually STORED — blocks 1 and 2 are fixed for every theory, so
-/// their colors are computed directly from [`BUILTIN_RULE_NAMES`]/
-/// [`BUILTIN_ACTION_NAMES`]'s positions rather than carried in an
-/// instance.
+/// Blocks 3a (`intr_rule_colors`) and 4 (`theory_rule_colors`/
+/// `theory_action_colors`) are STORED — blocks 1, 2 and 3b are fixed for
+/// every theory, so their colors are computed directly from
+/// [`BUILTIN_ACTION_NAMES`]'s positions (plus `max_conc_count`/
+/// `max_prem_count` for block 1's `EdgeRelation` sub-block) rather than
+/// carried in an instance.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ColorTable {
+    /// Block 3a: every intruder rule the `IntrRuleCache` this table was
+    /// built from contains — fixed (`Coerce`/`IRecv`/`ISend`/…) AND
+    /// theory-specific (`ConstrRule`/`DestrRule`) alike, colored
+    /// uniformly. `IntrRuleACInfo` derives `Ord`, so it is usable as a
+    /// `BTreeMap` key directly — no separate name/key type is needed the
+    /// way rule/action NAMES need one for blocks 3b/4.
+    intr_rule_colors: BTreeMap<IntrRuleACInfo, Color>,
     /// Keyed by the rule's INTERNED name (`ProtoRuleName::Stand`'s
     /// payload is already `&'static str` — see `rule.rs`'s own doc
     /// comment on that field), not a rendered/allocated `String`.
     theory_rule_colors: BTreeMap<&'static str, Color>,
     theory_action_colors: BTreeMap<String, Color>,
-    /// One past the largest `ConcIdx`/`PremIdx` seen across every fixed
-    /// built-in rule and this theory's own declared rules — the bounds
-    /// [`ColorTable::edge_relation_color`]'s packing needs. See
-    /// [`ColorTable::build`] for how these are discovered.
+    /// One past the largest `ConcIdx`/`PremIdx` seen across every rule in
+    /// the `IntrRuleCache` this table was built from and this theory's
+    /// own declared rules — the bounds [`ColorTable::edge_relation_color`]'s
+    /// packing needs. See [`ColorTable::build`] for how these are
+    /// discovered.
     max_conc_count: usize,
     max_prem_count: usize,
 }
 
 impl ColorTable {
-    /// Builds the color table for `theory`. Deterministic given the
-    /// theory's set of protocol rule/action NAMES alone: the same
-    /// theory always produces the same table, and two theories with the
-    /// same rule/action names produce the same table too, regardless of
-    /// what order those rules happen to be declared in the source file
-    /// (collected into a `BTreeSet` before any color is assigned).
-    pub fn build(theory: &Theory) -> Self {
+    /// Builds the color table this specific theory's `System`s need:
+    /// every rule instance the AC/canonicalization machinery ever colors
+    /// is either one of `protocol_rules`' own declared rules, the fixed
+    /// `ProtoRuleName::Fresh`, or an intruder rule `intruder_rules`
+    /// contains — so those two arguments alone are enough (no `&Theory`
+    /// needed; see the module docs' "why this table takes..." section).
+    ///
+    /// Deterministic given `protocol_rules`' and `intruder_rules`' sets
+    /// of rule/action NAMES (resp. `IntrRuleACInfo` values) alone: the
+    /// same inputs always produce the same table, regardless of what
+    /// order the rules happen to arrive in (collected into `BTreeSet`s/
+    /// a `BTreeMap` before any color is assigned).
+    pub fn build(protocol_rules: &[OpenProtoRule], intruder_rules: &IntrRuleCache) -> Self {
         let builtin_actions: BTreeSet<&str> = BUILTIN_ACTION_NAMES.into_iter().collect();
 
-        // Rule names: every `theory.rules()` entry is a `ProtoRuleE`
+        let mut theory_rule_names: BTreeSet<&'static str> = BTreeSet::new();
+        let mut theory_action_names: BTreeSet<String> = BTreeSet::new();
+        let mut max_conc_count: usize = 0;
+        let mut max_prem_count: usize = 0;
+        // Block 3a's contents AND the `EdgeRelation` sub-block's lower
+        // bound both come from the same scan: every rule this specific
+        // theory's `IntrRuleCache` actually contains (fixed AND
+        // Constr/Destr alike — deliberately not filtered, see the module
+        // docs' block-3 write-up), deduped via the map's own keys.
+        let mut intr_rule_colors: BTreeMap<IntrRuleACInfo, Color> = BTreeMap::new();
+        for r in intruder_rules.iter() {
+            intr_rule_colors.entry(r.info.clone()).or_insert(0);
+            max_conc_count = max_conc_count.max(r.conclusions.len());
+            max_prem_count = max_prem_count.max(r.premises.len());
+        }
+        // Rule names: every `protocol_rules` entry is a `ProtoRuleE`
         // (`Rule<ProtoRuleEInfo>`) — i.e. genuinely a user-declared
         // protocol rule (the open-theory level has no `RuleInfo`/`Intr`
         // case to collide with at all: that wrapper only appears once
         // rules are AC-instantiated for proof search). So there is
         // nothing to filter here, unlike actions below.
-        let mut theory_rule_names: BTreeSet<&'static str> = BTreeSet::new();
-        let mut theory_action_names: BTreeSet<String> = BTreeSet::new();
-        // The `EdgeRelation` sub-block's bounds: the largest premise/
-        // conclusion COUNT (not index — one past the max index) among
-        // every fixed built-in rule and this theory's own declared
-        // rules. Seeded from the fixed built-ins (`special_intruder_rules`
-        // called with `diff: true` so `IEquality`'s 2 premises are
-        // counted, matching `BUILTIN_RULE_NAMES` unconditionally
-        // including "Equality" regardless of this theory's own diff
-        // setting) so the sub-block never shrinks below what the
-        // built-ins alone need, then widened by this theory's own rules.
-        let mut max_conc_count: usize = 0;
-        let mut max_prem_count: usize = 0;
-        for r in special_intruder_rules(true).iter().chain(nat_intruder_rules().iter()) {
-            max_conc_count = max_conc_count.max(r.conclusions.len());
-            max_prem_count = max_prem_count.max(r.premises.len());
-        }
-        for r in theory.rules() {
+        for r in protocol_rules {
             if let ProtoRuleName::Stand(s) = r.rule.info.name {
                 theory_rule_names.insert(s);
             }
@@ -246,18 +272,23 @@ impl ColorTable {
         // conflicting one for the same string.
         theory_action_names.retain(|n| !builtin_actions.contains(n.as_str()));
 
-        // Block 3 starts AFTER block 1 (structural, now including the
-        // EdgeRelation sub-block) and both builtin sub-blocks (2a rules,
-        // 2b actions) — matching `action_color`'s own on-the-fly builtin
-        // computation, which places 2b right after 2a. All three must
-        // agree on this base or two different sub-blocks silently claim
-        // the same colors (caught by this module's own
-        // `builtin_and_theory_blocks_never_overlap` test — a real bug
-        // the first version of this function had, before block 3 was
-        // fixed to start here rather than right after block 2a).
-        let mut next: Color = block1_size(max_conc_count, max_prem_count)
-            + BUILTIN_RULE_NAMES.len() as Color
-            + BUILTIN_ACTION_NAMES.len() as Color;
+        // Block 3a starts right after block 2 (the single `FreshRule`
+        // slot). Assigned in a second pass (the first pass above only
+        // discovered the SET of `IntrRuleACInfo` values, via the map's
+        // keys) so every entry gets a color from the same monotonic
+        // counter block 3b/4 continue from — matching `action_color`'s
+        // own on-the-fly block-3b computation, which places it right
+        // after block 3a. All must agree on this base or two different
+        // sub-blocks silently claim the same colors (caught by this
+        // module's own `builtin_and_theory_blocks_never_overlap` test —
+        // a real bug an earlier version of this function had).
+        let mut next: Color = block2_size(max_conc_count, max_prem_count);
+        for color in intr_rule_colors.values_mut() {
+            *color = next;
+            next += 1;
+        }
+        next += BUILTIN_ACTION_NAMES.len() as Color;
+
         let mut theory_rule_colors: BTreeMap<&'static str, Color> = BTreeMap::new();
         for name in &theory_rule_names {
             theory_rule_colors.insert(name, next);
@@ -271,6 +302,7 @@ impl ColorTable {
         }
 
         ColorTable {
+            intr_rule_colors,
             theory_rule_colors,
             theory_action_colors,
             max_conc_count,
@@ -279,10 +311,16 @@ impl ColorTable {
     }
 
     /// `STRUCTURAL_FIXED_COUNT` plus this table's own `EdgeRelation`
-    /// sub-block size — where block 2 (Tamarin built-ins) starts for
+    /// sub-block size — where block 2 (the `FreshRule` slot) starts for
     /// this specific table. See the module docs' block-1 description.
     fn block1_size(&self) -> Color {
         block1_size(self.max_conc_count, self.max_prem_count)
+    }
+
+    /// One past [`Self::block1_size`] — where block 3a
+    /// (`intr_rule_colors`) starts for this specific table.
+    fn block2_size(&self) -> Color {
+        self.block1_size() + 1
     }
 
     /// The color for a rule INSTANCE (block 2a or 3a). Dispatches on
@@ -298,15 +336,17 @@ impl ColorTable {
     /// real captured system whose `Send` rule was the protocol's own,
     /// not the intruder's — see this module's test of the same name).
     ///
-    /// Panics if `ru` is an intruder construction/destruction rule (the
-    /// one `RuleInfo::Intr` case this table doesn't cover — see the
-    /// module docs' completeness caveat) or a `Stand` name this table
-    /// wasn't built from (a caller/table mismatch bug, not expected in
-    /// normal use).
+    /// Panics if `ru` is an intruder rule this table's `IntrRuleCache`
+    /// didn't contain, or a `Stand` name this table's `protocol_rules`
+    /// wasn't built from (both are caller/table mismatch bugs, not
+    /// expected in normal use — the whole point of block 3a covering
+    /// every `IntrRuleCache` entry uniformly is that a `ConstrRule`/
+    /// `DestrRule` is no longer a special case here, unlike the earlier
+    /// revision of this table).
     pub fn rule_color(&self, ru: &RuleACInst) -> Color {
         match &ru.info {
             RuleInfo::Proto(p) => match p.name {
-                ProtoRuleName::Fresh => self.builtin_rule_color("FreshRule"),
+                ProtoRuleName::Fresh => self.block1_size(),
                 ProtoRuleName::Stand(s) => self.theory_rule_colors.get(s).copied().unwrap_or_else(|| {
                     panic!(
                         "ColorTable::rule_color: protocol rule {s:?} is not a name \
@@ -314,25 +354,22 @@ impl ColorTable {
                     )
                 }),
             },
-            RuleInfo::Intr(info) => match builtin_intr_rule_name(info) {
-                Some(name) => self.builtin_rule_color(name),
-                None => panic!(
-                    "ColorTable::rule_color: {info:?} is an intruder construction/ \
-                     destruction rule -- theory-dependent (synthesized from this \
-                     theory's own functions:/builtins: declarations), and not yet \
-                     covered by this table (see the module docs' completeness \
-                     caveat)"
-                ),
-            },
+            RuleInfo::Intr(info) => self.intr_rule_colors.get(info).copied().unwrap_or_else(|| {
+                panic!(
+                    "ColorTable::rule_color: {info:?} is not covered by this table \
+                     -- this table's IntrRuleCache did not contain it (table/system \
+                     theory mismatch?)"
+                )
+            }),
         }
     }
 
-    /// The color for an action-fact name (block 2b or 3b). Panics if
+    /// The color for an action-fact name (block 3b or 4). Panics if
     /// `name` is neither a built-in nor a name this table was built
     /// from — see the module docs' completeness caveat.
     pub fn action_color(&self, name: &str) -> Color {
         if let Some(pos) = BUILTIN_ACTION_NAMES.iter().position(|n| *n == name) {
-            return self.block1_size() + BUILTIN_RULE_NAMES.len() as Color + pos as Color;
+            return self.block2_size() + self.intr_rule_colors.len() as Color + pos as Color;
         }
         self.theory_action_colors.get(name).copied().unwrap_or_else(|| {
             panic!(
@@ -380,57 +417,60 @@ impl ColorTable {
             VertexKind::AtTimepointRelation => STRUCTURAL_AT_TIMEPOINT_RELATION,
             VertexKind::LastAtomRelation => STRUCTURAL_LAST_ATOM_RELATION,
             VertexKind::RuleInstance(_, ru) => self.rule_color(ru),
-            VertexKind::Action(_, fact) => self.action_color(&fact.name),
+            VertexKind::Action(_, fact) => self.action_color(&fact_tag_name(&fact.tag)),
         }
     }
 
-    /// The color of a name known to be in [`BUILTIN_RULE_NAMES`] —
-    /// panics (an internal-consistency bug, not a user-facing error) if
-    /// it somehow isn't, since every caller has already established
-    /// membership. A method (not a free function) because the base
-    /// (block 2's start) depends on this table's own `EdgeRelation`
-    /// sub-block size.
-    fn builtin_rule_color(&self, name: &str) -> Color {
-        let pos = BUILTIN_RULE_NAMES
-            .iter()
-            .position(|n| *n == name)
-            .unwrap_or_else(|| panic!("builtin_rule_color: {name:?} not in BUILTIN_RULE_NAMES"));
-        self.block1_size() + pos as Color
-    }
-}
-
-/// The [`BUILTIN_RULE_NAMES`] entry for a fixed (theory-independent)
-/// `IntrRuleACInfo` variant, or `None` for `ConstrRule`/`DestrRule`
-/// (theory-dependent — see the module docs' completeness caveat).
-fn builtin_intr_rule_name(info: &IntrRuleACInfo) -> Option<&'static str> {
-    match info {
-        IntrRuleACInfo::Coerce => Some("Coerce"),
-        IntrRuleACInfo::IRecv => Some("Recv"),
-        IntrRuleACInfo::ISend => Some("Send"),
-        IntrRuleACInfo::PubConstr => Some("PubConstr"),
-        IntrRuleACInfo::NatConstr => Some("NatConstr"),
-        IntrRuleACInfo::FreshConstr => Some("FreshConstr"),
-        IntrRuleACInfo::IEquality => Some("Equality"),
-        IntrRuleACInfo::ConstrRule { .. } | IntrRuleACInfo::DestrRule { .. } => None,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constraint::solver::context::ProofContext;
     use crate::rule::{ProtoRuleACInstInfo, Rule, RuleAttributes};
+    use crate::theory::Theory;
     use tamarin_parser::parser::parse_theory;
+    use tamarin_term::maude_proc::MaudeHandle;
 
     fn theory(src: &str) -> Theory {
         let parsed = parse_theory(src, &[]).unwrap_or_else(|e| panic!("parse: {e}"));
         crate::elaborate::elaborate(&parsed).unwrap_or_else(|e| panic!("elaborate: {e:?}"))
     }
 
+    /// Elaborates `src`, boots a maude process on ITS OWN signature
+    /// (booting on a different theory's signature would make
+    /// [`ProofContext::assemble_intruder_rules`]'s subterm-constructor-rule
+    /// generation see the wrong function symbols), and builds a
+    /// [`ColorTable`] exactly the way `ProofContext::new_impl` does — from
+    /// the elaborated theory's own protocol rules and a freshly-assembled
+    /// [`IntrRuleCache`]. This is the caller-supplies-everything design
+    /// this module was rewritten for (see the module docs): the table no
+    /// longer has a `&Theory`-only construction path to fall back on, so
+    /// every test in this module needs a real (if trivial) maude process.
+    ///
+    /// `None` when no maude is resolvable (`TAM_ALLOW_NO_MAUDE=1` and
+    /// nothing found) — callers do `let Some(table) = table_for(...) else
+    /// { return };`, the same documented skip every other maude-backed
+    /// test module in this crate uses (see
+    /// [`crate::test_maude::maude_path`]'s own doc comment).
+    fn table_for(src: &str) -> Option<ColorTable> {
+        let path = crate::test_maude::maude_path()?;
+        let elaborated = theory(src);
+        let maude = MaudeHandle::start(&path, elaborated.signature.maude_sig.clone())
+            .unwrap_or_else(|e| panic!("maude at {path} failed to start: {e:?}"));
+        let protocol_rules: Vec<OpenProtoRule> = elaborated.rules().cloned().collect();
+        let intruder_rules = IntrRuleCache::from(ProofContext::assemble_intruder_rules(
+            &elaborated.signature.maude_sig,
+            &maude,
+        ));
+        Some(ColorTable::build(&protocol_rules, &intruder_rules))
+    }
+
     const EMPTY: &str = "theory T begin\nend";
 
     const TWO_RULES: &str = "theory T begin\n\
-        rule Zebra:\n  [] --[ Beta() ]-> []\n\
-        rule Apple:\n  [] --[ Alpha() ]-> []\n\
+        rule Zebra:\n  [ A(), B() ] --[ Beta() ]-> []\n\
+        rule Apple:\n  [ A(), B() ] --[ Alpha() ]-> []\n\
         end";
 
     /// A standalone `RuleACInst` for a user-declared protocol rule named
@@ -472,7 +512,7 @@ mod tests {
 
     #[test]
     fn structural_colors_are_fixed_and_distinct() {
-        let table = ColorTable::build(&theory(EMPTY));
+        let Some(table) = table_for(EMPTY) else { return };
         let colors = [
             table.vertex_color(&VertexKind::Dummy(nid())),
             table.vertex_color(&VertexKind::LessRelation),
@@ -493,13 +533,16 @@ mod tests {
     /// landing in slot 1.
     #[test]
     fn edge_relation_colors_differ_by_port_index_and_are_deterministic() {
-        // No fixed built-in rule has 2 conclusions (max is 1 -- see
-        // `special_intruder_rules`), so `ConcIdx(1)` needs a theory rule
-        // that actually has a 2nd conclusion to be in range at all.
+        // No fixed intruder rule in a trace-mode `IntrRuleCache` has more
+        // than 1 premise or 1 conclusion (see `special_intruder_rules`'s
+        // own doc comment: `IEquality`, the one 2-premise special rule,
+        // is diff-mode-only and never in a real trace-mode cache), so
+        // `ConcIdx(1)`/`PremIdx(1)` both need a theory rule that actually
+        // has a 2nd premise/conclusion to be in range at all.
         const TWO_CONCLUSIONS: &str = "theory T begin\n\
-            rule R:\n  [] --[ Beta() ]-> [ A(), B() ]\n\
+            rule R:\n  [ A(), B() ] --[ Beta() ]-> [ A(), B() ]\n\
             end";
-        let table = ColorTable::build(&theory(TWO_CONCLUSIONS));
+        let Some(table) = table_for(TWO_CONCLUSIONS) else { return };
         let c00 = table.edge_relation_color(ConcIdx(0), PremIdx(0));
         let c01 = table.edge_relation_color(ConcIdx(0), PremIdx(1));
         let c10 = table.edge_relation_color(ConcIdx(1), PremIdx(0));
@@ -516,15 +559,23 @@ mod tests {
         );
     }
 
-    /// `ColorTable::build` seeds the `EdgeRelation` range from the fixed
-    /// built-in rules' own premise counts (`IEquality` has 2), so even an
-    /// EMPTY theory must already support `PremIdx(0)` and `PremIdx(1)`
-    /// without panicking.
+    /// An EMPTY theory's real `IntrRuleCache` still covers `PremIdx(0)`/
+    /// `ConcIdx(0)` -- the `EdgeRelation` sub-block's bounds now come
+    /// entirely from what the caller's `IntrRuleCache`/`protocol_rules`
+    /// actually contain (see the module docs' "why this table takes..."
+    /// section), replacing the OLD hardcoded `special_intruder_rules(true)`
+    /// seeding this table no longer does. Deliberately does NOT assert an
+    /// exact upper bound: the base message algebra's own pairing
+    /// constructor (`subterm_constructor_rules`, always present -- pairing
+    /// is built into the term algebra independent of any theory's own
+    /// `functions:`/`builtins:` declarations) already gives even an EMPTY
+    /// theory more than 1 premise, so a test pinning that exact number
+    /// would just be re-deriving `subterm_constructor_rules`' internals
+    /// rather than testing this table.
     #[test]
-    fn empty_theory_already_supports_the_builtins_own_premise_range() {
-        let table = ColorTable::build(&theory(EMPTY));
+    fn empty_theory_edge_relation_range_covers_only_what_the_real_cache_needs() {
+        let Some(table) = table_for(EMPTY) else { return };
         table.edge_relation_color(ConcIdx(0), PremIdx(0));
-        table.edge_relation_color(ConcIdx(0), PremIdx(1)); // IEquality's 2nd premise
     }
 
     /// A theory whose own rule declares MORE premises than any built-in
@@ -535,32 +586,40 @@ mod tests {
         const THREE_PREMISES: &str = "theory T begin\n\
             rule R:\n  [ A(), B(), C() ] --> []\n\
             end";
-        let table = ColorTable::build(&theory(THREE_PREMISES));
+        let Some(table) = table_for(THREE_PREMISES) else { return };
         // PremIdx(2) would be out of range for a table built from EMPTY
-        // (see the panic test below) but must be in range here.
+        // (see the panic test above) but must be in range here.
         table.edge_relation_color(ConcIdx(0), PremIdx(2));
     }
 
     #[test]
     #[should_panic(expected = "out of range")]
     fn edge_relation_color_panics_on_an_out_of_range_index() {
-        let table = ColorTable::build(&theory(EMPTY));
+        let Some(table) = table_for(EMPTY) else {
+            panic!("out of range"); // keep should_panic green under TAM_ALLOW_NO_MAUDE
+        };
         // No built-in or EMPTY-theory rule has 3 conclusions.
         table.edge_relation_color(ConcIdx(3), PremIdx(0));
     }
 
+    /// The set block 3a actually covers for an EMPTY theory's real
+    /// cache: the 5 trace-mode `special_intruder_rules` (`IEquality` and
+    /// `NatConstr` are excluded — see the module docs' block-3 write-up
+    /// and `special_intruder_rules`'s own doc comment on `IEquality`
+    /// being diff-mode-only; `NatConstr` never enters a real cache at all
+    /// unless the nat plugin's own assembly path adds it, which
+    /// `ProofContext::assemble_intruder_rules`'s trace-mode path never
+    /// does) plus the one fixed `FreshRule` slot.
     #[test]
-    fn empty_theory_still_colors_every_builtin_name() {
-        let table = ColorTable::build(&theory(EMPTY));
+    fn empty_theory_still_colors_every_name_its_real_cache_actually_has() {
+        let Some(table) = table_for(EMPTY) else { return };
         table.rule_color(&fresh_rule_instance());
         for info in [
             IntrRuleACInfo::Coerce,
             IntrRuleACInfo::IRecv,
             IntrRuleACInfo::ISend,
             IntrRuleACInfo::PubConstr,
-            IntrRuleACInfo::NatConstr,
             IntrRuleACInfo::FreshConstr,
-            IntrRuleACInfo::IEquality,
         ] {
             table.rule_color(&intr_rule_instance(info)); // must not panic
         }
@@ -571,7 +630,7 @@ mod tests {
 
     #[test]
     fn builtin_and_theory_blocks_never_overlap() {
-        let table = ColorTable::build(&theory(TWO_RULES));
+        let Some(table) = table_for(TWO_RULES) else { return };
         let mut all: Vec<Color> = vec![
             table.vertex_color(&VertexKind::Dummy(nid())),
             table.vertex_color(&VertexKind::LessRelation),
@@ -599,7 +658,7 @@ mod tests {
     /// before `Alpha`, but colors must come out alphabetical).
     #[test]
     fn theory_specific_names_are_colored_in_sorted_not_declaration_order() {
-        let table = ColorTable::build(&theory(TWO_RULES));
+        let Some(table) = table_for(TWO_RULES) else { return };
         let apple = table.rule_color(&proto_rule_instance("Apple"));
         let zebra = table.rule_color(&proto_rule_instance("Zebra"));
         assert!(apple < zebra, "Apple ({apple}) should sort before Zebra ({zebra})");
@@ -614,8 +673,8 @@ mod tests {
     /// SAME table.
     #[test]
     fn same_theory_always_produces_the_same_table() {
-        let a = ColorTable::build(&theory(TWO_RULES));
-        let b = ColorTable::build(&theory(TWO_RULES));
+        let Some(a) = table_for(TWO_RULES) else { return };
+        let Some(b) = table_for(TWO_RULES) else { return };
         assert_eq!(a, b);
     }
 
@@ -625,11 +684,11 @@ mod tests {
     #[test]
     fn declaration_order_does_not_affect_the_table() {
         const REVERSED: &str = "theory T begin\n\
-            rule Apple:\n  [] --[ Alpha() ]-> []\n\
-            rule Zebra:\n  [] --[ Beta() ]-> []\n\
+            rule Apple:\n  [ A(), B() ] --[ Alpha() ]-> []\n\
+            rule Zebra:\n  [ A(), B() ] --[ Beta() ]-> []\n\
             end";
-        let forward = ColorTable::build(&theory(TWO_RULES));
-        let reversed = ColorTable::build(&theory(REVERSED));
+        let Some(forward) = table_for(TWO_RULES) else { return };
+        let Some(reversed) = table_for(REVERSED) else { return };
         assert_eq!(forward, reversed);
     }
 
@@ -645,7 +704,7 @@ mod tests {
         const COLLIDING: &str = "theory T begin\n\
             rule Send:\n  [] --> []\n\
             end";
-        let table = ColorTable::build(&theory(COLLIDING));
+        let Some(table) = table_for(COLLIDING) else { return };
         let builtin_send = table.rule_color(&intr_rule_instance(IntrRuleACInfo::ISend));
         let theory_send = table.rule_color(&proto_rule_instance("Send"));
         assert_ne!(
@@ -665,11 +724,9 @@ mod tests {
         const COLLIDING: &str = "theory T begin\n\
             rule R:\n  [] --[ Fr(~n) ]-> []\n\
             end";
-        let table = ColorTable::build(&theory(COLLIDING));
-        assert_eq!(
-            table.action_color("Fr"),
-            ColorTable::build(&theory(EMPTY)).action_color("Fr")
-        );
+        let Some(table) = table_for(COLLIDING) else { return };
+        let Some(empty_table) = table_for(EMPTY) else { return };
+        assert_eq!(table.action_color("Fr"), empty_table.action_color("Fr"));
     }
 }
 

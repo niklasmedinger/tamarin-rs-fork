@@ -531,7 +531,7 @@ mod tests {
         // relation -> tgt -- see `canon_graph`'s module docs), plus 1
         // LastAtomRelation marker vertex (last_atom = #i.2, a unary
         // relation contributing just 1 direct edge to its target).
-        let part = crate::canon_graph::extract_graph_part(&sys, &theory_declaring_create_and_receive());
+        let part = crate::canon_graph::extract_graph_part(&sys, &color_table_declaring_create_and_receive());
         use crate::canon_graph::VertexKind;
         let count = |pred: &dyn Fn(&VertexKind) -> bool| part.vertices.iter().filter(|v| pred(v)).count();
         assert_eq!(count(&|v| matches!(v, VertexKind::RuleInstance(_, _))), 2);
@@ -602,7 +602,7 @@ mod tests {
         let builtin_sys = system_from_json(&builtin_send).expect("builtin system_from_json");
         let protocol_sys = system_from_json(&protocol_send).expect("protocol system_from_json");
 
-        let theory = crate::canon_color::ColorTable::build(&theory_declaring_send());
+        let colors = color_table_declaring_send();
         let (_, builtin_ru) = &builtin_sys.nodes[0];
         let (_, protocol_ru) = &protocol_sys.nodes[0];
         assert!(matches!(builtin_ru.info, RuleInfo::Intr(IntrRuleACInfo::ISend)));
@@ -611,8 +611,8 @@ mod tests {
             RuleInfo::Proto(ref p) if matches!(p.name, ProtoRuleName::Stand(_))
         ));
         assert_ne!(
-            theory.rule_color(builtin_ru),
-            theory.rule_color(protocol_ru),
+            colors.rule_color(builtin_ru),
+            colors.rule_color(protocol_ru),
             "a built-in ISend node and a same-named protocol rule node must not collide"
         );
     }
@@ -670,36 +670,66 @@ mod tests {
         assert!(err.0.contains("ConstrRule"), "error should name the variant: {err}");
     }
 
-    /// A theory that itself declares a protocol rule literally named
-    /// `Send` -- the exact collision scenario `ColorTable::rule_color`'s
-    /// own tests (`canon_color.rs`) already validate the coloring logic
-    /// against; needed here too so `rule_color` has an entry for the
-    /// PROTOCOL `Send` to look up (a table built from an empty theory
-    /// would correctly panic on it — that's not the thing under test
-    /// here).
-    fn theory_declaring_send() -> crate::theory::Theory {
+    /// A `ColorTable` for a theory that itself declares a protocol rule
+    /// literally named `Send` -- the exact collision scenario
+    /// `ColorTable::rule_color`'s own tests (`canon_color.rs`) already
+    /// validate the coloring logic against; needed here too so
+    /// `rule_color` has an entry for the PROTOCOL `Send` to look up (a
+    /// table built from an empty theory would correctly panic on it —
+    /// that's not the thing under test here). Paired with the FIXED
+    /// special intruder rules (`special_intruder_rules`, no maude needed
+    /// — these never depend on a theory's own function symbols) so
+    /// `ISend` also has an entry, without needing a real maude process
+    /// just for this collision check.
+    fn color_table_declaring_send() -> crate::canon_color::ColorTable {
         let parsed = parse_theory("theory T begin\nrule Send:\n  [] --> []\nend", &[])
             .expect("parse theory declaring Send");
-        crate::elaborate::elaborate(&parsed).expect("elaborate theory declaring Send")
+        let elaborated = crate::elaborate::elaborate(&parsed).expect("elaborate theory declaring Send");
+        let protocol_rules: Vec<crate::theory::OpenProtoRule> =
+            elaborated.rules().cloned().collect();
+        crate::canon_color::ColorTable::build(
+            &protocol_rules,
+            &crate::constraint::solver::context::IntrRuleCache::from(
+                crate::intruder_rules::special_intruder_rules(false),
+            ),
+        )
     }
 
-    /// A theory matching [`sample_json`]'s own rule/action names — needed
-    /// so `ColorTable` (now built at `extract_graph_part` time, per
-    /// `canon_graph::GraphPart`'s own doc comment) has entries for
+    /// A `ColorTable` matching [`sample_json`]'s own rule/action names —
+    /// needed so `ColorTable` (now built at `extract_graph_part` time,
+    /// per `canon_graph::GraphPart`'s own doc comment) has entries for
     /// `"Create"`/`"Receive"` (protocol rules) and `"Recv"` (a protocol
     /// action, distinct from the built-in RULE name of the same
-    /// spelling — see `canon_color`'s own `BUILTIN_RULE_NAMES` vs.
-    /// `BUILTIN_ACTION_NAMES`, which never share a name).
-    fn theory_declaring_create_and_receive() -> crate::theory::Theory {
+    /// spelling — see `canon_color`'s own block 3a vs. `BUILTIN_ACTION_NAMES`,
+    /// which never share a name). An empty `IntrRuleCache` suffices: no
+    /// node in this test file's fixtures uses a `RuleInfo::Intr`
+    /// instance other than `color_table_declaring_send`'s own ISend
+    /// check above.
+    fn color_table_declaring_create_and_receive() -> crate::canon_color::ColorTable {
+        // Port counts (1 premise/1 conclusion on `Create`, 1 premise on
+        // `Receive`) match [`sample_json`]'s own nodes -- the
+        // `EdgeRelation` sub-block's bounds now come entirely from what
+        // the caller's rules/cache actually declare (no more artificial
+        // widening from hardcoded fixed-rule premise counts), so a
+        // theory template with FEWER ports than the real system's edges
+        // reference would make `edge_relation_color` panic as
+        // out-of-range (see `canon_color.rs`'s own module docs).
         let parsed = parse_theory(
             "theory T begin\n\
-             rule Create:\n  [] --> []\n\
-             rule Receive:\n  [] --[ Recv() ]-> []\n\
+             rule Create:\n  [ Fr(~n) ] --> [ Out(<m, ~n>) ]\n\
+             rule Receive:\n  [ In(x) ] --[ Recv(x) ]-> []\n\
              end",
             &[],
         )
         .expect("parse theory declaring Create/Receive");
-        crate::elaborate::elaborate(&parsed).expect("elaborate theory declaring Create/Receive")
+        let elaborated =
+            crate::elaborate::elaborate(&parsed).expect("elaborate theory declaring Create/Receive");
+        let protocol_rules: Vec<crate::theory::OpenProtoRule> =
+            elaborated.rules().cloned().collect();
+        crate::canon_color::ColorTable::build(
+            &protocol_rules,
+            &crate::constraint::solver::context::IntrRuleCache::from(Vec::new()),
+        )
     }
 }
 

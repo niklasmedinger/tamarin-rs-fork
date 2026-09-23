@@ -47,7 +47,9 @@
 use std::io::Read;
 
 use tamarin_parser::parser::parse_theory;
+use tamarin_theory::canon_color::ColorTable;
 use tamarin_theory::canon_graph::{extract_graph_part, to_graphviz};
+use tamarin_theory::constraint::solver::context::IntrRuleCache;
 use tamarin_theory::elaborate::{self, set_user_funs_for_theory};
 use tamarin_theory::system_import::system_from_json;
 
@@ -73,12 +75,26 @@ fn main() {
              or a builtins: block (see this example's module docs)."
         );
     }
-    // `extract_graph_part` needs the ELABORATED theory (not just the
-    // parsed AST `parsed_theory` above) to build its `GraphPart`'s own
-    // `ColorTable` -- see `canon_graph::GraphPart`'s doc comment.
+    // `extract_graph_part` needs a `ColorTable` for the ELABORATED theory
+    // (not just the parsed AST `parsed_theory` above) -- see
+    // `canon_graph::GraphPart`'s doc comment. Built from the theory's own
+    // declared rules plus the FIXED special intruder rules only (no
+    // maude process, keeping this dev tool's "no --theory needed for a
+    // simple dump" promise intact for the common case) -- a dump whose
+    // rule instances include a theory-specific Constr/Destr intruder
+    // rule (synthesized from a `functions:`/`builtins:` declaration)
+    // still isn't covered, same pre-existing limitation as before this
+    // tool's `ColorTable` construction was made caller-supplied (see
+    // `canon_color.rs`'s own "why this table takes..." doc section).
     let elaborated_theory = elaborate::elaborate(&parsed_theory).unwrap_or_else(|e| {
         die(&format!("failed to elaborate theory: {e}"));
     });
+    let protocol_rules: Vec<tamarin_theory::theory::OpenProtoRule> =
+        elaborated_theory.rules().cloned().collect();
+    let colors = ColorTable::build(
+        &protocol_rules,
+        &IntrRuleCache::from(tamarin_theory::intruder_rules::special_intruder_rules(false)),
+    );
 
     let json_text = match json_path.as_deref() {
         None | Some("-") => {
@@ -104,7 +120,7 @@ fn main() {
         std::process::exit(1);
     });
 
-    let part = extract_graph_part(&sys, &elaborated_theory);
+    let part = extract_graph_part(&sys, &colors);
     print!("{}", to_graphviz(&part));
 }
 

@@ -64,6 +64,7 @@ pub mod auto_sources;
 pub mod bliss_proc;
 pub mod canon;
 pub mod canon_color;
+pub mod canon_fingerprint;
 pub mod canon_graph;
 pub mod check_terms;
 pub mod close_rule;
