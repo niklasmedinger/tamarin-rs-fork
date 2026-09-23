@@ -1741,11 +1741,10 @@ pub fn canonicalize_system_content_seeded_profiled(
 fn canonicalize_eq_store(store: &EquationStore, labelling: &CanonLabelling) -> CanonicalEqStore {
     // eq_store.subst: domain vars are real, graph-reachable variables --
     // same guardedness-style assumption as formulas, so a missing theta
-    // entry PANICS (`lookup_theta`) rather than silently passing the raw
-    // var through. The range rewrite reuses `apply_literal_renaming`
-    // as-is (silently passes through anything `theta` doesn't cover,
-    // matching its existing, tested behaviour at every other call site --
-    // intentional here too, not a gap).
+    // entry PANICS rather than silently passing the raw var through, on
+    // BOTH halves: `lookup_theta` for the domain key, and
+    // `apply_literal_renaming` for the range term (which enforces the
+    // identical assumption the identical way -- see its own doc comment).
     let mut subst: Vec<(LNLit, LNTerm)> = store
         .subst
         .iter()

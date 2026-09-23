@@ -6,7 +6,7 @@
 //! $\alphaeqac$-equivalence class by 1) canonically renaming its literals
 //! (variables and names) by sort, delaying the renaming of literals that
 //! only occur under AC/C symbols until no permutation-free choice remains,
-//! and 2) bringing the result into `CAN_AC` normal form. See Algorithm 1
+//! and 2) bringing the result into AC-normal form. See Algorithm 1
 //! (`CAN_alphaeqac`) and Theorem `thm:can_alphaeqac` in `work.tex`.
 //!
 //! This module implements the base, TERM-level case; lifting to facts,
@@ -1042,27 +1042,18 @@ fn canonical_name(sort: LSort, idx: u64) -> Name {
 /// normal form.
 ///
 /// **Panics if `t` mentions a literal outside `ren`'s domain.** Every
-/// caller of this function -- [`Canonizer::canonize`] itself (above, once
-/// `next_literals` has run to exhaustion, so `ren` is exhaustive over
-/// every literal `t` contains by construction) and
-/// `tamarin_theory::canon`'s Stage G rewrites (`eq_store.subst`'s range,
-/// `subterm_store`'s pairs) -- runs strictly AFTER the graph part (plus,
-/// as of the goals-canonicalization work, every `Goal`) has already
-/// discovered and canonized every literal the system can legitimately
-/// contain, via `work.tex`'s own guardedness argument: everything past
-/// that point is read-only against an already-exhaustive `theta`.
-/// Silently passing an uncovered literal through used to look like a
-/// harmless fallback, but it is exactly the shape of bug this crate's
-/// canonicalization is built to catch loudly rather than hide: a
-/// literal that reaches here uncovered means some earlier stage failed
-/// to discover real system content (the `sys.goals` gap this comment was
-/// added for — a `Goal`'s own term was never being canonized until the
-/// graph part learned to fold every `Goal` in, exactly the kind of
-/// silent gap that would otherwise let two NON-alpha-equivalent systems
-/// canonicalize identically). A raw pass-through would leave that
-/// literal's ORIGINAL, un-canonicalized identity leaking into the
-/// "canonical" result -- unsound, and silently so. Panicking turns a
-/// silent soundness gap into a loud, immediately-diagnosable crash.
+/// caller runs against an already-exhaustive renaming: [`Canonizer::canonize`]
+/// (above) only reaches this once `next_literals` has run to exhaustion, and
+/// `tamarin_theory::canon`'s Stage G rewrites run strictly AFTER the graph
+/// part has discovered and canonized every literal the system can
+/// legitimately contain (`work.tex`'s guardedness argument), everything
+/// past that point being read-only against an already-exhaustive `theta`.
+/// So an uncovered literal here means an earlier stage failed to discover
+/// real system content -- and passing it through silently would leak that
+/// literal's ORIGINAL, un-canonicalized identity into the "canonical"
+/// result, which is precisely how two NON-alpha-equivalent systems end up
+/// canonicalizing identically. Panicking turns that silent soundness gap
+/// into a loud, immediately-diagnosable crash.
 ///
 /// `pub`, not `pub(crate)`: `tamarin_theory::canon`'s whole-system assembly
 /// (Stage G) reuses this directly for `eq_store.subst`'s range rewrite
@@ -1070,13 +1061,11 @@ fn canonical_name(sort: LSort, idx: u64) -> Name {
 /// from this one, so `pub(crate)` would not have been visible there.
 pub fn apply_literal_renaming(t: &LNTerm, ren: &BTreeMap<LNLit, LNLit>) -> LNTerm {
     match t {
-        Term::Lit(l) => Term::Lit(*ren.get(l).unwrap_or_else(|| {
+        Term::Lit(l) => Term::Lit(ren.get(l).copied().unwrap_or_else(|| {
             panic!(
                 "apply_literal_renaming: literal {l:?} is not covered by the renaming -- \
-                 every literal reaching this point should already be exhaustively covered \
-                 (see this function's own doc comment); an uncovered literal here means an \
-                 earlier stage failed to discover real system content, not that a fallback \
-                 is needed"
+                 an uncovered literal means an earlier canonicalization stage missed real \
+                 system content (see this function's own doc comment)"
             )
         })),
         Term::App(sym, args) => {
