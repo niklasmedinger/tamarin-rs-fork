@@ -67,18 +67,20 @@
 //! action-name colors always land in disjoint sub-ranges.
 //!
 //! **Shape refinement** (`TODO.md`'s skeleton-strengthening sketch: erase
-//! literals to sorts, `CAN_AC` the result). A base color only knows a
+//! variables to sorts, `CAN_AC` the result). A base color only knows a
 //! vertex's rule name or fact tag, so e.g. sibling `!KU(t_i)` goals from a
 //! tuple decomposition are all interchangeable to bliss, and every such
 //! swap is a group element Stage F has to minimize over. The refined key
 //! of a vertex is `(base color, shape)`, where the shape of a
 //! `RuleInstance`/`Action` is its content term (`canon::rule_to_term`/
-//! `canon::fact_to_term`) with every literal replaced by a placeholder for
-//! its sort (and var-vs-name kind), rebuilt bottom-up through the AC/C
-//! smart constructors ([`erase_literals`]). This is constant on
-//! $\alphaeqac$-classes: a sort-respecting renaming never changes the
-//! erased term, and erasure maps AC-equal terms to AC-equal terms, whose
-//! normal forms coincide. No canonization is needed.
+//! `canon::fact_to_term`) with every variable replaced by a placeholder
+//! for its sort, rebuilt through the AC/C smart constructors
+//! ([`erase_variables`]). Names are kept: they are never renamed (see
+//! `tamarin_term::alpha_eq_ac`'s module doc), so `!KU(<'1', x>)` and
+//! `!KU(<'2', x>)` get different shapes. This is constant on
+//! $\alphaeqac$-classes: a sort-respecting variable renaming never changes
+//! the erased term, and erasure maps AC-equal terms to AC-equal terms,
+//! whose normal forms coincide. No canonization is needed.
 //!
 //! The keys are then numbered by RANK among the distinct keys of the SAME
 //! graph part, never by the order vertices are encountered: vertex order
@@ -118,9 +120,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use tamarin_term::lterm::{LNTerm, LVar, Name};
-use tamarin_term::term::{f_app, Term};
-use tamarin_term::vterm::Lit;
+use tamarin_term::lterm::{HasFrees, LNTerm, LVar};
 
 use crate::canon::{fact_to_term, rule_to_term};
 use crate::canon_graph::VertexKind;
@@ -479,27 +479,26 @@ impl ColorTable {
 /// refinement"); `None` for content-free structural vertices.
 fn shape_term(v: &VertexKind) -> Option<LNTerm> {
     match v {
-        VertexKind::RuleInstance(_, ru) => Some(erase_literals(&rule_to_term(ru))),
-        VertexKind::Action(_, fact) => Some(erase_literals(&fact_to_term(fact))),
+        VertexKind::RuleInstance(_, ru) => Some(erase_variables(rule_to_term(ru))),
+        VertexKind::Action(_, fact) => Some(erase_variables(fact_to_term(fact))),
         _ => None,
     }
 }
 
-/// `t` with every literal replaced by one placeholder per sort and kind
-/// (variable or name), rebuilt bottom-up through [`f_app`] so AC arguments
-/// are re-flattened and re-sorted, and C arguments re-sorted, around the
-/// placeholders -- i.e. the `CAN_AC` normal form of the erased term.
-fn erase_literals(t: &LNTerm) -> LNTerm {
-    match t {
-        Term::Lit(Lit::Var(v)) => Term::Lit(Lit::Var(LVar::new("_", v.sort, 0))),
-        Term::Lit(Lit::Con(n)) => Term::Lit(Lit::Con(Name::new(n.tag, "_"))),
-        Term::App(sym, args) => f_app(*sym, args.iter().map(erase_literals).collect()),
-    }
+/// `t` with every variable replaced by one placeholder per sort, names
+/// kept. The ARBITRARY (non-monotone) [`HasFrees::map_free`] rebuilds
+/// through the smart constructors, so AC arguments are re-flattened and
+/// re-sorted, and C arguments re-sorted, around the placeholders -- i.e.
+/// the `CAN_AC` normal form of the erased term.
+fn erase_variables(t: LNTerm) -> LNTerm {
+    t.map_free(&mut |v| LVar::new("_", v.sort, 0))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
     use crate::constraint::solver::context::ProofContext;
     use crate::rule::{ProtoRuleACInstInfo, Rule, RuleAttributes};
     use crate::theory::Theory;
@@ -841,6 +840,24 @@ mod tests {
         assert_eq!(colors[0], colors[1], "renamed msg variables have the same shape");
         assert_ne!(colors[0], colors[2], "a msg and a pub variable differ in shape");
         assert_ne!(colors[3], colors[4], "sign(..) and mac(..) differ in shape");
+    }
+
+    /// Names are never renamed, so they are part of the shape: `!KU('1')`
+    /// and `!KU('2')` differ, like `!KU(~'n')` and `!KU(~'m')`.
+    #[test]
+    fn shape_colors_keep_names() {
+        use tamarin_term::lterm::{fresh_term, pub_term};
+        let table = ColorTable::default();
+        let colors = table.shape_colors(&[
+            ku(pub_term("1")),
+            ku(pub_term("2")),
+            ku(pub_term("1")),
+            ku(fresh_term("n")),
+            ku(fresh_term("m")),
+        ]);
+        assert_ne!(colors[0], colors[1], "'1' and '2' differ in shape");
+        assert_eq!(colors[0], colors[2], "the same name has the same shape");
+        assert_ne!(colors[3], colors[4], "~'n' and ~'m' differ in shape");
     }
 
     /// Erasure must re-sort AC arguments: `xor(x.0:msg, $p.1)` and its

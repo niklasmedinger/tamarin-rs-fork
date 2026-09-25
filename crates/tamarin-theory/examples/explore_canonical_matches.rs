@@ -180,9 +180,9 @@ use tamarin_theory::bliss_proc::{
     bliss_available, canonical_edges, canonical_vertex_order, generate_group, graph_part_to_dimacs,
     run_bliss, Permutation,
 };
-use tamarin_term::alpha_eq_ac::{apply_literal_renaming, canonicalize_alpha_eq_ac, CanonLabelling};
+use tamarin_term::alpha_eq_ac::{canonicalize_alpha_eq_ac, CanonLabelling};
 use tamarin_term::fingerprint::{fingerprint_term, Fingerprint};
-use tamarin_term::lterm::{LNTerm, LSort, LVar, Name};
+use tamarin_term::lterm::{HasFrees, LNTerm, LSort, LVar};
 use tamarin_term::term::Term;
 use tamarin_term::vterm::Lit;
 use tamarin_theory::canon::{
@@ -646,8 +646,6 @@ impl SwapKindCounts {
     }
 }
 
-type LNLit = Lit<Name, LVar>;
-
 /// Candidate refinements of the vertex coloring, per vertex of one graph
 /// part. A refinement keeps the graph and only splits color classes, so the
 /// automorphism group bliss would report under it is exactly the subset of
@@ -657,14 +655,16 @@ type LNLit = Lit<Name, LVar>;
 /// equivalent systems canonicalize differently.
 struct Refinements {
     /// Current color + the content's skeleton: its local canonical form with
-    /// every literal replaced by one placeholder per sort.
+    /// every variable replaced by one placeholder per sort (names are kept:
+    /// they are never renamed).
     skeleton: Vec<(Color, Option<Fingerprint>)>,
     /// Current color + the content's local canonical form (canonicalized on
     /// its own, modulo renaming + AC) -- the finest per-vertex invariant.
     local: Vec<(Color, Option<Fingerprint>)>,
-    /// Per distinct raw literal in vertex content: its sort and the sorted
-    /// indices of the vertices containing it -- what literal vertices with
-    /// incidence edges would add to the graph. Sorted.
+    /// Per distinct raw variable in vertex content: its sort and the sorted
+    /// indices of the vertices containing it -- what variable vertices with
+    /// incidence edges would add to the graph. Sorted. Names are left out:
+    /// a name is content, already part of the skeleton.
     occurrences: Vec<(LSort, Vec<usize>)>,
     /// Like `occurrences`, but each occurrence also carries its argument path
     /// inside the vertex's term (unordered below AC/commutative symbols) --
@@ -672,18 +672,19 @@ struct Refinements {
     positions: Vec<(LSort, Vec<(usize, String)>)>,
 }
 
-/// Records every literal occurrence in `t` (content of `vertex`) with its
+/// Records every variable occurrence in `t` (content of `vertex`) with its
 /// argument path: `symbol/index;` per step, `symbol/*;` below an AC or
 /// commutative symbol, whose argument order is not invariant.
 fn collect_positions(
     t: &LNTerm,
     vertex: usize,
     path: &mut String,
-    out: &mut BTreeMap<LNLit, Vec<(usize, String)>>,
+    out: &mut BTreeMap<LVar, Vec<(usize, String)>>,
 ) {
     use std::fmt::Write as _;
     match t {
-        Term::Lit(l) => out.entry(*l).or_default().push((vertex, path.clone())),
+        Term::Lit(Lit::Var(v)) => out.entry(*v).or_default().push((vertex, path.clone())),
+        Term::Lit(Lit::Con(_)) => {}
         Term::App(sym, args) => {
             let unordered = sym.is_ac() || sym.is_c();
             for (i, a) in args.iter().enumerate() {
@@ -710,26 +711,13 @@ fn content_term(v: &VertexKind) -> Option<LNTerm> {
     }
 }
 
-fn collect_literals(t: &LNTerm, out: &mut BTreeSet<LNLit>) {
-    match t {
-        Term::Lit(l) => {
-            out.insert(*l);
-        }
-        Term::App(_, args) => {
-            for a in args.iter() {
-                collect_literals(a, out);
-            }
-        }
-    }
-}
-
 impl Refinements {
     fn new(part: &GraphPart) -> Self {
         let n = part.vertices.len();
         let mut skeleton = Vec::with_capacity(n);
         let mut local = Vec::with_capacity(n);
-        let mut occurrences: BTreeMap<LNLit, Vec<usize>> = BTreeMap::new();
-        let mut positions: BTreeMap<LNLit, Vec<(usize, String)>> = BTreeMap::new();
+        let mut occurrences: BTreeMap<LVar, Vec<usize>> = BTreeMap::new();
+        let mut positions: BTreeMap<LVar, Vec<(usize, String)>> = BTreeMap::new();
         for (i, v) in part.vertices.iter().enumerate() {
             let color = part.vertex_color(i);
             let Some(raw) = content_term(v) else {
@@ -738,30 +726,26 @@ impl Refinements {
                 continue;
             };
             let canonical = canonicalize_alpha_eq_ac(&raw);
-            let mut lits = BTreeSet::new();
-            collect_literals(&canonical, &mut lits);
-            let placeholders: BTreeMap<LNLit, LNLit> = lits
-                .iter()
-                .map(|l| (*l, Lit::Var(LVar::new("_", l.sort(), 0))))
-                .collect();
-            let skel = apply_literal_renaming(&canonical, &placeholders);
+            let skel = canonical.clone().map_free(&mut |v| LVar::new("_", v.sort, 0));
             skeleton.push((color, Some(fingerprint_term(&skel))));
             local.push((color, Some(fingerprint_term(&canonical))));
-            let mut raw_lits = BTreeSet::new();
-            collect_literals(&raw, &mut raw_lits);
-            for l in raw_lits {
-                occurrences.entry(l).or_default().push(i);
+            let mut raw_vars = BTreeSet::new();
+            raw.for_each_free(&mut |v| {
+                raw_vars.insert(*v);
+            });
+            for v in raw_vars {
+                occurrences.entry(v).or_default().push(i);
             }
             collect_positions(&raw, i, &mut String::new(), &mut positions);
         }
         let mut occurrences: Vec<(LSort, Vec<usize>)> =
-            occurrences.into_iter().map(|(l, vs)| (l.sort(), vs)).collect();
+            occurrences.into_iter().map(|(v, vs)| (v.sort, vs)).collect();
         occurrences.sort();
         let mut positions: Vec<(LSort, Vec<(usize, String)>)> = positions
             .into_iter()
-            .map(|(l, mut ps)| {
+            .map(|(v, mut ps)| {
                 ps.sort();
-                (l.sort(), ps)
+                (v.sort, ps)
             })
             .collect();
         positions.sort();

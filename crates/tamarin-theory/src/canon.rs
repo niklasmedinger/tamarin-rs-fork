@@ -237,11 +237,9 @@ fn graph_tag(tag: &str, args: Vec<LNTerm>) -> LNTerm {
 }
 
 /// The 0-ary marker term for `suffix` (see [`graph_marker_name`]) — a
-/// function symbol, never a literal, so it is NEVER renamed by
-/// `CAN_alphaeqac` (unlike e.g. a public name, which — being a literal —
-/// the canonizer would try to assign a fresh canonical name to, making it
-/// useless as a fixed marker of vertex/edge IDENTITY). A 0-ary special
-/// case of [`graph_tag`].
+/// function symbol, so it is NEVER renamed by `CAN_alphaeqac`, and its
+/// NUL-prefixed name can never collide with a user's function symbol or
+/// name. A 0-ary special case of [`graph_tag`].
 fn graph_marker(suffix: &str) -> LNTerm {
     graph_tag(suffix, Vec::new())
 }
@@ -273,7 +271,7 @@ fn graph_marker(suffix: &str) -> LNTerm {
 /// formula references a `NodeId` FREE: `guarded::to_induction_hypothesis`
 /// (the `ginduct`/`Induction` proof method) does exactly that, injecting
 /// a free top-level `Last(v)` disjunct per Node-sorted quantified
-/// variable — `canonicalize_guarded`'s `lookup_theta` then panics on the
+/// variable — `canonicalize_guarded`'s theta lookup then panicked on the
 /// very first such formula it meets, since `theta` never had anywhere to
 /// put that entry. Embedding each vertex's `NodeId` as a literal, in
 /// canonical vertex order and directly before that vertex's own content,
@@ -452,23 +450,23 @@ pub fn minimal_graph_part_labelings(
 // =============================================================================
 //
 // Per `work.tex`'s "Canonization of Formula Constraints": a guarded
-// formula's free variables and name constants are always bound/introduced
-// elsewhere in the constraint system (by an action formula, a rule
-// constraint, or a rule/fact argument — see the paragraph building up to
+// formula's free variables are always bound/introduced elsewhere in the
+// constraint system (by an action formula, a rule constraint, or a
+// rule/fact argument — see the paragraph building up to
 // `ex:canon_guarded`), so by the time formulas are canonized a canonical
 // labelling `theta` for them already exists (computed while canonizing the
 // system's rule instances/action formulas via graph-part canonization,
 // below — Stage G's `canonicalize_constraint_system` is the actual call
 // site that threads that `theta` in here). `theta` is assumed EXHAUSTIVE: every
-// free variable and name constant `g` mentions must have an entry, or
-// canonization panics (see [`lookup_theta`]) — a miss means `theta` was
+// free variable `g` mentions must have an entry, or canonization panics
+// (see [`tamarin_term::alpha_eq_ac::rename_var`]) — a miss means `theta` was
 // built incorrectly, not a case to paper over with a silent fallback. Given
 // that labelling, canonizing a `Guarded` is two steps:
 //
-// 1. Substitute every free variable AND name constant via `theta`
-//    ([`subst_via_theta_guarded`]) — matching `tamarin_term::alpha_eq_ac`'s
-//    own literal model, where a name constant (`PubLit`/`FreshLit`/`NatLit`
-//    here, `Lit::Con(Name{..})` there) is renamed exactly like a variable.
+// 1. Substitute every free variable via `theta` ([`subst_via_theta_guarded`]).
+//    Name constants (`PubLit`/`FreshLit`/`NatLit`) are left as they are:
+//    names are never renamed (see `tamarin_term::alpha_eq_ac`'s module doc),
+//    so they need no `theta` entry and may occur only in a formula.
 //    Bound variables need no substitution: a `Guarded`'s bound occurrences
 //    are already De-Bruijn indices (position-determined), which is already
 //    a canonical representation — the only non-canonical thing about them is
@@ -493,17 +491,17 @@ pub fn minimal_graph_part_labelings(
 //    concrete difference this makes.
 
 use crate::guarded::{
-    self, cmp_atom, cmp_guarded, cmp_term, ga, gall, gex, map_guarded_atoms, BVar, GAtom, GBinding,
-    GFact, GTerm, Guarded, Quant,
+    self, cmp_atom, cmp_guarded, cmp_term, ga, gall, gex, map_lvars_in_guarded, BVar, GAtom,
+    GBinding, GFact, GTerm, Guarded, Quant,
 };
 use tamarin_parser::ast as p;
-use tamarin_term::lterm::{LSort, Name, NameId, NameTag};
-use tamarin_term::vterm::Lit;
+use tamarin_term::alpha_eq_ac::{apply_renaming, rename_var};
+use tamarin_term::lterm::{LSort, LVar};
 use tamarin_utils::fingerprint::{Fingerprint, FingerprintHasher};
 
-/// Same choice `tamarin_term::alpha_eq_ac` makes internally: a literal is
-/// either a name constant or a variable.
-type LNLit = Lit<Name, tamarin_term::lterm::LVar>;
+/// The canonical labelling's renaming: variables only, names are never
+/// renamed (see `tamarin_term::alpha_eq_ac`'s module doc).
+type Theta = std::collections::BTreeMap<LVar, LVar>;
 
 /// `p::SortHint` to `LSort`. `Untagged` (a bare, sigil-less name) resolves
 /// to `Msg`, matching the parser's own default for that position; every
@@ -552,129 +550,18 @@ fn lvar_to_varspec(v: &tamarin_term::lterm::LVar) -> p::VarSpec {
     }
 }
 
-/// The name constant a `PubLit`/`FreshLit`/`NatLit`'s source string denotes,
-/// for looking it up in `theta`.
-fn name_lit(tag: NameTag, s: &str) -> Name {
-    Name {
-        tag,
-        id: NameId::new(s),
-    }
-}
-
-/// Looks up a literal in `theta`, panicking if it has no entry. A guarded
-/// formula's free variables and name constants are ALWAYS assumed to be
-/// already covered by an exhaustively-computed canonical labelling (per
-/// `work.tex`'s argument that every free variable in a constraint system's
-/// formula is bound by some action formula or rule constraint elsewhere in
-/// the same system): a miss here means `theta` was built incorrectly
-/// (missing an entry) or this formula wasn't actually closed the way
-/// `work.tex` assumes — either way a caller bug, not a case to paper over
-/// with a silent fallback.
-fn lookup_theta<'t>(theta: &'t std::collections::BTreeMap<LNLit, LNLit>, key: &LNLit) -> &'t LNLit {
-    theta.get(key).unwrap_or_else(|| {
-        panic!(
-            "canonicalize_guarded: {key:?} has no entry in theta — every free \
-             variable/name constant of a guarded formula must already be covered \
-             by the canonical labelling (work.tex's guardedness argument), so a \
-             miss here is a caller bug, not a case to fall back on silently"
-        )
-    })
-}
-
-/// Substitutes every free variable and name constant of `g` via `theta`,
-/// leaving Bound variables (already canonical by De-Bruijn position)
-/// untouched. Panics if some free variable or name constant has no entry in
-/// `theta` — see [`lookup_theta`].
-///
-/// `theta` is the same `LNLit -> LNLit` map [`tamarin_term::alpha_eq_ac`]
-/// itself produces: a sort-respecting, bijective, CATEGORY-respecting
-/// (`Lit::Var` never maps to `Lit::Con` or vice versa) canonical labelling.
-/// A `Guarded`'s `GTerm::Var(BVar::Free(_))` leaves look themselves up as
-/// `Lit::Var`; its `PubLit`/`FreshLit`/`NatLit(String)` leaves — the
-/// constants `alpha_eq_ac` calls `Lit::Con(Name{..})` — look themselves up
-/// as `Lit::Con` under the matching `NameTag`.
-pub fn subst_via_theta_guarded(
-    g: &Guarded,
-    theta: &std::collections::BTreeMap<LNLit, LNLit>,
-) -> Guarded {
-    map_guarded_atoms(g, &mut |_depth, a| subst_atom_via_theta(a, theta))
-}
-
-fn subst_atom_via_theta(a: &GAtom, theta: &std::collections::BTreeMap<LNLit, LNLit>) -> GAtom {
-    let t = |x: &GTerm| subst_term_via_theta(x, theta);
-    let f = |x: &GFact| subst_fact_via_theta(x, theta);
-    match a {
-        GAtom::Eq(x, y) => GAtom::Eq(t(x), t(y)),
-        GAtom::Less(x, y) => GAtom::Less(t(x), t(y)),
-        GAtom::LessMset(x, y) => GAtom::LessMset(t(x), t(y)),
-        GAtom::Subterm(x, y) => GAtom::Subterm(t(x), t(y)),
-        GAtom::Action(fact, time) => GAtom::Action(f(fact), t(time)),
-        GAtom::Last(x) => GAtom::Last(t(x)),
-        GAtom::Pred(fact) => GAtom::Pred(f(fact)),
-    }
-}
-
-fn subst_fact_via_theta(fact: &GFact, theta: &std::collections::BTreeMap<LNLit, LNLit>) -> GFact {
-    GFact {
-        persistent: fact.persistent,
-        name: fact.name.clone(),
-        args: fact
-            .args
-            .iter()
-            .map(|a| subst_term_via_theta(a, theta))
-            .collect(),
-        annotations: fact.annotations.clone(),
-    }
-}
-
-fn subst_term_via_theta(t: &GTerm, theta: &std::collections::BTreeMap<LNLit, LNLit>) -> GTerm {
-    let rec = |x: &GTerm| subst_term_via_theta(x, theta);
-    match t {
-        GTerm::Var(BVar::Free(v)) => {
-            let key = Lit::Var(varspec_to_lvar(v));
-            match lookup_theta(theta, &key) {
-                Lit::Var(canon) => GTerm::Var(BVar::Free(lvar_to_varspec(canon))),
-                Lit::Con(_) => panic!(
-                    "canonicalize_guarded: variable {v:?} mapped to a name constant \
-                     in theta — a sort-respecting substitution never does this"
-                ),
-            }
-        }
-        GTerm::Var(BVar::Bound(_)) => t.clone(),
-        GTerm::PubLit(s) => match lookup_theta(theta, &Lit::Con(name_lit(NameTag::Pub, s))) {
-            Lit::Con(canon) => GTerm::PubLit(canon.id.as_str().to_string()),
-            Lit::Var(_) => panic!(
-                "canonicalize_guarded: pub name {s:?} mapped to a variable in theta \
-                 — a sort-respecting substitution never does this"
-            ),
-        },
-        GTerm::FreshLit(s) => match lookup_theta(theta, &Lit::Con(name_lit(NameTag::Fresh, s))) {
-            Lit::Con(canon) => GTerm::FreshLit(canon.id.as_str().to_string()),
-            Lit::Var(_) => panic!(
-                "canonicalize_guarded: fresh name {s:?} mapped to a variable in theta \
-                 — a sort-respecting substitution never does this"
-            ),
-        },
-        GTerm::NatLit(s) => match lookup_theta(theta, &Lit::Con(name_lit(NameTag::Nat, s))) {
-            Lit::Con(canon) => GTerm::NatLit(canon.id.as_str().to_string()),
-            Lit::Var(_) => panic!(
-                "canonicalize_guarded: nat name {s:?} mapped to a variable in theta \
-                 — a sort-respecting substitution never does this"
-            ),
-        },
-        // Built-in 0-ary constant TERMS (`one`/`tone`/`DH_neutral`), not name
-        // literals: `alpha_eq_ac`'s own literal model has no entry for these
-        // either (they're NoEq function applications of arity 0, per
-        // `term.rs`'s `one_sym`/`nat_one_sym`/`dh_neutral_sym`), so there is
-        // nothing to look up in `theta`.
-        GTerm::Number(_) | GTerm::NumberOne | GTerm::NatOne | GTerm::DhNeutral => t.clone(),
-        GTerm::App(n, args) => GTerm::App(n.clone(), args.iter().map(rec).collect()),
-        GTerm::AlgApp(n, x, y) => GTerm::AlgApp(n.clone(), ga(rec(x)), ga(rec(y))),
-        GTerm::Pair(items) => GTerm::Pair(items.iter().map(rec).collect()),
-        GTerm::Diff(x, y) => GTerm::Diff(ga(rec(x)), ga(rec(y))),
-        GTerm::BinOp(op, x, y) => GTerm::BinOp(*op, ga(rec(x)), ga(rec(y))),
-        GTerm::PatMatch(x) => GTerm::PatMatch(ga(rec(x))),
-    }
+/// Substitutes every free variable of `g` via `theta`, leaving Bound
+/// variables (already canonical by De-Bruijn position) and name constants
+/// (never renamed) untouched. Panics if some free variable has no entry in
+/// `theta` — see [`rename_var`]: a guarded formula's free variables are
+/// ALWAYS assumed to be already covered by an exhaustively-computed
+/// canonical labelling (per `work.tex`'s argument that every free variable
+/// in a constraint system's formula is bound by some action formula or rule
+/// constraint elsewhere in the same system), so a miss means `theta` was
+/// built incorrectly or this formula wasn't actually closed the way
+/// `work.tex` assumes — either way a caller bug.
+pub fn subst_via_theta_guarded(g: &Guarded, theta: &Theta) -> Guarded {
+    map_lvars_in_guarded(g, |v| lvar_to_varspec(&rename_var(theta, varspec_to_lvar(v))))
 }
 
 /// Canonically orders an atom's operands where doing so is sound: `=` is
@@ -833,7 +720,7 @@ pub fn ac_normalize_guarded(g: &Guarded) -> Guarded {
 /// and [`ac_normalize_guarded`]).
 pub fn canonicalize_guarded(
     g: &Guarded,
-    theta: &std::collections::BTreeMap<LNLit, LNLit>,
+    theta: &Theta,
 ) -> Guarded {
     ac_normalize_guarded(&subst_via_theta_guarded(g, theta))
 }
@@ -1149,8 +1036,6 @@ use crate::constraint::solver::Contradiction;
 use crate::constraint::system::{GoalStatus, Side, SourceKind, System};
 use crate::tools::equation_store::{EqDisj, EquationStore, LNSubst, LNSubstVFresh};
 use crate::tools::subterm_store::{SubtermConstraint, SubtermStore};
-use tamarin_term::alpha_eq_ac::apply_literal_renaming;
-use tamarin_term::lterm::LVar;
 use tamarin_term::vterm::var_term;
 
 /// The complete canonical form of a constraint `System` (Stage G).
@@ -1224,23 +1109,23 @@ pub enum CanonicalGoalKind {
     /// the vertex records that the action exists, this entry records that
     /// it is a GOAL and whether it is solved -- neither of which the vertex
     /// carries, and both of which decide what `candidate_methods` offers.
-    Action(LNLit, LNTerm),
+    Action(LVar, LNTerm),
     /// `Goal::Chain(NodeConc, NodePrem)`: both endpoints' `NodeId`s
     /// canonicalized via the graph part's `theta` -- no new literal, the
     /// port indices need no renaming.
-    Chain(LNLit, ConcIdx, LNLit, PremIdx),
+    Chain(LVar, ConcIdx, LVar, PremIdx),
     /// `Goal::Premise(NodePrem, LNFact)`: the `NodeId` canonicalized the
     /// same way as `Chain`'s endpoints, plus the fact itself
     /// canonicalized via `theta` (its own literals should already be
     /// covered -- `NodePrem` names an EXISTING rule instance's own
     /// premise slot, whose fact the graph part already discovered).
-    Premise(LNLit, PremIdx, LNTerm),
+    Premise(LVar, PremIdx, LNTerm),
     /// `Goal::Disj(Disj<Guarded>)`: each alternative canonicalized via
     /// `canonicalize_guarded` against `theta`, then sorted -- NOT
     /// deduplicated, same treatment as `formulas`/`solved_formulas`/`lemmas`.
     Disj(Vec<Guarded>),
     /// `Goal::Subterm((LNTerm, LNTerm))`: both terms canonicalized via
-    /// `apply_literal_renaming` -- same treatment as `subterm_store`'s
+    /// `apply_renaming` -- same treatment as `subterm_store`'s
     /// pairs.
     Subterm(LNTerm, LNTerm),
 }
@@ -1251,7 +1136,7 @@ pub enum CanonicalGoalKind {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CanonicalEqStore {
     /// `eq_store.subst`, canonical-key sorted.
-    pub subst: Vec<(LNLit, LNTerm)>,
+    pub subst: Vec<(LVar, LNTerm)>,
     /// `eq_store.conj` -- `split_id` DROPPED: its only consumer is
     /// `Goal::Split`, which `CanonicalSystem::goals` drops too (it only
     /// NAMES an `EqDisj` already present here; nothing else ever reads a
@@ -1272,7 +1157,7 @@ pub struct CanonicalEqStore {
     /// collapses a real 6-substitution case to 5, dropping a split case
     /// and changing the proof tree), so collapsing them here would
     /// likewise conflate two non-interchangeable systems.
-    pub conj: Vec<Vec<Vec<(LNLit, LNTerm)>>>,
+    pub conj: Vec<Vec<Vec<(LVar, LNTerm)>>>,
 }
 
 /// All four fields are `Ord` on their own, so this derives it directly --
@@ -1565,7 +1450,7 @@ pub(crate) fn canonicalize_system_content_seeded(
     // `theta` is EXHAUSTIVE (work.tex's guardedness argument: every free
     // variable/name constant a formula mentions is bound elsewhere in the
     // system) and panics on a miss rather than silently miscanonizing
-    // (see `lookup_theta`). Kept as three SEPARATE sets, not unioned --
+    // (see `rename_var`). Kept as three SEPARATE sets, not unioned --
     // `solved_formulas` membership is live proof-search state, not pure
     // memoization: `ProofMethod::Induction`'s applicability and
     // `isInitialSystem` both key off it.
@@ -1777,13 +1662,13 @@ pub fn canonicalize_system_content_seeded_profiled(
     // per-alternative fork cost in `conj` doesn't hide inside a single
     // `eq_store` bucket.
     let t = std::time::Instant::now();
-    let mut subst: Vec<(LNLit, LNTerm)> = sys
+    let mut subst: Vec<(LVar, LNTerm)> = sys
         .eq_store
         .subst
         .iter()
         .map(|(v, term)| {
-            let canon_key = *lookup_theta(labelling.theta(), &Lit::Var(*v));
-            let canon_term = apply_literal_renaming(term, labelling.theta());
+            let canon_key = rename_var(labelling.theta(), *v);
+            let canon_term = apply_renaming(labelling.theta(), term.clone());
             (canon_key, canon_term)
         })
         .collect();
@@ -1791,7 +1676,7 @@ pub fn canonicalize_system_content_seeded_profiled(
     stats.eq_store_subst = t.elapsed();
 
     let t = std::time::Instant::now();
-    let mut conj: Vec<Vec<Vec<(LNLit, LNTerm)>>> = sys
+    let mut conj: Vec<Vec<Vec<(LVar, LNTerm)>>> = sys
         .eq_store
         .conj
         .iter()
@@ -1829,15 +1714,15 @@ fn canonicalize_eq_store(store: &EquationStore, labelling: &CanonLabelling) -> C
     // eq_store.subst: domain vars are real, graph-reachable variables --
     // same guardedness-style assumption as formulas, so a missing theta
     // entry PANICS rather than silently passing the raw var through, on
-    // BOTH halves: `lookup_theta` for the domain key, and
-    // `apply_literal_renaming` for the range term (which enforces the
+    // BOTH halves: `rename_var` for the domain key, and
+    // `apply_renaming` for the range term (which enforces the
     // identical assumption the identical way -- see its own doc comment).
-    let mut subst: Vec<(LNLit, LNTerm)> = store
+    let mut subst: Vec<(LVar, LNTerm)> = store
         .subst
         .iter()
         .map(|(v, t)| {
-            let canon_key = *lookup_theta(labelling.theta(), &Lit::Var(*v));
-            let canon_term = apply_literal_renaming(t, labelling.theta());
+            let canon_key = rename_var(labelling.theta(), *v);
+            let canon_term = apply_renaming(labelling.theta(), t.clone());
             (canon_key, canon_term)
         })
         .collect();
@@ -1848,7 +1733,7 @@ fn canonicalize_eq_store(store: &EquationStore, labelling: &CanonLabelling) -> C
     // `CanonicalEqStore::conj`'s own doc comment for why duplicates must
     // survive), sorted once canonical; likewise the outer list of
     // `EqDisj`s.
-    let mut conj: Vec<Vec<Vec<(LNLit, LNTerm)>>> = store
+    let mut conj: Vec<Vec<Vec<(LVar, LNTerm)>>> = store
         .conj
         .iter()
         .map(|disj| canonicalize_eq_disj(disj, labelling))
@@ -1861,8 +1746,8 @@ fn canonicalize_eq_store(store: &EquationStore, labelling: &CanonLabelling) -> C
 /// Canonicalizes one `EqDisj`'s alternatives, preserving multiplicity (no
 /// alpha-dedup -- see `CanonicalEqStore::conj`'s own doc comment) and
 /// sorting by the now-canonical content.
-fn canonicalize_eq_disj(disj: &EqDisj, labelling: &CanonLabelling) -> Vec<Vec<(LNLit, LNTerm)>> {
-    let mut alternatives: Vec<Vec<(LNLit, LNTerm)>> = disj
+fn canonicalize_eq_disj(disj: &EqDisj, labelling: &CanonLabelling) -> Vec<Vec<(LVar, LNTerm)>> {
+    let mut alternatives: Vec<Vec<(LVar, LNTerm)>> = disj
         .substs
         .iter()
         .map(|alt| canonicalize_eq_disj_alternative(alt, labelling))
@@ -1878,7 +1763,7 @@ fn canonicalize_eq_disj(disj: &EqDisj, labelling: &CanonLabelling) -> Vec<Vec<(L
 /// **Domain keys** are real, graph-reachable variables (the `x_i` in
 /// EquationStore.hs's own semantics) -- canonicalized via the shared
 /// `theta` (panicking on a miss, same guardedness-style assumption as
-/// everywhere else -- see [`lookup_theta`]) and sorted by that CANONICAL
+/// everywhere else -- see [`rename_var`]) and sorted by that CANONICAL
 /// identity, not raw `LVar` Ord, so the range terms below get visited
 /// (and their local witnesses numbered) in a content-driven,
 /// cross-system-stable order rather than one that depends on incidental
@@ -1934,10 +1819,10 @@ fn canonicalize_eq_disj(disj: &EqDisj, labelling: &CanonLabelling) -> Vec<Vec<(L
 fn canonicalize_eq_disj_alternative(
     alt: &LNSubstVFresh,
     labelling: &CanonLabelling,
-) -> Vec<(LNLit, LNTerm)> {
-    let mut entries: Vec<(LNLit, LVar)> = alt
+) -> Vec<(LVar, LNTerm)> {
+    let mut entries: Vec<(LVar, LVar)> = alt
         .iter()
-        .map(|(v, _)| (*lookup_theta(labelling.theta(), &Lit::Var(*v)), *v))
+        .map(|(v, _)| (rename_var(labelling.theta(), *v), *v))
         .collect();
     // `entries` is created from the alternative's domain keys; i.e., a BTreeMap's keys.
     // Thus, each key is unique. This is important for the injectivity assertion below.
@@ -1950,7 +1835,7 @@ fn canonicalize_eq_disj_alternative(
     // from a monotonic, never-reset, never-reused counter; a literal
     // already in `theta` is excluded from "uncanonicalized" before that
     // even runs, so it's never reprocessed), so two DISTINCT domain keys
-    // of one alternative can never canonicalize to the SAME `LNLit`. If
+    // of one alternative can never canonicalize to the SAME `LVar`. If
     // they somehow did (e.g. a `theta` hand-built via `CanonLabelling::
     // from_theta` with a bug, bypassing the Canonizer's own accumulation
     // entirely), the stable sort above would fall back to `alt`'s raw,
@@ -2007,7 +1892,7 @@ fn canonicalize_eq_disj_alternative(
 }
 
 /// The smallest raw variable index guaranteed not to collide with any
-/// `Lit::Var` key already in `theta` -- the floor
+/// variable key already in `theta` -- the floor
 /// [`canonicalize_eq_disj_alternative`]'s range-freshening allocator must
 /// start from so a freshly-minted witness identity can never accidentally
 /// match an existing (and therefore already-resolved) literal. Only
@@ -2015,39 +1900,25 @@ fn canonicalize_eq_disj_alternative(
 /// literals originally seen -- proof-search-allocated indices, typically
 /// large and monotonically increasing over a run), not its VALUES (the
 /// canonical output literals, a completely separate, small,
-/// sequentially-counted namespace that a lookup is never keyed by) or
-/// `Con` keys (name constants -- freshening only ever touches `Var`
-/// occurrences, never `Con` ones, so a name constant can never collide
-/// with a freshened identity regardless).
-fn raw_var_idx_avoid_floor(theta: &std::collections::BTreeMap<LNLit, LNLit>) -> u64 {
-    theta
-        .keys()
-        .filter_map(|lit| match lit {
-            Lit::Var(v) => Some(v.idx),
-            Lit::Con(_) => None,
-        })
-        .max()
-        .map_or(0, |m| m + 1)
+/// sequentially-counted namespace that a lookup is never keyed by).
+fn raw_var_idx_avoid_floor(theta: &Theta) -> u64 {
+    theta.keys().map(|v| v.idx).max().map_or(0, |m| m + 1)
 }
 
 /// Canonicalizes `store` (the `subterm_store`): drops
 /// `propagated`/`old_neg_subterms` (Rust-only bookkeeping, not
 /// semantically meaningful content), renames every term pair via `theta`
-/// (reusing `apply_literal_renaming`, same as `eq_store.subst`'s range), and
+/// (`apply_renaming`, same as `eq_store.subst`'s range), and
 /// re-sorts everything -- `neg_subterms` is already a sorted, deduplicated
 /// set pre-canonicalization, but renaming can change relative order and
 /// even collapse two distinct pairs into one, so the existing sort/dedup
 /// can't be trusted to survive it unchanged.
 fn canonicalize_subterm_store(
     store: &SubtermStore,
-    theta: &std::collections::BTreeMap<LNLit, LNLit>,
+    theta: &Theta,
 ) -> CanonicalSubtermStore {
-    let canon_pair = |c: &SubtermConstraint| {
-        (
-            apply_literal_renaming(&c.small, theta),
-            apply_literal_renaming(&c.big, theta),
-        )
-    };
+    let canon_pair =
+        |c: &SubtermConstraint| apply_renaming(theta, (c.small.clone(), c.big.clone()));
 
     let mut subterms: Vec<(LNTerm, LNTerm)> = store.subterms.iter().map(canon_pair).collect();
     subterms.sort();
@@ -2057,12 +1928,7 @@ fn canonicalize_subterm_store(
     let mut neg_subterms: Vec<(LNTerm, LNTerm)> = store
         .neg_subterms
         .iter()
-        .map(|(a, b)| {
-            (
-                apply_literal_renaming(a, theta),
-                apply_literal_renaming(b, theta),
-            )
-        })
+        .map(|(a, b)| apply_renaming(theta, (a.clone(), b.clone())))
         .collect();
     neg_subterms.sort();
     neg_subterms.dedup();
@@ -2077,8 +1943,8 @@ fn canonicalize_subterm_store(
 
 /// Canonicalizes `sys.goals` into [`CanonicalGoal`]s -- read-only against
 /// `theta`, same guardedness-style assumption as every other Stage G
-/// field (a missing entry panics via [`lookup_theta`]/
-/// [`apply_literal_renaming`], not a silent fallback).
+/// field (a missing entry panics via [`rename_var`], not a silent
+/// fallback).
 ///
 /// `Goal::Action` is kept even though `canon_graph::extract_graph_part`
 /// also turns it into a `VertexKind::Action` vertex: the vertex (deduped
@@ -2103,7 +1969,7 @@ fn canonicalize_subterm_store(
 /// dedup here would silently collapse.
 fn canonicalize_goals(
     goals: &[(Goal, GoalStatus)],
-    theta: &std::collections::BTreeMap<LNLit, LNLit>,
+    theta: &Theta,
 ) -> Vec<CanonicalGoal> {
     let mut out: Vec<CanonicalGoal> = goals
         .iter()
@@ -2119,36 +1985,36 @@ fn canonicalize_goals(
 }
 
 /// One goal's canonical payload via `theta` (panicking on an uncovered
-/// literal, like every other Stage G field) -- `None` for `Goal::Split`,
+/// variable, like every other Stage G field) -- `None` for `Goal::Split`,
 /// whose raw id the canonical form drops (see [`canonicalize_goals`]).
 pub fn canonicalize_goal_kind(
     goal: &Goal,
-    theta: &std::collections::BTreeMap<LNLit, LNLit>,
+    theta: &Theta,
 ) -> Option<CanonicalGoalKind> {
     Some(match goal {
         Goal::Split(_) => return None,
         Goal::Action(nid, fact) => CanonicalGoalKind::Action(
-            *lookup_theta(theta, &Lit::Var(*nid)),
-            apply_literal_renaming(&fact_to_term(fact), theta),
+            rename_var(theta, *nid),
+            fact_to_term(&apply_renaming(theta, fact.clone())),
         ),
         Goal::Chain((conc_nid, conc_idx), (prem_nid, prem_idx)) => CanonicalGoalKind::Chain(
-            *lookup_theta(theta, &Lit::Var(*conc_nid)),
+            rename_var(theta, *conc_nid),
             *conc_idx,
-            *lookup_theta(theta, &Lit::Var(*prem_nid)),
+            rename_var(theta, *prem_nid),
             *prem_idx,
         ),
         Goal::Premise((prem_nid, prem_idx), fact) => CanonicalGoalKind::Premise(
-            *lookup_theta(theta, &Lit::Var(*prem_nid)),
+            rename_var(theta, *prem_nid),
             *prem_idx,
-            apply_literal_renaming(&fact_to_term(fact), theta),
+            fact_to_term(&apply_renaming(theta, fact.clone())),
         ),
         Goal::Disj(disj) => CanonicalGoalKind::Disj(sort_guarded(
             disj.0.iter().map(|g| canonicalize_guarded(g, theta)).collect(),
         )),
-        Goal::Subterm((small, big)) => CanonicalGoalKind::Subterm(
-            apply_literal_renaming(small, theta),
-            apply_literal_renaming(big, theta),
-        ),
+        Goal::Subterm((small, big)) => {
+            let (small, big) = apply_renaming(theta, (small.clone(), big.clone()));
+            CanonicalGoalKind::Subterm(small, big)
+        }
     })
 }
 
@@ -2172,7 +2038,7 @@ pub enum CanonicalProofMethod {
     Solve(CanonicalGoalKind),
     /// `solve` of a case split, identified by the canonicalized alternatives
     /// of the `EqDisj` it names -- the canonical form drops split ids.
-    SolveSplit(Vec<Vec<(LNLit, LNTerm)>>),
+    SolveSplit(Vec<Vec<(LVar, LNTerm)>>),
 }
 
 /// Renames `method` (offered for `sys`) through `labelling`, `sys`'s
@@ -2504,8 +2370,8 @@ mod tests {
     /// A canonical msg variable literal — same naming scheme as the
     /// term-level tests in `tamarin_term::alpha_eq_ac`'s own test suite
     /// (`mv0`, `mv1`, ...): one fixed name `"mv"`, index in `LVar::idx`.
-    fn mv(idx: u64) -> LNLit {
-        Lit::Var(LVar::new("mv", LSort::Msg, idx))
+    fn mv(idx: u64) -> LVar {
+        LVar::new("mv", LSort::Msg, idx)
     }
 
     /// A bare free `VarSpec` (`Untagged` sort, idx 0) — matches what the
@@ -2530,17 +2396,17 @@ mod tests {
         }
     }
 
-    /// The `LNLit` key/value `theta` uses for `v`.
-    fn var_lit(v: &p::VarSpec) -> LNLit {
-        Lit::Var(varspec_to_lvar(v))
+    /// The `LVar` key/value `theta` uses for `v`.
+    fn var_lit(v: &p::VarSpec) -> LVar {
+        varspec_to_lvar(v)
     }
 
     /// An exhaustive IDENTITY `theta` over `vars`: each variable maps to
-    /// itself. Point 2 requires `theta` to cover every free variable/name a
+    /// itself. Point 2 requires `theta` to cover every free variable a
     /// formula mentions (a miss panics), so tests whose free variables don't
     /// need to actually CHANGE still have to give `theta` an entry for each
     /// of them.
-    fn identity_theta(vars: &[p::VarSpec]) -> std::collections::BTreeMap<LNLit, LNLit> {
+    fn identity_theta(vars: &[p::VarSpec]) -> Theta {
         vars.iter().map(|v| (var_lit(v), var_lit(v))).collect()
     }
 
@@ -2714,60 +2580,58 @@ mod tests {
     }
 
     // -- 8) Point 1: name CONSTANTS (`PubLit`/`FreshLit`/`NatLit`) are
-    //    substituted via `theta` exactly like variables — `~'n'`/`~'m'` (two
-    //    fresh names) rename to `~'fn0'`/`~'fn1'`, cross-checked the same
-    //    way as test 1 (identity `theta` over the already-canonical names).
+    //    never renamed (see `tamarin_term::alpha_eq_ac`'s module doc): they
+    //    need no `theta` entry, are left as they are, and two formulas that
+    //    differ only in a name stay different. -----------------------------
     #[test]
-    fn fresh_name_literals_are_substituted_via_theta() {
-        let n = Name::new(NameTag::Fresh, "n");
-        let m = Name::new(NameTag::Fresh, "m");
-        let fn0 = Name::new(NameTag::Fresh, "fn0");
-        let fn1 = Name::new(NameTag::Fresh, "fn1");
-        let theta = std::collections::BTreeMap::from([
-            (Lit::Con(n), Lit::Con(fn0)),
-            (Lit::Con(m), Lit::Con(fn1)),
-        ]);
-        // AC normalization needed here too
-        let got = canonicalize_guarded(&g("~'m' = ~'n'"), &theta);
-
-        let identity = std::collections::BTreeMap::from([
-            (Lit::Con(fn0), Lit::Con(fn0)),
-            (Lit::Con(fn1), Lit::Con(fn1)),
-        ]);
-        let expected = canonicalize_guarded(&g("~'fn0' = ~'fn1'"), &identity);
-        assert_eq!(got, expected);
-        assert_eq!(fingerprint_guarded(&got), fingerprint_guarded(&expected));
-
+    fn name_literals_are_kept_fixed() {
+        let empty = Theta::new();
+        let got = canonicalize_guarded(&g("~'m' = ~'n'"), &empty);
+        let expected = canonicalize_guarded(&g("~'n' = ~'m'"), &empty);
+        assert_eq!(got, expected, "`=` is still brought into AC normal form");
         match &got {
             Guarded::Atom(GAtom::Eq(GTerm::FreshLit(a), GTerm::FreshLit(b))) => {
-                assert_eq!(a, "fn0");
-                assert_eq!(b, "fn1");
+                let mut names = [a.as_str(), b.as_str()];
+                names.sort();
+                assert_eq!(names, ["m", "n"]);
             }
             other => panic!("expected Eq(FreshLit, FreshLit), got {other:?}"),
         }
-    }
 
-    // -- 9) Point 1, continued: a name constant nested inside a FACT
-    //    argument (not just a bare equality operand) is substituted too —
-    //    exercises `subst_fact_via_theta`, not just `subst_term_via_theta`
-    //    at the top level of an atom. --------------------------------------
-    #[test]
-    fn name_literal_inside_fact_argument_is_substituted() {
-        let a = Name::new(NameTag::Pub, "a");
-        let pn0 = Name::new(NameTag::Pub, "pn0");
         let i = vs_node("i");
-        let theta = std::collections::BTreeMap::from([
-            (Lit::Con(a), Lit::Con(pn0)),
-            (var_lit(&i), var_lit(&i)),
-        ]);
-        let got = canonicalize_guarded(&g("P('a') @ #i"), &theta);
+        let theta = identity_theta(std::slice::from_ref(&i));
+        let got = canonicalize_guarded(&g("P('a', %'b') @ #i"), &theta);
         match &got {
             Guarded::Atom(GAtom::Action(f, _)) => {
-                assert_eq!(f.args.len(), 1);
-                assert!(matches!(&f.args[0], GTerm::PubLit(s) if s == "pn0"));
+                assert!(matches!(&f.args[0], GTerm::PubLit(s) if s == "a"));
+                assert!(matches!(&f.args[1], GTerm::NatLit(s) if s == "b"));
             }
             other => panic!("expected an Action atom, got {other:?}"),
         }
+    }
+
+    // -- 9) Formulas that differ only in a public constant (a message tag)
+    //    must NOT canonicalize equal, even though renaming '1' to '2' would
+    //    map one onto the other: the theory refers to '1' and '2' by
+    //    identity. --------------------------------------------------------
+    #[test]
+    fn formulas_differing_only_in_a_name_are_not_alpha_eq() {
+        let theta = identity_theta(&[vs("x"), vs_node("i")]);
+        let f1 = canonicalize_guarded(&g("P(<'1', x>) @ #i"), &theta);
+        let f2 = canonicalize_guarded(&g("P(<'2', x>) @ #i"), &theta);
+        assert_ne!(f1, f2);
+        assert_ne!(fingerprint_guarded(&f1), fingerprint_guarded(&f2));
+    }
+
+    // -- 9b) A name that occurs ONLY in a formula (here: under a
+    //    quantifier, so it can't be in the graph part) needs no `theta`
+    //    entry. ------------------------------------------------------------
+    #[test]
+    fn name_only_under_a_quantifier_needs_no_theta_entry() {
+        let empty = Theta::new();
+        let got = canonicalize_guarded(&g("not (Ex #j. Reveal('c') @ #j)"), &empty);
+        let other = canonicalize_guarded(&g("not (Ex #j. Reveal('d') @ #j)"), &empty);
+        assert_ne!(got, other);
     }
 
     // -- A term inside an atom is ALSO brought into `CAN_AC` normal form,
@@ -2866,18 +2730,18 @@ mod tests {
     // -- 10) Point 2: a free variable with NO entry in `theta` is a caller
     //    bug, not a case to fall back on silently — canonization panics. --
     #[test]
-    #[should_panic(expected = "has no entry in theta")]
+    #[should_panic(expected = "not covered by the canonical renaming")]
     fn missing_free_variable_in_theta_panics() {
         let empty = std::collections::BTreeMap::new();
         let _ = canonicalize_guarded(&g("x = y"), &empty);
     }
 
-    // -- 11) Point 2, continued: same for a missing NAME constant. ---------
+    // -- 11) Point 2, continued: same for a missing free NODE variable. ----
     #[test]
-    #[should_panic(expected = "has no entry in theta")]
-    fn missing_name_literal_in_theta_panics() {
-        let empty = std::collections::BTreeMap::new();
-        let _ = canonicalize_guarded(&g("~'n' = ~'n'"), &empty);
+    #[should_panic(expected = "not covered by the canonical renaming")]
+    fn missing_node_variable_in_theta_panics() {
+        let empty = Theta::new();
+        let _ = canonicalize_guarded(&g("P('a') @ #i"), &empty);
     }
 
     // -- 12) Idempotence: canonizing an already-canonical formula (with an
@@ -3005,7 +2869,7 @@ mod tests {
 
         let (_, labelling) = canonicalize_graph_part_seeded(&ordered, &edges);
 
-        let key = Lit::Var(node(0));
+        let key = node(0);
         assert!(
             labelling.theta().contains_key(&key),
             "expected theta to cover the vertex's own NodeId, got {:?}",
@@ -3659,7 +3523,7 @@ mod tests {
     /// within each sort (index 0, 1, ...), so a test can predict which
     /// output entry belongs to which input domain var.
     fn labelling_covering(domain_vars: &[LVar]) -> CanonLabelling {
-        let mut theta: std::collections::BTreeMap<LNLit, LNLit> = std::collections::BTreeMap::new();
+        let mut theta: Theta = std::collections::BTreeMap::new();
         let mut next_idx: std::collections::BTreeMap<LSort, u64> = std::collections::BTreeMap::new();
         for dv in domain_vars {
             let idx = next_idx.entry(dv.sort).or_insert(0);
@@ -3670,7 +3534,7 @@ mod tests {
                 LSort::Node => "tv",
                 LSort::Nat => "nv",
             };
-            theta.insert(Lit::Var(*dv), Lit::Var(LVar::new(name, dv.sort, *idx)));
+            theta.insert(*dv, LVar::new(name, dv.sort, *idx));
             *idx += 1;
         }
         CanonLabelling::from_theta(theta)
@@ -3696,12 +3560,12 @@ mod tests {
         let out = canonicalize_eq_disj_alternative(&alt, &labelling);
 
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0, Lit::Var(LVar::new("mv", LSort::Msg, 0)));
+        assert_eq!(out[0].0, LVar::new("mv", LSort::Msg, 0));
         // The witness got SOME fresh canonical literal of its own -- not
         // `w` itself (which was never a canonical form to begin with),
         // and not x's own canonical key.
         assert_ne!(out[0].1, var_term(w));
-        assert_ne!(out[0].1, LNTerm::Lit(out[0].0));
+        assert_ne!(out[0].1, var_term(out[0].0));
     }
 
     /// The core correctness property: two alternatives with the SAME
@@ -3761,8 +3625,8 @@ mod tests {
         let out = canonicalize_eq_disj_alternative(&alt, &labelling);
 
         assert_eq!(out.len(), 2);
-        let p_key = Lit::Var(LVar::new("mv", LSort::Msg, 0));
-        let q_key = Lit::Var(LVar::new("mv", LSort::Msg, 1));
+        let p_key = LVar::new("mv", LSort::Msg, 0);
+        let q_key = LVar::new("mv", LSort::Msg, 1);
         let p_range = &out.iter().find(|(k, _)| *k == p_key).expect("p entry").1;
         let q_range = &out.iter().find(|(k, _)| *k == q_key).expect("q entry").1;
         match p_range {
@@ -3797,7 +3661,7 @@ mod tests {
         let labelling = labelling_covering(&[x, y]);
         let y_canonical = *labelling
             .theta()
-            .get(&Lit::Var(y))
+            .get(&y)
             .expect("labelling_covering covers y");
 
         let out = canonicalize_eq_disj_alternative(&alt, &labelling);
@@ -3805,7 +3669,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_ne!(
             out[0].1,
-            LNTerm::Lit(y_canonical),
+            var_term(y_canonical),
             "the witness (raw-identical to `y`) must get its OWN canonical \
              identity, not `y`'s -- aliasing them would silently fuse an \
              existentially-local witness with an unrelated real variable"
@@ -3834,11 +3698,11 @@ mod tests {
         let v1 = LVar::new("v1", LSort::Msg, 1);
         let v2 = LVar::new("v2", LSort::Msg, 2);
         let shared_canonical = LVar::new("mv", LSort::Msg, 0);
-        let mut theta: std::collections::BTreeMap<LNLit, LNLit> = std::collections::BTreeMap::new();
+        let mut theta: Theta = std::collections::BTreeMap::new();
         // Deliberately broken: two DIFFERENT raw domain vars mapped to the
         // SAME canonical literal -- impossible via real accumulation.
-        theta.insert(Lit::Var(v1), Lit::Var(shared_canonical));
-        theta.insert(Lit::Var(v2), Lit::Var(shared_canonical));
+        theta.insert(v1, shared_canonical);
+        theta.insert(v2, shared_canonical);
         let labelling = CanonLabelling::from_theta(theta);
 
         let alt: LNSubstVFresh = LNSubstVFresh::from_list(vec![
@@ -3914,8 +3778,8 @@ mod tests {
         let solved = canonicalize_goals(&goal(true), labelling.theta());
 
         let expected_kind = CanonicalGoalKind::Action(
-            Lit::Var(LVar::new("tv", LSort::Node, 0)),
-            apply_literal_renaming(&fact_to_term(&fact), labelling.theta()),
+            LVar::new("tv", LSort::Node, 0),
+            fact_to_term(&apply_renaming(labelling.theta(), fact.clone())),
         );
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].kind, expected_kind);
@@ -3962,6 +3826,42 @@ mod tests {
         );
     }
 
+    /// System-level regression for names being constants: `!KU(<'1', x>)`
+    /// and `!KU(<'2', x>)` unify with different rule conclusions, so two
+    /// systems differing only in the tag must not canonicalize (or
+    /// fingerprint) identically -- while renaming `x` still merges.
+    #[test]
+    fn systems_differing_only_in_a_message_tag_are_not_alpha_eq() {
+        if !bliss_available() {
+            return;
+        }
+        use crate::canon_fingerprint::fingerprint_constraint_system;
+        use tamarin_term::builtin::pair;
+        use tamarin_term::lterm::pub_term;
+
+        let colors = empty_color_table();
+        let with_ku_goal = |tag: &str, var: &str| {
+            let mut sys = System::empty();
+            sys.content_mut().goals = std::sync::Arc::new(vec![(
+                Goal::Action(node(0), crate::fact::ku_fact(pair(pub_term(tag), v(var, LSort::Msg)))),
+                GoalStatus::default(),
+            )]);
+            canonicalize_constraint_system(&sys, &colors)
+                .unwrap_or_else(|e| panic!("canonicalize ('{tag}', {var}): {e:?}"))
+        };
+
+        let one_x = with_ku_goal("1", "x");
+        let two_x = with_ku_goal("2", "x");
+        let one_y = with_ku_goal("1", "y");
+
+        assert_ne!(one_x, two_x, "'1' and '2' are different constants");
+        assert_ne!(
+            fingerprint_constraint_system(&one_x),
+            fingerprint_constraint_system(&two_x)
+        );
+        assert_eq!(one_x, one_y, "renaming the variable still merges");
+    }
+
     #[test]
     fn canonicalize_goals_canonicalizes_chain_via_theta() {
         let conc_nid = node(0);
@@ -3981,9 +3881,9 @@ mod tests {
         assert_eq!(
             out[0].kind,
             CanonicalGoalKind::Chain(
-                Lit::Var(LVar::new("tv", LSort::Node, 0)),
+                LVar::new("tv", LSort::Node, 0),
                 ConcIdx(0),
-                Lit::Var(LVar::new("tv", LSort::Node, 1)),
+                LVar::new("tv", LSort::Node, 1),
                 PremIdx(1),
             )
         );
@@ -4004,11 +3904,11 @@ mod tests {
         let out = canonicalize_goals(&goals, labelling.theta());
 
         assert_eq!(out.len(), 1);
-        let expected_fact_term = apply_literal_renaming(&fact_to_term(&fact), labelling.theta());
+        let expected_fact_term = fact_to_term(&apply_renaming(labelling.theta(), fact.clone()));
         assert_eq!(
             out[0].kind,
             CanonicalGoalKind::Premise(
-                Lit::Var(LVar::new("tv", LSort::Node, 0)),
+                LVar::new("tv", LSort::Node, 0),
                 PremIdx(2),
                 expected_fact_term,
             )
@@ -4072,13 +3972,13 @@ mod tests {
     }
 
     /// The exhaustiveness contract every other Stage G field already has
-    /// (`lookup_theta`/`apply_literal_renaming` panic on a miss, not
-    /// silently pass through -- see `apply_literal_renaming`'s own doc
-    /// comment in `tamarin-term`) applies to goals too: a `Chain` goal
+    /// (`rename_var`/`apply_renaming` panic on a miss, not silently pass
+    /// through -- see `rename_var`'s own doc comment in `tamarin-term`)
+    /// applies to goals too: a `Chain` goal
     /// referencing a `NodeId` the graph part never discovered must panic
     /// loudly, not silently drop the reference.
     #[test]
-    #[should_panic(expected = "no entry in theta")]
+    #[should_panic(expected = "not covered by the canonical renaming")]
     fn canonicalize_goals_panics_on_a_node_id_missing_from_theta() {
         let uncovered_nid = node(99);
         let goals = vec![(

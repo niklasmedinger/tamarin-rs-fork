@@ -46,13 +46,9 @@ use crate::constraint::system::{SourceKind, Side};
 use crate::guarded::Guarded;
 
 use tamarin_term::fingerprint::{fingerprint_term, Fingerprint};
-use tamarin_term::lterm::{LNTerm, Name};
+use tamarin_term::lterm::{LNTerm, LVar};
 use tamarin_term::vterm::Lit;
 use tamarin_utils::fingerprint::FingerprintHasher;
-
-/// Same literal model `tamarin_term::alpha_eq_ac`/`canon` use internally:
-/// a term leaf is either a name constant or a variable.
-type LNLit = Lit<Name, tamarin_term::lterm::LVar>;
 
 /// Per-field fingerprints of a [`CanonicalSystem`] -- see the module docs
 /// for why these are kept separate rather than combined into one hash.
@@ -119,7 +115,7 @@ pub fn fingerprint_constraint_system(sys: &CanonicalSystem) -> CanonicalSystemFi
 
 fn fingerprint_eq_store(store: &CanonicalEqStore) -> CanonicalEqStoreFingerprint {
     CanonicalEqStoreFingerprint {
-        subst: fingerprint_lnlit_term_pairs(&store.subst),
+        subst: fingerprint_var_term_pairs(&store.subst),
         conj: fingerprint_eq_conj(&store.conj),
     }
 }
@@ -223,21 +219,21 @@ pub fn fingerprint_proof_method(m: &CanonicalProofMethod) -> Fingerprint {
 /// discipline [`canon::fingerprint_guarded`] uses for `Guarded`'s variants).
 fn hash_goal_kind(h: &mut FingerprintHasher, kind: &CanonicalGoalKind) {
     match kind {
-        CanonicalGoalKind::Action(nid_lit, fact_term) => {
+        CanonicalGoalKind::Action(nid, fact_term) => {
             h.tag("Action");
-            h.digest(&fingerprint_lnlit(nid_lit));
+            h.digest(&fingerprint_var(nid));
             h.digest(&fingerprint_term(fact_term));
         }
-        CanonicalGoalKind::Chain(conc_lit, conc_idx, prem_lit, prem_idx) => {
+        CanonicalGoalKind::Chain(conc_nid, conc_idx, prem_nid, prem_idx) => {
             h.tag("Chain");
-            h.digest(&fingerprint_lnlit(conc_lit));
+            h.digest(&fingerprint_var(conc_nid));
             h.u64(conc_idx.0 as u64);
-            h.digest(&fingerprint_lnlit(prem_lit));
+            h.digest(&fingerprint_var(prem_nid));
             h.u64(prem_idx.0 as u64);
         }
-        CanonicalGoalKind::Premise(prem_lit, prem_idx, fact_term) => {
+        CanonicalGoalKind::Premise(prem_nid, prem_idx, fact_term) => {
             h.tag("Premise");
-            h.digest(&fingerprint_lnlit(prem_lit));
+            h.digest(&fingerprint_var(prem_nid));
             h.u64(prem_idx.0 as u64);
             h.digest(&fingerprint_term(fact_term));
         }
@@ -253,25 +249,25 @@ fn hash_goal_kind(h: &mut FingerprintHasher, kind: &CanonicalGoalKind) {
     }
 }
 
-/// Fingerprints a bare `LNLit` by wrapping it as a one-node `Term::Lit`
+/// Fingerprints a bare variable by wrapping it as a one-node `Term::Lit`
 /// and reusing [`fingerprint_term`] unchanged -- `fingerprint_term`'s own
 /// `Lit` handling (`hash_lit`) isn't exposed as a separate function, and
 /// wrapping is free (`Lit` is `Copy`, no allocation), so there's nothing
 /// to gain from duplicating that logic here.
-fn fingerprint_lnlit(l: &LNLit) -> Fingerprint {
-    fingerprint_term(&LNTerm::Lit(*l))
+fn fingerprint_var(v: &LVar) -> Fingerprint {
+    fingerprint_term(&LNTerm::Lit(Lit::Var(*v)))
 }
 
-/// Folds a sequence of `(LNLit, LNTerm)` pairs (`eq_store.subst`, and one
+/// Folds a sequence of `(LVar, LNTerm)` pairs (`eq_store.subst`, and one
 /// alternative's own canonicalized range terms inside `eq_store.conj`)
 /// into one fingerprint, preserving pair order (already canonical-order
 /// for `subst`; see [`fingerprint_eq_disj`] for why order matters, or
 /// doesn't, inside `conj`).
-fn fingerprint_lnlit_term_pairs(pairs: &[(LNLit, LNTerm)]) -> Fingerprint {
+fn fingerprint_var_term_pairs(pairs: &[(LVar, LNTerm)]) -> Fingerprint {
     let mut h = FingerprintHasher::new();
     h.u64(pairs.len() as u64);
     for (k, v) in pairs {
-        h.digest(&fingerprint_lnlit(k));
+        h.digest(&fingerprint_var(k));
         h.digest(&fingerprint_term(v));
     }
     h.finish()
@@ -290,11 +286,11 @@ fn fingerprint_term_pairs(pairs: &[(LNTerm, LNTerm)]) -> Fingerprint {
     h.finish()
 }
 
-/// Folds `eq_store.conj: Vec<Vec<Vec<(LNLit, LNTerm)>>>` (the outer list
+/// Folds `eq_store.conj: Vec<Vec<Vec<(LVar, LNTerm)>>>` (the outer list
 /// of `EqDisj`s) into one fingerprint via [`fingerprint_eq_disj`] per
 /// disjunction, in order -- already canonical-content order (see
 /// `CanonicalEqStore::conj`'s own doc comment in `canon.rs`).
-fn fingerprint_eq_conj(conj: &[Vec<Vec<(LNLit, LNTerm)>>]) -> Fingerprint {
+fn fingerprint_eq_conj(conj: &[Vec<Vec<(LVar, LNTerm)>>]) -> Fingerprint {
     let mut h = FingerprintHasher::new();
     h.u64(conj.len() as u64);
     for disj in conj {
@@ -303,19 +299,19 @@ fn fingerprint_eq_conj(conj: &[Vec<Vec<(LNLit, LNTerm)>>]) -> Fingerprint {
     h.finish()
 }
 
-/// Folds one `EqDisj`'s alternatives (`Vec<Vec<(LNLit, LNTerm)>>`) into
-/// one fingerprint via [`fingerprint_lnlit_term_pairs`] per alternative,
+/// Folds one `EqDisj`'s alternatives (`Vec<Vec<(LVar, LNTerm)>>`) into
+/// one fingerprint via [`fingerprint_var_term_pairs`] per alternative,
 /// in order. Order here is content-driven, not incidental: a
 /// `CanonicalSystem`'s `conj` stores alternatives sorted by their own
 /// canonicalized content as a MULTISET (duplicates preserved, never
 /// deduplicated -- see `CanonicalEqStore::conj`'s own doc comment), so two
 /// $\alphaeqac$-equivalent systems' corresponding disjunctions always
 /// produce alternatives in the same relative order here too.
-fn fingerprint_eq_disj(alts: &[Vec<(LNLit, LNTerm)>]) -> Fingerprint {
+fn fingerprint_eq_disj(alts: &[Vec<(LVar, LNTerm)>]) -> Fingerprint {
     let mut h = FingerprintHasher::new();
     h.u64(alts.len() as u64);
     for alt in alts {
-        h.digest(&fingerprint_lnlit_term_pairs(alt));
+        h.digest(&fingerprint_var_term_pairs(alt));
     }
     h.finish()
 }
@@ -561,7 +557,7 @@ mod tests {
         let a = fingerprint_constraint_system(&baseline_system());
         let mut sys_b = baseline_system();
         sys_b.eq_store.conj = vec![vec![vec![(
-            Lit::Var(LVar::new("x", LSort::Msg, 0)),
+            LVar::new("x", LSort::Msg, 0),
             term("y", 0),
         )]]];
         let b = fingerprint_constraint_system(&sys_b);
@@ -639,9 +635,9 @@ mod tests {
             solved_formulas: vec![gtrue()],
             lemmas: vec![gtrue()],
             eq_store: CanonicalEqStore {
-                subst: vec![(Lit::Var(LVar::new("x", LSort::Msg, 0)), term("y", 0))],
+                subst: vec![(LVar::new("x", LSort::Msg, 0), term("y", 0))],
                 conj: vec![vec![vec![(
-                    Lit::Var(LVar::new("x", LSort::Msg, 0)),
+                    LVar::new("x", LSort::Msg, 0),
                     term("y", 0),
                 )]]],
             },
@@ -674,7 +670,7 @@ mod tests {
     #[test]
     fn eq_store_conj_fingerprint_preserves_multiplicity() {
         let alt = vec![(
-            Lit::Var(LVar::new("x", LSort::Msg, 0)),
+            LVar::new("x", LSort::Msg, 0),
             term("y", 0),
         )];
         let mut sys_one = baseline_system();
