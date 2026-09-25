@@ -38,7 +38,10 @@
 //! uses) needed to fold a `Vec<_>` field into one fingerprint, plus the
 //! top-level field-by-field assembly.
 
-use crate::canon::{self, CanonicalEqStore, CanonicalGoal, CanonicalGoalKind, CanonicalSubtermStore, CanonicalSystem};
+use crate::canon::{
+    self, CanonicalEqStore, CanonicalGoal, CanonicalGoalKind, CanonicalProofMethod,
+    CanonicalSubtermStore, CanonicalSystem,
+};
 use crate::constraint::system::{SourceKind, Side};
 use crate::guarded::Guarded;
 
@@ -53,7 +56,7 @@ type LNLit = Lit<Name, tamarin_term::lterm::LVar>;
 
 /// Per-field fingerprints of a [`CanonicalSystem`] -- see the module docs
 /// for why these are kept separate rather than combined into one hash.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CanonicalSystemFingerprint {
     pub graph_part: Fingerprint,
     pub formulas: Fingerprint,
@@ -80,7 +83,7 @@ pub struct CanonicalSystemFingerprint {
 /// same reason [`CanonicalSystemFingerprint`] itself has one field per
 /// `CanonicalSystem` field: collapsing `subst`/`conj` into one hash would
 /// hide which of the two actually diverged between two systems.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CanonicalEqStoreFingerprint {
     pub subst: Fingerprint,
     pub conj: Fingerprint,
@@ -89,7 +92,7 @@ pub struct CanonicalEqStoreFingerprint {
 /// Per-field fingerprints of a [`CanonicalSubtermStore`] -- see
 /// [`CanonicalEqStoreFingerprint`]'s own doc comment for why this isn't
 /// one combined hash either.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CanonicalSubtermStoreFingerprint {
     pub subterms: Fingerprint,
     pub solved_subterms: Fingerprint,
@@ -169,7 +172,62 @@ fn fingerprint_goals(goals: &[CanonicalGoal]) -> Fingerprint {
 /// [`CanonicalGoal`]'s own doc comment).
 fn fingerprint_canonical_goal(g: &CanonicalGoal) -> Fingerprint {
     let mut h = FingerprintHasher::new();
-    match &g.kind {
+    hash_goal_kind(&mut h, &g.kind);
+    h.u8(u8::from(g.solved));
+    h.finish()
+}
+
+/// Fingerprints one [`CanonicalProofMethod`]: a variant tag plus its
+/// payload. Compare methods of two systems as a sorted multiset of these.
+pub fn fingerprint_proof_method(m: &CanonicalProofMethod) -> Fingerprint {
+    let mut h = FingerprintHasher::new();
+    match m {
+        CanonicalProofMethod::Simplify => {
+            h.tag("Simplify");
+        }
+        CanonicalProofMethod::Induction => {
+            h.tag("Induction");
+        }
+        CanonicalProofMethod::Sorry(reason) => {
+            h.tag("Sorry");
+            match reason {
+                Some(r) => h.u8(1).tag(r),
+                None => h.u8(0),
+            };
+        }
+        CanonicalProofMethod::Finished {
+            result,
+            contradiction,
+        } => {
+            h.tag("Finished").tag(result);
+            match contradiction {
+                Some(c) => h.u8(1).tag(c),
+                None => h.u8(0),
+            };
+        }
+        CanonicalProofMethod::Solve(kind) => {
+            h.tag("Solve");
+            hash_goal_kind(&mut h, kind);
+        }
+        CanonicalProofMethod::SolveSplit(alts) => {
+            h.tag("SolveSplit");
+            h.digest(&fingerprint_eq_disj(alts));
+        }
+    }
+    h.finish()
+}
+
+/// The variant tag and payload of a [`CanonicalGoalKind`] -- shared by goal
+/// and proof-method fingerprints. Tags keep `Chain`/`Premise`/`Disj`/...
+/// from colliding even if their payloads happened to hash the same (same
+/// discipline [`canon::fingerprint_guarded`] uses for `Guarded`'s variants).
+fn hash_goal_kind(h: &mut FingerprintHasher, kind: &CanonicalGoalKind) {
+    match kind {
+        CanonicalGoalKind::Action(nid_lit, fact_term) => {
+            h.tag("Action");
+            h.digest(&fingerprint_lnlit(nid_lit));
+            h.digest(&fingerprint_term(fact_term));
+        }
         CanonicalGoalKind::Chain(conc_lit, conc_idx, prem_lit, prem_idx) => {
             h.tag("Chain");
             h.digest(&fingerprint_lnlit(conc_lit));
@@ -193,8 +251,6 @@ fn fingerprint_canonical_goal(g: &CanonicalGoal) -> Fingerprint {
             h.digest(&fingerprint_term(big));
         }
     }
-    h.u8(u8::from(g.solved));
-    h.finish()
 }
 
 /// Fingerprints a bare `LNLit` by wrapping it as a one-node `Term::Lit`

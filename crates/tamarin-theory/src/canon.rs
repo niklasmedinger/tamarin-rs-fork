@@ -1144,6 +1144,8 @@ fn hash_sort_hint(h: &mut FingerprintHasher, s: p::SortHint) {
 
 use crate::bliss_proc::BlissError;
 use crate::constraint::constraints::Goal;
+use crate::constraint::solver::proof_method::{ProofMethod, Result as FinishedResult};
+use crate::constraint::solver::Contradiction;
 use crate::constraint::system::{GoalStatus, Side, SourceKind, System};
 use crate::tools::equation_store::{EqDisj, EquationStore, LNSubst, LNSubstVFresh};
 use crate::tools::subterm_store::{SubtermConstraint, SubtermStore};
@@ -1183,23 +1185,21 @@ pub struct CanonicalSystem {
     pub lemmas: Vec<Guarded>,
     pub eq_store: CanonicalEqStore,
     pub subterm_store: CanonicalSubtermStore,
-    /// `sys.goals`, minus `Goal::Action` (already a real `VertexKind::Action`
-    /// vertex in `graph_part` -- see `canon_graph::extract_graph_part`'s
-    /// own doc comment) and `Goal::Split` (dropped -- it only NAMES an
+    /// `sys.goals`, minus `Goal::Split` (dropped -- it only NAMES an
     /// `EqDisj` already present in `eq_store.conj`; nothing else ever
     /// reads its raw id, the exact same reasoning that already dropped
-    /// `EqDisj::split_id` itself). See [`canonicalize_goals`] for the
-    /// remaining four variants' canonicalization and why `GoalStatus::solved`
-    /// is kept (content-relevant: gates whether `candidate_methods` offers
-    /// the goal again) while `::looping`/`::nr` are not (pure
-    /// heuristic-ranking / path-dependent bookkeeping). Sorted, NOT
-    /// deduplicated -- see [`canonicalize_goals`]'s own doc comment.
+    /// `EqDisj::split_id` itself). See [`canonicalize_goals`] for each
+    /// variant's canonicalization and why `GoalStatus::solved` is kept
+    /// (content-relevant: gates whether `candidate_methods` offers the goal
+    /// again) while `::looping`/`::nr` are not (pure heuristic-ranking /
+    /// path-dependent bookkeeping). Sorted, NOT deduplicated -- see
+    /// [`canonicalize_goals`]'s own doc comment.
     pub goals: Vec<CanonicalGoal>,
     pub source_kind: Option<SourceKind>,
     pub side: Option<Side>,
 }
 
-/// Canonicalized form of one non-`Action`/non-`Split` [`Goal`], paired
+/// Canonicalized form of one non-`Split` [`Goal`], paired
 /// with whether it's currently solved -- see [`CanonicalSystem::goals`]'s
 /// own doc comment.
 ///
@@ -1218,6 +1218,13 @@ pub struct CanonicalGoal {
 /// the matching [`Goal`] variant.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CanonicalGoalKind {
+    /// `Goal::Action(LVar, LNFact)`: the `NodeId` and the fact canonicalized
+    /// via `theta`. The same `(NodeId, fact)` is also a `VertexKind::Action`
+    /// vertex in `graph_part` (which is what puts its literals into `theta`);
+    /// the vertex records that the action exists, this entry records that
+    /// it is a GOAL and whether it is solved -- neither of which the vertex
+    /// carries, and both of which decide what `candidate_methods` offers.
+    Action(LNLit, LNTerm),
     /// `Goal::Chain(NodeConc, NodePrem)`: both endpoints' `NodeId`s
     /// canonicalized via the graph part's `theta` -- no new literal, the
     /// port indices need no renaming.
@@ -1312,7 +1319,7 @@ fn cmp_canonical_goal_slice(a: &[CanonicalGoal], b: &[CanonicalGoal]) -> std::cm
 }
 
 /// Total order over [`CanonicalGoal`] -- constructor rank
-/// (`Chain < Premise < Disj < Subterm`, this enum's declaration order,
+/// (`Action < Chain < Premise < Disj < Subterm`, this enum's declaration order,
 /// mirroring [`crate::constraint::constraints::cmp_goal`]'s own style)
 /// then payload, `solved` last (so two goals with the same canonicalized
 /// content but different solved-status sort adjacently, not scattered).
@@ -1323,10 +1330,11 @@ fn cmp_canonical_goal(a: &CanonicalGoal, b: &CanonicalGoal) -> std::cmp::Orderin
 fn cmp_canonical_goal_kind(a: &CanonicalGoalKind, b: &CanonicalGoalKind) -> std::cmp::Ordering {
     fn rank(k: &CanonicalGoalKind) -> u8 {
         match k {
-            CanonicalGoalKind::Chain(..) => 0,
-            CanonicalGoalKind::Premise(..) => 1,
-            CanonicalGoalKind::Disj(_) => 2,
-            CanonicalGoalKind::Subterm(..) => 3,
+            CanonicalGoalKind::Action(..) => 0,
+            CanonicalGoalKind::Chain(..) => 1,
+            CanonicalGoalKind::Premise(..) => 2,
+            CanonicalGoalKind::Disj(_) => 3,
+            CanonicalGoalKind::Subterm(..) => 4,
         }
     }
     let (ra, rb) = (rank(a), rank(b));
@@ -1336,6 +1344,12 @@ fn cmp_canonical_goal_kind(a: &CanonicalGoalKind, b: &CanonicalGoalKind) -> std:
     // Rank equality above guarantees the same variant, so each `let …
     // else` binding of `b` is infallible.
     match a {
+        CanonicalGoalKind::Action(n1, f1) => {
+            let CanonicalGoalKind::Action(n2, f2) = b else {
+                unreachable!("rank matched Action")
+            };
+            n1.cmp(n2).then_with(|| f1.cmp(f2))
+        }
         CanonicalGoalKind::Chain(cl1, ci1, pl1, pi1) => {
             let CanonicalGoalKind::Chain(cl2, ci2, pl2, pi2) = b else {
                 unreachable!("rank matched Chain")
@@ -1434,6 +1448,20 @@ pub fn canonicalize_constraint_system(
     sys: &System,
     colors: &crate::canon_color::ColorTable,
 ) -> Result<CanonicalSystem, BlissError> {
+    canonicalize_constraint_system_with_labelling(sys, colors).map(|(canon, _)| canon)
+}
+
+/// [`canonicalize_constraint_system`], also returning the winning
+/// survivor's [`CanonLabelling`] -- the renaming that maps `sys` onto its
+/// canonical form, for canonicalizing anything else derived from `sys`
+/// consistently with it (e.g. its proof methods, [`canonicalize_proof_method`]).
+/// With several tied survivors this is one of them; anything canonicalized
+/// through it should be compared as a multiset, which a symmetry of the
+/// system maps onto itself.
+pub fn canonicalize_constraint_system_with_labelling(
+    sys: &System,
+    colors: &crate::canon_color::ColorTable,
+) -> Result<(CanonicalSystem, CanonLabelling), BlissError> {
     // Stage A+B: vertex/edge structure plus the caller-supplied vertex
     // coloring, in one call -- see `canon_graph`'s own module docs for
     // why `GraphPart` owns its `ColorTable` rather than threading it
@@ -1456,9 +1484,8 @@ pub fn canonicalize_constraint_system(
     // canonicalizable content (formulas, eq_store, ...) still to process.
     if part.vertices.is_empty() {
         let (graph_term, labelling) = canonicalize_graph_part_seeded(&[], &BTreeSet::new());
-        return Ok(canonicalize_system_content_seeded(
-            sys, &labelling, graph_term,
-        ));
+        let canon = canonicalize_system_content_seeded(sys, &labelling, graph_term);
+        return Ok((canon, labelling));
     }
 
     // Stage C: bliss's own canonical labeling plus a GENERATING set for
@@ -1489,7 +1516,7 @@ pub fn canonicalize_constraint_system(
     // no new invocation of) and extend it through formulas ->
     // solved_formulas -> lemmas -> eq_store -> subterm_store -- a fixed,
     // deterministic order.
-    let mut candidates: Vec<CanonicalSystem> = Vec::with_capacity(survivors.len());
+    let mut candidates: Vec<(CanonicalSystem, CanonLabelling)> = Vec::with_capacity(survivors.len());
     for (labeling, graph_term) in &survivors {
         let ordered = crate::bliss_proc::canonical_vertex_order(&part, labeling);
         let edges = crate::bliss_proc::canonical_edges(&part, labeling);
@@ -1499,11 +1526,8 @@ pub fn canonicalize_constraint_system(
             "re-running canonicalize_graph_part_seeded for a winning labeling must \
              reproduce the same term minimal_graph_part_labelings already found"
         );
-        candidates.push(canonicalize_system_content_seeded(
-            sys,
-            &labelling,
-            graph_term_again,
-        ));
+        let canon = canonicalize_system_content_seeded(sys, &labelling, graph_term_again);
+        candidates.push((canon, labelling));
     }
 
     // Stage F's system-level tie-break: the minimum CanonicalSystem over
@@ -1512,7 +1536,7 @@ pub fn canonicalize_constraint_system(
     // `cmp_canonical_system`'s own doc comment).
     Ok(candidates
         .into_iter()
-        .min_by(cmp_canonical_system)
+        .min_by(|(a, _), (b, _)| cmp_canonical_system(a, b))
         .expect("`candidates` has one entry per (non-empty) `survivors` entry"))
 }
 
@@ -1626,6 +1650,69 @@ pub struct ContentStageTimes {
     /// `sys.goals.len()` BEFORE dropping `Action`/`Split` -- the raw
     /// count, not `CanonicalSystem::goals.len()` (which excludes both).
     pub num_goals: usize,
+}
+
+impl ContentStageTimes {
+    /// Adds `other`'s durations only. The `num_*` counts describe the
+    /// `System` itself, so they are identical across one node's survivors
+    /// and must not be summed there. Destructured without `..` so a new
+    /// field forces a decision here.
+    pub fn add_durations(&mut self, other: &Self) {
+        let ContentStageTimes {
+            formulas,
+            solved_formulas,
+            lemmas,
+            eq_store_subst,
+            eq_store_conj,
+            subterm_store,
+            goals,
+            num_formulas: _,
+            num_solved_formulas: _,
+            num_lemmas: _,
+            num_eq_store_subst: _,
+            num_eq_store_conj: _,
+            num_eq_store_conj_alternatives: _,
+            num_subterms: _,
+            num_solved_subterms: _,
+            num_neg_subterms: _,
+            num_goals: _,
+        } = *other;
+        self.formulas += formulas;
+        self.solved_formulas += solved_formulas;
+        self.lemmas += lemmas;
+        self.eq_store_subst += eq_store_subst;
+        self.eq_store_conj += eq_store_conj;
+        self.subterm_store += subterm_store;
+        self.goals += goals;
+    }
+
+    /// The summed duration of every stage.
+    pub fn total_duration(&self) -> std::time::Duration {
+        self.formulas
+            + self.solved_formulas
+            + self.lemmas
+            + self.eq_store_subst
+            + self.eq_store_conj
+            + self.subterm_store
+            + self.goals
+    }
+}
+
+/// Sums durations AND counts -- for aggregating across different nodes.
+impl std::ops::AddAssign<&ContentStageTimes> for ContentStageTimes {
+    fn add_assign(&mut self, other: &ContentStageTimes) {
+        self.add_durations(other);
+        self.num_formulas += other.num_formulas;
+        self.num_solved_formulas += other.num_solved_formulas;
+        self.num_lemmas += other.num_lemmas;
+        self.num_eq_store_subst += other.num_eq_store_subst;
+        self.num_eq_store_conj += other.num_eq_store_conj;
+        self.num_eq_store_conj_alternatives += other.num_eq_store_conj_alternatives;
+        self.num_subterms += other.num_subterms;
+        self.num_solved_subterms += other.num_solved_subterms;
+        self.num_neg_subterms += other.num_neg_subterms;
+        self.num_goals += other.num_goals;
+    }
 }
 
 /// The [`canonicalize_system_content_seeded`] this function's own doc
@@ -1993,15 +2080,15 @@ fn canonicalize_subterm_store(
 /// field (a missing entry panics via [`lookup_theta`]/
 /// [`apply_literal_renaming`], not a silent fallback).
 ///
-/// `Goal::Action` is skipped entirely: it's already a real
-/// `VertexKind::Action` vertex in the graph part (`canon_graph::extract_graph_part`
-/// adds one per `Goal::Action`, deduped against formula-derived actions
-/// -- see that function's own doc comment), so canonicalizing it again
-/// here would double-count the exact same content under a different
-/// field. `Goal::Split` is skipped too: it only NAMES an `EqDisj` already
-/// in `eq_store.conj` (see [`CanonicalSystem::goals`]'s own doc comment).
+/// `Goal::Action` is kept even though `canon_graph::extract_graph_part`
+/// also turns it into a `VertexKind::Action` vertex: the vertex (deduped
+/// against formula-derived actions) only says the action exists. Whether
+/// it is also a goal, and whether that goal is solved, is recorded only
+/// here -- two systems differing in either offer different proof methods.
+/// `Goal::Split` is skipped: it only NAMES an `EqDisj` already in
+/// `eq_store.conj` (see [`CanonicalSystem::goals`]'s own doc comment).
 ///
-/// The remaining four variants keep [`GoalStatus::solved`] (content-relevant
+/// Every kept variant keeps [`GoalStatus::solved`] (content-relevant
 /// -- see [`CanonicalGoal`]'s own doc comment) but drop `::looping`/`::nr`
 /// (pure heuristic-ranking / path-dependent bookkeeping, matching
 /// `next_goal_nr`'s own exclusion from the canonical form). Sorted, but
@@ -2021,28 +2108,7 @@ fn canonicalize_goals(
     let mut out: Vec<CanonicalGoal> = goals
         .iter()
         .filter_map(|(goal, status)| {
-            let kind = match goal {
-                Goal::Action(..) | Goal::Split(_) => return None,
-                Goal::Chain((conc_nid, conc_idx), (prem_nid, prem_idx)) => CanonicalGoalKind::Chain(
-                    *lookup_theta(theta, &Lit::Var(*conc_nid)),
-                    *conc_idx,
-                    *lookup_theta(theta, &Lit::Var(*prem_nid)),
-                    *prem_idx,
-                ),
-                Goal::Premise((prem_nid, prem_idx), fact) => CanonicalGoalKind::Premise(
-                    *lookup_theta(theta, &Lit::Var(*prem_nid)),
-                    *prem_idx,
-                    apply_literal_renaming(&fact_to_term(fact), theta),
-                ),
-                Goal::Disj(disj) => CanonicalGoalKind::Disj(sort_guarded(
-                    disj.0.iter().map(|g| canonicalize_guarded(g, theta)).collect(),
-                )),
-                Goal::Subterm((small, big)) => CanonicalGoalKind::Subterm(
-                    apply_literal_renaming(small, theta),
-                    apply_literal_renaming(big, theta),
-                ),
-            };
-            Some(CanonicalGoal {
+            canonicalize_goal_kind(goal, theta).map(|kind| CanonicalGoal {
                 kind,
                 solved: status.solved,
             })
@@ -2050,6 +2116,128 @@ fn canonicalize_goals(
         .collect();
     out.sort_by(cmp_canonical_goal);
     out
+}
+
+/// One goal's canonical payload via `theta` (panicking on an uncovered
+/// literal, like every other Stage G field) -- `None` for `Goal::Split`,
+/// whose raw id the canonical form drops (see [`canonicalize_goals`]).
+pub fn canonicalize_goal_kind(
+    goal: &Goal,
+    theta: &std::collections::BTreeMap<LNLit, LNLit>,
+) -> Option<CanonicalGoalKind> {
+    Some(match goal {
+        Goal::Split(_) => return None,
+        Goal::Action(nid, fact) => CanonicalGoalKind::Action(
+            *lookup_theta(theta, &Lit::Var(*nid)),
+            apply_literal_renaming(&fact_to_term(fact), theta),
+        ),
+        Goal::Chain((conc_nid, conc_idx), (prem_nid, prem_idx)) => CanonicalGoalKind::Chain(
+            *lookup_theta(theta, &Lit::Var(*conc_nid)),
+            *conc_idx,
+            *lookup_theta(theta, &Lit::Var(*prem_nid)),
+            *prem_idx,
+        ),
+        Goal::Premise((prem_nid, prem_idx), fact) => CanonicalGoalKind::Premise(
+            *lookup_theta(theta, &Lit::Var(*prem_nid)),
+            *prem_idx,
+            apply_literal_renaming(&fact_to_term(fact), theta),
+        ),
+        Goal::Disj(disj) => CanonicalGoalKind::Disj(sort_guarded(
+            disj.0.iter().map(|g| canonicalize_guarded(g, theta)).collect(),
+        )),
+        Goal::Subterm((small, big)) => CanonicalGoalKind::Subterm(
+            apply_literal_renaming(small, theta),
+            apply_literal_renaming(big, theta),
+        ),
+    })
+}
+
+/// A [`ProofMethod`] renamed through a system's canonical labelling (see
+/// [`canonicalize_proof_method`]): two canonically equal systems must offer
+/// the same MULTISET of these. Only a multiset -- `candidate_methods` ranks
+/// goals using `depth`, `GoalStatus::looping` and `GoalStatus::nr`, none of
+/// which are part of the canonical form, so the order may differ.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanonicalProofMethod {
+    Simplify,
+    Induction,
+    Sorry(Option<String>),
+    /// Result and contradiction KIND only: the payload (`NodeId`s, a term)
+    /// belongs to whichever contradiction `is_finished` happens to find
+    /// first, which depends on raw iteration order.
+    Finished {
+        result: &'static str,
+        contradiction: Option<&'static str>,
+    },
+    Solve(CanonicalGoalKind),
+    /// `solve` of a case split, identified by the canonicalized alternatives
+    /// of the `EqDisj` it names -- the canonical form drops split ids.
+    SolveSplit(Vec<Vec<(LNLit, LNTerm)>>),
+}
+
+/// Renames `method` (offered for `sys`) through `labelling`, `sys`'s
+/// canonical labelling from [`canonicalize_constraint_system_with_labelling`].
+/// Panics on a literal `labelling` doesn't cover, on a split goal naming no
+/// `EqDisj` in `sys.eq_store.conj`, and on the display-only
+/// `Invalidated`/`RawSolve`, which `candidate_methods` never produces.
+pub fn canonicalize_proof_method(
+    method: &ProofMethod,
+    sys: &System,
+    labelling: &CanonLabelling,
+) -> CanonicalProofMethod {
+    match method {
+        ProofMethod::Simplify => CanonicalProofMethod::Simplify,
+        ProofMethod::Induction => CanonicalProofMethod::Induction,
+        ProofMethod::Sorry(reason) => CanonicalProofMethod::Sorry(reason.clone()),
+        ProofMethod::Finished(result) => {
+            let (result, contradiction) = match result {
+                FinishedResult::Solved => ("solved", None),
+                FinishedResult::Contradictory(c) => {
+                    ("contradictory", c.as_ref().map(contradiction_kind))
+                }
+                FinishedResult::Unfinishable => ("unfinishable", None),
+            };
+            CanonicalProofMethod::Finished {
+                result,
+                contradiction,
+            }
+        }
+        ProofMethod::SolveGoal(Goal::Split(id)) => {
+            let disj = sys
+                .eq_store
+                .conj
+                .iter()
+                .find(|d| d.split_id == *id)
+                .unwrap_or_else(|| panic!("split goal {id:?} names no EqDisj in eq_store.conj"));
+            CanonicalProofMethod::SolveSplit(canonicalize_eq_disj(disj, labelling))
+        }
+        ProofMethod::SolveGoal(goal) => CanonicalProofMethod::Solve(
+            canonicalize_goal_kind(goal, labelling.theta())
+                .expect("only Goal::Split has no goal kind, handled above"),
+        ),
+        ProofMethod::Invalidated | ProofMethod::RawSolve(_) => {
+            panic!("{method:?} is display-only and never a candidate proof method")
+        }
+    }
+}
+
+fn contradiction_kind(c: &Contradiction) -> &'static str {
+    match c {
+        Contradiction::Cyclic => "cyclic",
+        Contradiction::SubtermCyclic => "subterm_cyclic",
+        Contradiction::NonNormalTerms => "non_normal_terms",
+        Contradiction::ForbiddenExp => "forbidden_exp",
+        Contradiction::ForbiddenBP => "forbidden_bp",
+        Contradiction::ForbiddenKD => "forbidden_kd",
+        Contradiction::ImpossibleChain => "impossible_chain",
+        Contradiction::ForbiddenChain => "forbidden_chain",
+        Contradiction::ForbiddenACConstrChain => "forbidden_ac_constr_chain",
+        Contradiction::NonInjectiveFactInstance(..) => "non_injective_fact_instance",
+        Contradiction::IncompatibleEqs => "incompatible_eqs",
+        Contradiction::FormulasFalse => "formulas_false",
+        Contradiction::SuperfluousLearn(..) => "superfluous_learn",
+        Contradiction::NodeAfterLast(..) => "node_after_last",
+    }
 }
 
 #[cfg(test)]
@@ -3639,25 +3827,84 @@ mod tests {
     // -- Stage G: goals (`canonicalize_goals`) -----------------------------
 
     #[test]
-    fn canonicalize_goals_drops_action_and_split_goals() {
-        let nid = node(0);
-        let labelling = labelling_covering(&[nid]);
-        let goals = vec![
-            (
-                Goal::Action(nid, proto_fact(Multiplicity::Linear, "P", vec![])),
-                GoalStatus::default(),
-            ),
-            (
-                Goal::Split(crate::tools::equation_store::SplitId(0)),
-                GoalStatus::default(),
-            ),
-        ];
-        let out = canonicalize_goals(&goals, labelling.theta());
+    fn canonicalize_goals_drops_split_goals() {
+        let goals = vec![(
+            Goal::Split(crate::tools::equation_store::SplitId(0)),
+            GoalStatus::default(),
+        )];
+        let out = canonicalize_goals(&goals, &std::collections::BTreeMap::new());
         assert!(
             out.is_empty(),
-            "Action (already a graph-part vertex) and Split (only names an \
-             EqDisj already in eq_store.conj) must not appear in the \
-             canonical goal list: {out:?}"
+            "Split only names an EqDisj already in eq_store.conj and must not \
+             appear in the canonical goal list: {out:?}"
+        );
+    }
+
+    #[test]
+    fn canonicalize_goals_keeps_action_goals_with_their_solved_status() {
+        let nid = node(0);
+        let x = LVar::new("x", LSort::Msg, 0);
+        let labelling = labelling_covering(&[nid, x]);
+        let fact = proto_fact(Multiplicity::Linear, "P", vec![v("x", LSort::Msg)]);
+        let goal = |solved| {
+            vec![(
+                Goal::Action(nid, fact.clone()),
+                GoalStatus {
+                    solved,
+                    ..Default::default()
+                },
+            )]
+        };
+
+        let open = canonicalize_goals(&goal(false), labelling.theta());
+        let solved = canonicalize_goals(&goal(true), labelling.theta());
+
+        let expected_kind = CanonicalGoalKind::Action(
+            Lit::Var(LVar::new("tv", LSort::Node, 0)),
+            apply_literal_renaming(&fact_to_term(&fact), labelling.theta()),
+        );
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, expected_kind);
+        assert!(!open[0].solved);
+        assert_eq!(solved[0].kind, expected_kind);
+        assert!(solved[0].solved);
+        assert_ne!(open, solved, "solved-ness of an action goal must survive canonicalization");
+    }
+
+    /// System-level regression: an action goal's `solved` flag decides
+    /// whether `candidate_methods` offers it, so two systems differing only
+    /// in it are different proof-search states. The action's
+    /// `VertexKind::Action` vertex is identical in both, so only the goal
+    /// list can tell them apart.
+    #[test]
+    fn systems_differing_only_in_an_action_goals_solved_status_are_not_alpha_eq() {
+        if !bliss_available() {
+            return;
+        }
+        let colors = empty_color_table();
+        let with_action_goal = |solved| {
+            let mut sys = System::empty();
+            sys.content_mut().goals = std::sync::Arc::new(vec![(
+                Goal::Action(node(0), crate::fact::ku_fact(zero_ary_fun_term("m"))),
+                GoalStatus {
+                    solved,
+                    ..Default::default()
+                },
+            )]);
+            canonicalize_constraint_system(&sys, &colors)
+                .unwrap_or_else(|e| panic!("canonicalize (solved={solved}): {e:?}"))
+        };
+
+        let open = with_action_goal(false);
+        let solved = with_action_goal(true);
+
+        assert_eq!(
+            open.graph_part, solved.graph_part,
+            "the action vertex itself is identical in both systems"
+        );
+        assert_ne!(
+            open, solved,
+            "an open and a solved action goal must not canonicalize identically"
         );
     }
 
@@ -3824,6 +4071,88 @@ mod tests {
             canon_a, canon_b,
             "a system with a genuine pending Subterm goal must not canonicalize \
              identically to one without it"
+        );
+    }
+
+    // -- canonicalize_proof_method --
+
+    /// The same goal under two different raw namings, each renamed through
+    /// its own system's labelling, must give the same canonical method.
+    #[test]
+    fn alpha_renamed_solve_goals_canonicalize_equally() {
+        let solve = |nid: LVar, var: &str| {
+            let x = LVar::new(var, LSort::Msg, 0);
+            let method = ProofMethod::SolveGoal(Goal::Premise(
+                (nid, PremIdx(0)),
+                in_fact(v(var, LSort::Msg)),
+            ));
+            canonicalize_proof_method(&method, &System::empty(), &labelling_covering(&[nid, x]))
+        };
+        assert_eq!(solve(node(0), "x"), solve(node(5), "y"));
+        assert_ne!(
+            solve(node(0), "x"),
+            canonicalize_proof_method(
+                &ProofMethod::Simplify,
+                &System::empty(),
+                &CanonLabelling::empty()
+            )
+        );
+    }
+
+    /// A split goal is identified by its `EqDisj`'s canonicalized content,
+    /// not by its raw split id (which the canonical form drops).
+    #[test]
+    fn split_methods_canonicalize_by_their_disjunctions_content() {
+        use crate::tools::equation_store::SplitId;
+        let x = LVar::new("x", LSort::Msg, 7);
+        let solve_split = |id: i64, witness_idx: u64| {
+            let mut sys = System::empty();
+            sys.eq_store_mut().conj.push(EqDisj {
+                split_id: SplitId(id),
+                substs: vec![LNSubstVFresh::from_list(vec![(
+                    x,
+                    var_term(LVar::new("w", LSort::Msg, witness_idx)),
+                )])],
+            });
+            canonicalize_proof_method(
+                &ProofMethod::SolveGoal(Goal::Split(SplitId(id))),
+                &sys,
+                &labelling_covering(&[x]),
+            )
+        };
+        let a = solve_split(0, 100);
+        assert!(matches!(a, CanonicalProofMethod::SolveSplit(_)));
+        assert_eq!(a, solve_split(3, 500));
+    }
+
+    #[test]
+    #[should_panic(expected = "names no EqDisj")]
+    fn a_split_method_naming_no_disjunction_panics() {
+        let _ = canonicalize_proof_method(
+            &ProofMethod::SolveGoal(Goal::Split(crate::tools::equation_store::SplitId(9))),
+            &System::empty(),
+            &CanonLabelling::empty(),
+        );
+    }
+
+    /// Which contradiction instance `is_finished` reports first depends on
+    /// raw iteration order, so only its kind may count.
+    #[test]
+    fn finished_methods_ignore_the_contradiction_payload() {
+        let finished = |c: Contradiction| {
+            canonicalize_proof_method(
+                &ProofMethod::Finished(FinishedResult::Contradictory(Some(c))),
+                &System::empty(),
+                &CanonLabelling::empty(),
+            )
+        };
+        assert_eq!(
+            finished(Contradiction::NodeAfterLast(node(0), node(1))),
+            finished(Contradiction::NodeAfterLast(node(7), node(3)))
+        );
+        assert_ne!(
+            finished(Contradiction::NodeAfterLast(node(0), node(1))),
+            finished(Contradiction::Cyclic)
         );
     }
 
