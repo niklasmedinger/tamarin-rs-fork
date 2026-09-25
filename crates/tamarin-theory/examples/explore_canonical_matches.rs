@@ -89,10 +89,17 @@
 //! ## Output
 //!
 //! Written to `--out` (default `explore_<theory-stem>_<lemma>.json`) as one
-//! compact JSON object, `schema_version` 2 (use `jq .` to read it):
-//! `theory`, `lemma`, `argv`, `params`, `truncated` (`--max-nodes` stopped
-//! the search), `lower_bound` (some node is unexpanded or failed to
-//! canonicalize, so `tree` undercounts), `sizes` (the three totals plus
+//! compact JSON object, `schema_version` 3 (use `jq .` to read it), via a
+//! temporary file and a rename (a killed run never leaves a truncated one):
+//! `theory`, `lemma`, `argv`, `params`, `stop_reason` (`exhausted`,
+//! `max_nodes`, `time_budget` or `panic`), `truncated` (anything but
+//! `exhausted`), `lower_bound` (some node is unexpanded or failed to
+//! canonicalize or expand, so `tree` undercounts), `timing` (`setup_secs`,
+//! `explore_secs`), `peak_rss_mib`, `canonicalize` (`failures` and up to 20
+//! `examples`, each with its `kind` -- `panic` or `error` --, `path` and
+//! `message`), `panic` (null, or where expanding a node panicked: `node`,
+//! `path`, `activity`, `message`), `invariant_violations` (see "Three
+//! sizes"; expected only after a `panic` stop), `sizes` (the three totals plus
 //! `graph_by_min_depth`, `graph_distinct_at_depth`, `processed_by_depth`,
 //! `tree_by_depth`; counts above `u64::MAX` are strings), `status_counts`,
 //! `method_check` (`checked` merges, `mismatches`, `failures` to canonicalize
@@ -101,19 +108,50 @@
 //! methods only on either side), `methods` (interned method text, including
 //! candidate methods that were never applied) and `nodes`: per OR node its `depth`
 //! (min depth), `status` (`expanded`, `finished` + `result`, `depth_limit`,
-//! `unexpanded`, `canon_panic`), `canon_err` (canonicalization returned an
+//! `unexpanded`, `canon_panic`, `exec_panic`), `canon_err` (canonicalization returned an
 //! error: expanded normally but never merged into), `first_parent`
 //! (`[parent, and_index, case_index]` of the occurrence that created it),
 //! `inapplicable`, and `and` (`method` index, `kind`, `cases` as
 //! `[name, child_id]` pairs).
 //!
-//! Usage: `cargo run --example explore_canonical_matches -- <theory.spthy> <lemma> [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge]`
+//! Usage: `cargo run --example explore_canonical_matches -- <theory.spthy> <lemma> [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--time-budget SECS] [--heartbeat SECS] [--trace]`
+//! or `... -- --list-lemmas <theory.spthy>`.
 //!
 //! - `--max-depth` (default 4): don't expand nodes at this depth.
 //! - `--max-nodes` (default 2000): stop expanding once this many
 //!   occurrences have been canonicalized. Checked before each expansion, so
 //!   it can be exceeded by one node's fan-out; queued nodes stay
 //!   `unexpanded`.
+//! - `--time-budget SECS`: likewise, stop expanding once the process has
+//!   run this long (setup included); the JSON is written as usual. Also
+//!   checked only between expansions, so one expansion can overrun it.
+//! - `--heartbeat SECS`: log a progress line (processed, graph, queue,
+//!   rate, RSS, and the current node's step and how long it has run) every
+//!   SECS, from a background thread, so a single long step (one
+//!   `exec_proof_method` can take minutes) is visible as such.
+//! - `--trace`: log every expansion and every applied method, so a run
+//!   killed from outside still shows where it was.
+//! - `--list-lemmas`: print one JSON object describing the theory instead
+//!   of exploring: `lines`, `diff` (only parses with the `diff` flag, or has
+//!   diff/equivalence lemmas; the port has no diff-mode prover),
+//!   `processes` (SAPIC), `rules`, `lemmas` (`name`, `trace_quantifier`,
+//!   `attributes`, `modulo`) and `error`.
+//!
+//! ## Batch runs
+//!
+//! `experiments/run_explore.py` (in the thesis repository) runs this over
+//! many theories/lemmas, keeping each run's stderr as its log. Every log
+//! line is prefixed with the seconds since start, and names the phase
+//! (`setup`, `explore`, `write`) as it changes. A panic's message is
+//! followed by a `panic context` line: the phase, the OR node being
+//! expanded, its path, and the step at that node (which method, which case
+//! being visited, which stage of visiting it). A panic while expanding a
+//! node (outside canonicalization, whose panics are recorded per node)
+//! stops the exploration there, marks the node `exec_panic`, and still
+//! writes the JSON. Exit codes: 0 done (whatever `stop_reason`), 2 usage,
+//! 3 setup failed (read/parse/elaborate/maude/lemma; no JSON), 4 stopped by
+//! a panic (partial JSON), 5 a size invariant failed (JSON written), 101 an
+//! uncaught panic.
 //!
 //! Env vars (all opt-in, unset = off), all terminal-only:
 //! - `PROGRESS=1` -- stderr heartbeat every 20 canonicalizations (elapsed,
@@ -173,6 +211,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -211,6 +251,182 @@ use tamarin_utils::{env_gate, FastMap};
 mod common;
 
 // =============================================================================
+// Diagnostics for batch runs: timestamped log lines, breadcrumb, panic context
+// =============================================================================
+//
+// A batch run keeps only this process's stderr (see "Batch runs" in the
+// module docs). When a run dies -- a panic outside canonicalization, a hard
+// timeout, the memory limit -- the log's last lines must say where: the
+// phase, the OR node being expanded, its path, and the step at that node.
+
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+/// Seconds since the process started (the first call).
+fn elapsed_secs() -> f64 {
+    PROCESS_START.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
+/// `eprintln!` with the elapsed time as a prefix.
+macro_rules! log {
+    ($($arg:tt)*) => {
+        eprintln!("[{:>9.2}s] {}", elapsed_secs(), format_args!($($arg)*))
+    };
+}
+
+/// What the explorer is doing right now, printed by the panic hook and the
+/// heartbeat thread (hence a process-wide mutex, not a thread-local).
+struct Breadcrumb {
+    phase: &'static str,
+    /// The OR node being expanded and its depth.
+    node: Option<(OrId, u32)>,
+    /// That node's path from the root.
+    path: String,
+    /// The step at that node (which method runs, which child is visited).
+    activity: String,
+    /// When the current activity (or its latest sub-step) started.
+    since: Option<Instant>,
+}
+
+static BREADCRUMB: Mutex<Breadcrumb> = Mutex::new(Breadcrumb {
+    phase: "",
+    node: None,
+    path: String::new(),
+    activity: String::new(),
+    since: None,
+});
+
+/// Progress counters, published by the explorer for the heartbeat thread.
+static PROCESSED: AtomicU64 = AtomicU64::new(0);
+static GRAPH_NODES: AtomicU64 = AtomicU64::new(0);
+static QUEUED: AtomicU64 = AtomicU64::new(0);
+
+/// Runs `f` on the breadcrumb. A poisoned lock (a panic while holding it)
+/// is still usable: the breadcrumb is plain data.
+fn with_breadcrumb<T>(f: impl FnOnce(&mut Breadcrumb) -> T) -> T {
+    let mut guard = BREADCRUMB.lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut guard)
+}
+
+fn set_phase(phase: &'static str) {
+    with_breadcrumb(|b| {
+        b.phase = phase;
+        b.node = None;
+        b.path.clear();
+        b.activity.clear();
+        b.since = Some(Instant::now());
+    });
+    log!("phase: {phase}");
+}
+
+fn set_breadcrumb_node(id: OrId, depth: u32, path: String) {
+    with_breadcrumb(|b| {
+        b.node = Some((id, depth));
+        b.path = path;
+        b.activity.clear();
+        b.since = Some(Instant::now());
+    });
+}
+
+fn set_activity(activity: String) {
+    with_breadcrumb(|b| {
+        b.activity = activity;
+        b.since = Some(Instant::now());
+    });
+}
+
+/// Replaces the sub-step after `" :: "` in the activity (e.g. which stage
+/// of visiting a child runs), keeping what the expansion set before it.
+fn set_activity_step(step: &str) {
+    with_breadcrumb(|b| {
+        if let Some(at) = b.activity.find(" :: ") {
+            b.activity.truncate(at);
+        }
+        b.activity.push_str(" :: ");
+        b.activity.push_str(step);
+        b.since = Some(Instant::now());
+    });
+}
+
+fn breadcrumb_activity() -> String {
+    with_breadcrumb(|b| b.activity.clone())
+}
+
+fn breadcrumb_text() -> String {
+    // `try_lock`: the panic hook may run while this thread holds the lock.
+    let Ok(b) = BREADCRUMB.try_lock() else {
+        return "<breadcrumb busy>".to_string();
+    };
+    let node = b
+        .node
+        .map_or_else(|| "-".to_string(), |(id, d)| format!("#{id} (depth {d})"));
+    format!(
+        "phase={} node={node} activity={} path={}",
+        b.phase,
+        if b.activity.is_empty() { "-" } else { &b.activity },
+        if b.path.is_empty() { "-" } else { &b.path }
+    )
+}
+
+/// `--heartbeat`: a background thread logging progress every `every`, also
+/// while one step (a single `exec_proof_method`, say) runs for minutes --
+/// what the node is doing and for how long.
+fn spawn_heartbeat(every: Duration) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(every);
+        let (phase, node, activity, secs) = with_breadcrumb(|b| {
+            (
+                b.phase,
+                b.node,
+                truncate_for_log(&b.activity, 300).to_string(),
+                b.since.map_or(0.0, |t| t.elapsed().as_secs_f64()),
+            )
+        });
+        let processed = PROCESSED.load(Ordering::Relaxed);
+        log!(
+            "heartbeat: phase={phase} processed={processed} graph={} queue={} rate={:.2}/s \
+             rss={}MiB | node={} for {secs:.0}s: {}",
+            GRAPH_NODES.load(Ordering::Relaxed),
+            QUEUED.load(Ordering::Relaxed),
+            processed as f64 / elapsed_secs().max(0.001),
+            memory_mib("VmRSS:").map_or_else(|| "?".to_string(), |m| m.to_string()),
+            node.map_or_else(|| "-".to_string(), |(id, d)| format!("#{id} (depth {d})")),
+            if activity.is_empty() { "-" } else { &activity },
+        );
+    });
+}
+
+/// Chains a hook after the default one (message, location, backtrace) that
+/// adds the breadcrumb. Also fires for panics `catch_unwind` recovers from.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        log!("panic context: {}", breadcrumb_text());
+    }));
+}
+
+/// `VmRSS`/`VmHWM` (current/peak resident set) in MiB, from
+/// `/proc/self/status`; `None` off Linux.
+fn memory_mib(field: &str) -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with(field))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib / 1024)
+}
+
+/// `s` cut to at most `max` bytes (at a char boundary), for log lines.
+fn truncate_for_log(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+// =============================================================================
 // The AND/OR search graph
 // =============================================================================
 
@@ -227,6 +443,10 @@ enum Status {
     DepthLimit,
     /// Canonicalization panicked: never merged into, never expanded.
     CanonPanic,
+    /// Expanding the node panicked (outside canonicalization, e.g. in
+    /// `exec_proof_method`); exploration stopped there. Its `and` holds
+    /// what was built before the panic.
+    ExecPanic,
 }
 
 impl Status {
@@ -237,6 +457,7 @@ impl Status {
             Status::Finished(_) => "finished",
             Status::DepthLimit => "depth_limit",
             Status::CanonPanic => "canon_panic",
+            Status::ExecPanic => "exec_panic",
         }
     }
 }
@@ -1450,6 +1671,8 @@ struct StageTimers {
 
 struct Flags {
     progress: bool,
+    /// `--trace`: one log line per expansion and per applied method.
+    trace: bool,
     dump_formulas: bool,
     profile: bool,
     profile_canon: bool,
@@ -1477,7 +1700,41 @@ struct Explorer<'a> {
     /// `DUMP_AUTOMORPHISMS` examples printed so far, per category.
     automorphism_examples_shown: BTreeMap<&'static str, usize>,
     started: Instant,
+    /// `--time-budget`: stop expanding once the PROCESS has run this long.
+    time_budget: Option<Duration>,
+    /// The first [`FAILURE_EXAMPLES_LIMIT`] canonicalization failures.
+    canon_failure_examples: Vec<Value>,
+    /// Set when expanding a node panicked (see [`StopReason::Panic`]).
+    panic: Option<Value>,
 }
+
+/// Why [`Explorer::run`] stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    /// The queue ran empty: everything within `--max-depth` was explored.
+    Exhausted,
+    /// `--max-nodes` occurrences were canonicalized.
+    MaxNodes,
+    /// `--time-budget` ran out.
+    TimeBudget,
+    /// Expanding a node panicked outside canonicalization. Exploration
+    /// stops there: the panic may have left the shared solver state (e.g.
+    /// the maude connection) inconsistent.
+    Panic,
+}
+
+impl StopReason {
+    fn name(self) -> &'static str {
+        match self {
+            StopReason::Exhausted => "exhausted",
+            StopReason::MaxNodes => "max_nodes",
+            StopReason::TimeBudget => "time_budget",
+            StopReason::Panic => "panic",
+        }
+    }
+}
+
+const FAILURE_EXAMPLES_LIMIT: usize = 20;
 
 const DUMMY_SWAP_EXAMPLES_LIMIT: usize = 3;
 
@@ -1517,6 +1774,7 @@ impl Explorer<'_> {
         }
         self.graph.processed_by_depth[depth] += 1;
 
+        self.publish_progress();
         if self.flags.progress && self.processed % 20 == 0 {
             let elapsed = self.started.elapsed().as_secs_f64();
             eprintln!(
@@ -1536,6 +1794,7 @@ impl Explorer<'_> {
         // A canonicalization panic (e.g. a `theta` miss) must not end the
         // whole exploration: this tool's job is to FIND such gaps across
         // every path, not stop at the first.
+        set_activity_step("canonicalize");
         let canon = timed(self.flags.profile, &mut self.timers.canonicalize, || {
             catch_unwind(AssertUnwindSafe(|| {
                 canonicalize_constraint_system_with_labelling(&sys, &ctx.color_table)
@@ -1548,28 +1807,29 @@ impl Explorer<'_> {
 
         let (fingerprint, methods, methods_sig) = match canon {
             Err(payload) => {
-                self.canonicalize_failures += 1;
-                eprintln!(
-                    "canonicalize_constraint_system PANICKED at {}: {}",
-                    self.graph.path(edge),
-                    panic_message(&*payload)
+                let message = panic_message(&*payload).to_string();
+                log!(
+                    "canonicalize_constraint_system PANICKED at {}: {message}",
+                    self.graph.path(edge)
                 );
                 let id = self.graph.add_node(depth, edge);
                 self.graph.node_mut(id).status = Status::CanonPanic;
+                self.record_canon_failure("panic", Some(id), depth, edge, message);
                 return id;
             }
             Ok(Err(e)) => {
-                self.canonicalize_failures += 1;
-                eprintln!(
+                log!(
                     "canonicalize_constraint_system failed at {}: {e:?}",
                     self.graph.path(edge)
                 );
+                self.record_canon_failure("error", None, depth, edge, format!("{e:?}"));
                 (None, None, None)
             }
             Ok(Ok((canon, labelling))) => {
                 let fp = timed(self.flags.profile, &mut self.timers.fingerprint, || {
                     fingerprint_constraint_system(&canon)
                 });
+                set_activity_step("candidate_methods");
                 let methods = timed(self.flags.profile, &mut self.timers.candidate_methods, || {
                     candidate_methods(&sys, ctx, depth)
                 });
@@ -1595,6 +1855,37 @@ impl Explorer<'_> {
         }
         self.queue.push_back((id, sys, methods));
         id
+    }
+
+    /// Counts a canonicalization failure (`kind` "panic" or "error") and
+    /// keeps the first [`FAILURE_EXAMPLES_LIMIT`] for the JSON. `node` is
+    /// the OR node it created, if any (a failed canonicalization that
+    /// returned an error creates its node later, unmergeable).
+    fn record_canon_failure(
+        &mut self,
+        kind: &str,
+        node: Option<OrId>,
+        depth: usize,
+        edge: Option<(OrId, u32, u32)>,
+        message: String,
+    ) {
+        self.canonicalize_failures += 1;
+        if self.canon_failure_examples.len() < FAILURE_EXAMPLES_LIMIT {
+            self.canon_failure_examples.push(json!({
+                "kind": kind,
+                "node": node,
+                "depth": depth,
+                "path": self.graph.path_json(edge),
+                "message": message,
+            }));
+        }
+    }
+
+    /// Publishes the progress counters the heartbeat thread reports.
+    fn publish_progress(&self) {
+        PROCESSED.store(self.processed, Ordering::Relaxed);
+        GRAPH_NODES.store(self.graph.nodes.len() as u64, Ordering::Relaxed);
+        QUEUED.store(self.queue.len() as u64, Ordering::Relaxed);
     }
 
     /// `methods` (offered for `sys`) as a [`MethodSignature`] under `sys`'s
@@ -1683,18 +1974,66 @@ impl Explorer<'_> {
         }
     }
 
-    /// Expands queued nodes breadth-first until the queue is empty or
-    /// `max_nodes` occurrences have been canonicalized. Returns whether the
-    /// search was truncated (nodes left `Unexpanded`).
-    fn run(&mut self, max_nodes: u64) -> bool {
+    /// Expands queued nodes breadth-first until the queue is empty,
+    /// `max_nodes` occurrences have been canonicalized, the time budget is
+    /// spent, or an expansion panics. Nodes left in the queue stay
+    /// `Unexpanded`.
+    fn run(&mut self, max_nodes: u64) -> StopReason {
         while let Some((id, sys, methods)) = self.queue.pop_front() {
-            if self.processed >= max_nodes {
+            let stop = if self.processed >= max_nodes {
+                Some(StopReason::MaxNodes)
+            } else if self
+                .time_budget
+                .is_some_and(|b| elapsed_secs() >= b.as_secs_f64())
+            {
+                Some(StopReason::TimeBudget)
+            } else {
+                None
+            };
+            if let Some(stop) = stop {
+                log!(
+                    "stopping ({}): processed={} graph={} queue={}",
+                    stop.name(),
+                    self.processed,
+                    self.graph.nodes.len(),
+                    self.queue.len() + 1
+                );
                 self.queue.push_front((id, sys, methods));
-                return true;
+                return stop;
             }
-            self.expand(id, &sys, methods);
+            let expanded = catch_unwind(AssertUnwindSafe(|| self.expand(id, &sys, methods)));
+            if let Err(payload) = expanded {
+                self.record_expand_panic(id, panic_message(&*payload).to_string());
+                return StopReason::Panic;
+            }
         }
-        false
+        StopReason::Exhausted
+    }
+
+    /// Marks `id` as [`Status::ExecPanic`] after its expansion panicked,
+    /// dropping the placeholder case of a child that was being visited
+    /// (always the last case of the last AND node, so every other node's
+    /// `first_parent` stays valid), and records the panic for the JSON.
+    fn record_expand_panic(&mut self, id: OrId, message: String) {
+        let activity = breadcrumb_activity();
+        let node = self.graph.node_mut(id);
+        node.status = Status::ExecPanic;
+        if let Some(last) = node.and.last_mut() {
+            last.cases.retain(|&(_, child)| child != OrId::MAX);
+        }
+        let depth = node.depth;
+        let first_parent = node.first_parent;
+        log!(
+            "expansion of #{id} PANICKED, stopping exploration: {message} (while: {})",
+            truncate_for_log(&activity, 500)
+        );
+        self.panic = Some(json!({
+            "node": id,
+            "depth": depth,
+            "path": self.graph.path_json(first_parent),
+            "activity": activity,
+            "message": message,
+        }));
     }
 
     /// `methods` are `sys`'s candidate methods if `visit` already computed
@@ -1707,7 +2046,10 @@ impl Explorer<'_> {
             self.graph.node_mut(id).status = Status::DepthLimit;
             return;
         }
+        let path = self.graph.path(self.graph.node(id).first_parent);
+        set_breadcrumb_node(id, depth as u32, path);
         let methods = methods.unwrap_or_else(|| {
+            set_activity("candidate_methods".to_string());
             timed(profile, &mut self.timers.candidate_methods, || {
                 candidate_methods(sys, ctx, depth)
             })
@@ -1716,10 +2058,29 @@ impl Explorer<'_> {
         // (solved/contradictory/unfinishable) system.
         if let [ProofMethod::Finished(result)] = methods.as_slice() {
             self.graph.node_mut(id).status = Status::Finished(result_name(result));
+            if self.flags.trace {
+                log!("finished #{id} depth={depth}: {}", result_name(result));
+            }
             return;
         }
+        if self.flags.trace {
+            log!(
+                "expand #{id} depth={depth} methods={} processed={} graph={} queue={}",
+                methods.len(),
+                self.processed,
+                self.graph.nodes.len(),
+                self.queue.len()
+            );
+        }
         self.graph.node_mut(id).status = Status::Expanded;
-        for method in methods {
+        let method_count = methods.len();
+        for (k, method) in methods.into_iter().enumerate() {
+            let text = pretty_proof_method_inline(&method);
+            let step = format!("method {}/{method_count} {text}", k + 1);
+            if self.flags.trace {
+                log!("  exec {}", truncate_for_log(&step, 300));
+            }
+            set_activity(format!("exec_proof_method {step}"));
             let exec = timed(profile, &mut self.timers.exec_proof_method, || {
                 exec_proof_method(ctx, &method, sys)
             });
@@ -1727,14 +2088,18 @@ impl Explorer<'_> {
                 self.graph.node_mut(id).inapplicable += 1;
                 continue;
             };
-            let method_id = self.graph.intern_method(pretty_proof_method_inline(&method));
+            let method_id = self.graph.intern_method(text);
             let and_idx = self.graph.node(id).and.len() as u32;
             self.graph.node_mut(id).and.push(AndNode {
                 method: method_id,
                 kind: method_kind(&method),
                 cases: Vec::with_capacity(cases.len()),
             });
+            if self.flags.trace {
+                log!("    -> {} case(s)", cases.len());
+            }
             for (case_name, child_sys) in cases {
+                set_activity(format!("visit case [{case_name}] of {step}"));
                 // Pushed with a placeholder target first, so the child's own
                 // path (diagnostics, `first_parent`) is already resolvable
                 // while it is being canonicalized.
@@ -1834,6 +2199,11 @@ struct Summary {
     /// The JSON `sizes` object.
     sizes: Value,
     status_counts: BTreeMap<&'static str, u64>,
+    /// Violated size invariants (see the module docs' "Three sizes"),
+    /// recorded rather than asserted so the JSON is still written. Expected
+    /// after [`StopReason::Panic`] (the occurrence being visited was counted
+    /// but never added); otherwise a bug in this tool.
+    violations: Vec<String>,
 }
 
 fn summarize(graph: &Graph, max_depth: usize) -> Summary {
@@ -1849,6 +2219,7 @@ fn summarize(graph: &Graph, max_depth: usize) -> Summary {
         "depth_limit",
         "unexpanded",
         "canon_panic",
+        "exec_panic",
         "canon_err",
     ]
     .into_iter()
@@ -1861,18 +2232,19 @@ fn summarize(graph: &Graph, max_depth: usize) -> Summary {
             *status_counts.get_mut("canon_err").expect("listed") += 1;
         }
     }
-    let lower_bound = status_counts["unexpanded"] > 0 || status_counts["canon_panic"] > 0;
+    let lower_bound = status_counts["unexpanded"] > 0
+        || status_counts["canon_panic"] > 0
+        || status_counts["exec_panic"] > 0;
 
-    assert!(
-        graph_size <= processed && u128::from(processed) <= tree,
-        "size invariant violated: graph={graph_size} processed={processed} tree={tree}"
-    );
+    let mut violations = Vec::new();
+    if !(graph_size <= processed && u128::from(processed) <= tree) {
+        violations.push(format!("graph={graph_size} processed={processed} tree={tree}"));
+    }
     for (d, &p) in graph.processed_by_depth.iter().enumerate() {
         let t = tree_sizes.by_depth.get(d).copied().unwrap_or(0);
-        assert!(
-            u128::from(p) <= t,
-            "size invariant violated at depth {d}: processed={p} tree={t}"
-        );
+        if u128::from(p) > t {
+            violations.push(format!("depth {d}: processed={p} tree={t}"));
+        }
     }
 
     let sizes = json!({
@@ -1891,6 +2263,7 @@ fn summarize(graph: &Graph, max_depth: usize) -> Summary {
         lower_bound,
         sizes,
         status_counts,
+        violations,
     }
 }
 
@@ -1925,15 +2298,40 @@ struct Args {
     max_nodes: u64,
     out: Option<String>,
     no_merge: bool,
+    /// `--time-budget SECS`: stop expanding once the process has run this
+    /// long (setup included), then write the JSON as usual.
+    time_budget: Option<f64>,
+    /// `--heartbeat SECS`: log a progress line every SECS (background thread).
+    heartbeat: Option<f64>,
+    /// `--trace`: log every expansion and every applied method.
+    trace: bool,
 }
 
-fn parse_args(raw: &[String]) -> Args {
+enum Mode {
+    /// `--list-lemmas <theory>`.
+    ListLemmas(String),
+    Explore(Args),
+}
+
+const USAGE: &str = "usage: explore_canonical_matches <theory.spthy> <lemma> \
+     [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] \
+     [--time-budget SECS] [--heartbeat SECS] [--trace]\n       \
+     explore_canonical_matches --list-lemmas <theory.spthy>";
+
+fn usage_error(message: &str) -> ! {
+    eprintln!("{message}\n{USAGE}");
+    std::process::exit(EXIT_USAGE);
+}
+
+fn parse_args(raw: &[String]) -> Mode {
+    if raw.get(1).map(String::as_str) == Some("--list-lemmas") {
+        match raw.get(2) {
+            Some(path) if raw.len() == 3 => return Mode::ListLemmas(path.clone()),
+            _ => usage_error("--list-lemmas wants exactly one theory path"),
+        }
+    }
     if raw.len() < 3 {
-        eprintln!(
-            "usage: explore_canonical_matches <theory.spthy> <lemma> \
-             [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge]"
-        );
-        std::process::exit(2);
+        usage_error("missing <theory.spthy> <lemma>");
     }
     let mut args = Args {
         theory_path: raw[1].clone(),
@@ -1942,34 +2340,34 @@ fn parse_args(raw: &[String]) -> Args {
         max_nodes: 2000,
         out: None,
         no_merge: false,
+        time_budget: None,
+        heartbeat: None,
+        trace: false,
     };
     let mut i = 3;
     while i < raw.len() {
-        let value = || raw.get(i + 1).unwrap_or_else(|| panic!("{} wants a value", raw[i]));
-        match raw[i].as_str() {
-            "--max-depth" => {
-                args.max_depth = value().parse().expect("--max-depth wants an integer");
-                i += 2;
-            }
-            "--max-nodes" => {
-                args.max_nodes = value().parse().expect("--max-nodes wants an integer");
-                i += 2;
-            }
-            "--out" => {
-                args.out = Some(value().clone());
-                i += 2;
-            }
-            "--no-merge" => {
-                args.no_merge = true;
-                i += 1;
-            }
-            other => {
-                eprintln!("unrecognized argument: {other}");
-                std::process::exit(2);
-            }
+        let flag = raw[i].as_str();
+        let value = || {
+            raw.get(i + 1)
+                .unwrap_or_else(|| usage_error(&format!("{flag} wants a value")))
+        };
+        let number = |v: &String| -> f64 {
+            v.parse()
+                .unwrap_or_else(|_| usage_error(&format!("{flag} wants a number, got {v:?}")))
+        };
+        match flag {
+            "--max-depth" => args.max_depth = number(value()) as usize,
+            "--max-nodes" => args.max_nodes = number(value()) as u64,
+            "--out" => args.out = Some(value().clone()),
+            "--time-budget" => args.time_budget = Some(number(value())),
+            "--heartbeat" => args.heartbeat = Some(number(value())),
+            "--no-merge" => args.no_merge = true,
+            "--trace" => args.trace = true,
+            other => usage_error(&format!("unrecognized argument: {other}")),
         }
+        i += if matches!(flag, "--no-merge" | "--trace") { 1 } else { 2 };
     }
-    args
+    Mode::Explore(args)
 }
 
 fn default_out_path(theory_path: &str, lemma: &str) -> String {
@@ -1979,23 +2377,91 @@ fn default_out_path(theory_path: &str, lemma: &str) -> String {
     format!("explore_{stem}_{lemma}.json")
 }
 
-fn main() {
-    let argv: Vec<String> = std::env::args().collect();
-    let args = parse_args(&argv);
+// Exit codes (see the module docs' "Batch runs"). A Rust panic that escapes
+// everything below exits with 101.
+const EXIT_USAGE: i32 = 2;
+const EXIT_SETUP_ERROR: i32 = 3;
+const EXIT_PANIC_STOP: i32 = 4;
+const EXIT_INVARIANT_VIOLATION: i32 = 5;
 
-    if !bliss_available() {
-        eprintln!("bliss not available and TAM_ALLOW_NO_BLISS=1 set -- nothing to do, exiting");
-        return;
-    }
+/// `--list-lemmas`: prints one JSON object describing the theory and its
+/// lemmas, for a batch runner to plan jobs from. `error` is non-null (and
+/// the exit code [`EXIT_SETUP_ERROR`]) if it can't be read, parsed or
+/// elaborated; the fields gathered before that are still printed.
+fn list_lemmas(theory_path: &str) -> i32 {
+    let mut out = json!({ "theory": theory_path, "error": null });
+    let code = match describe_theory(theory_path, &mut out) {
+        Ok(()) => 0,
+        Err(e) => {
+            out["error"] = json!(e);
+            EXIT_SETUP_ERROR
+        }
+    };
+    println!("{out}");
+    code
+}
 
-    // `ctx.color_table` is built from this same theory, so the elaborated
-    // theory itself isn't needed below.
-    let (parsed, _elaborated, maude) = common::load_theory_with_maude(&args.theory_path);
+/// Fills `out` for [`list_lemmas`]: `lines`; `diff` (the theory is meant
+/// for `--diff` mode: it only parses with the `diff` flag, or it has diff/
+/// equivalence lemmas -- the port has no diff-mode prover); `processes`
+/// (SAPIC); `rules`; and `lemmas`, exactly the names
+/// `build_lemma_proof_context` can look up.
+fn describe_theory(path: &str, out: &mut Value) -> Result<(), String> {
+    use tamarin_parser::ast::TheoryItem;
+    use tamarin_theory::theory::TraceQuantifier;
 
-    // Same per-lemma setup `prove_lemma` uses. `_user_funs_guard` must stay
-    // alive for the WHOLE exploration: canonicalization needs the installed
-    // signature.
-    let (ctx, initial_sys, _skeleton_tree, _user_funs_guard) = build_lemma_proof_context(
+    let source = std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
+    out["lines"] = json!(source.lines().count());
+    let plain = tamarin_parser::parse_theory(&source, &[]);
+    let with_diff_flag = tamarin_parser::parse_theory(&source, &["diff"]);
+    let diff_items = with_diff_flag.as_ref().map_or(0, |t| {
+        t.items
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    TheoryItem::DiffLemma(_) | TheoryItem::EquivLemma(..) | TheoryItem::DiffEquivLemma(_)
+                )
+            })
+            .count()
+    });
+    out["diff"] = json!(diff_items > 0 || (plain.is_err() && with_diff_flag.is_ok()));
+    let parsed = plain.map_err(|e| format!("parse: {e}"))?;
+    out["processes"] = json!(parsed
+        .items
+        .iter()
+        .any(|i| matches!(i, TheoryItem::TopLevelProcess(_) | TheoryItem::ProcessDef(_))));
+    let elaborated = catch_unwind(AssertUnwindSafe(|| tamarin_theory::elaborate::elaborate(&parsed)))
+        .map_err(|p| format!("elaborate panicked: {}", panic_message(&*p)))?
+        .map_err(|e| format!("elaborate: {}", e.message))?;
+    out["rules"] = json!(elaborated.rules().count());
+    out["lemmas"] = elaborated
+        .lemmas()
+        .map(|l| {
+            json!({
+                "name": l.name,
+                "trace_quantifier": match l.trace_quantifier {
+                    TraceQuantifier::AllTraces => "all-traces",
+                    TraceQuantifier::ExistsTrace => "exists-trace",
+                },
+                "attributes": l.attributes.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>(),
+                "modulo": l.modulo,
+            })
+        })
+        .collect();
+    Ok(())
+}
+
+/// Parses and elaborates the theory, starts maude on its signature, and
+/// builds the lemma's proof context -- the same per-lemma setup
+/// `prove_lemma` uses. Errors instead of panicking, so a batch log says
+/// which step failed.
+fn setup(
+    args: &Args,
+) -> Result<(ProofContext, System, tamarin_theory::elaborate::UserFunsForTheoryGuard), String> {
+    let (parsed, elaborated, maude) = common::try_load_theory_with_maude(&args.theory_path)?;
+    log!("parsed and elaborated: {} rule(s); maude started", elaborated.rules().count());
+    let (ctx, initial_sys, _skeleton_tree, user_funs_guard) = build_lemma_proof_context(
         &parsed,
         &args.lemma,
         maude,
@@ -2005,12 +2471,72 @@ fn main() {
         CutStrategy::Dfs,
         None,
     )
-    .unwrap_or_else(|e| panic!("build_lemma_proof_context({}): {e:?}", args.lemma));
+    .map_err(|e| format!("build_lemma_proof_context({}): {e:?}", args.lemma))?;
+    Ok((ctx, initial_sys, user_funs_guard))
+}
 
+/// Writes `doc` to `out` via a temporary file and a rename, so a run killed
+/// while writing never leaves a truncated JSON behind.
+fn write_json_atomically(out: &str, doc: &Value) -> std::io::Result<()> {
+    let tmp = format!("{out}.tmp");
+    let file = std::fs::File::create(&tmp)?;
+    let mut writer = std::io::BufWriter::new(file);
+    serde_json::to_writer(&mut writer, doc)?;
+    std::io::Write::flush(&mut writer)?;
+    std::fs::rename(&tmp, out)
+}
+
+fn main() {
+    PROCESS_START.get_or_init(Instant::now);
+    install_panic_hook();
+    let argv: Vec<String> = std::env::args().collect();
+    let args = match parse_args(&argv) {
+        Mode::ListLemmas(path) => std::process::exit(list_lemmas(&path)),
+        Mode::Explore(args) => args,
+    };
+
+    log!("argv: {argv:?}");
+    log!(
+        "pid={} cwd={} maude={} BLISS_PATH={:?}",
+        std::process::id(),
+        std::env::current_dir().map_or_else(|_| "?".to_string(), |d| d.display().to_string()),
+        common::maude_binary(),
+        std::env::var("BLISS_PATH").ok()
+    );
+    if !bliss_available() {
+        eprintln!("bliss not available and TAM_ALLOW_NO_BLISS=1 set -- nothing to do, exiting");
+        return;
+    }
+
+    if let Some(every) = args.heartbeat {
+        spawn_heartbeat(Duration::from_secs_f64(every));
+    }
+    set_phase("setup");
+    // `_user_funs_guard` must stay alive for the WHOLE exploration:
+    // canonicalization needs the installed signature.
+    let (ctx, initial_sys, _user_funs_guard) = match catch_unwind(AssertUnwindSafe(|| setup(&args))) {
+        Ok(Ok(setup)) => setup,
+        Ok(Err(e)) => {
+            log!("setup failed: {e}");
+            std::process::exit(EXIT_SETUP_ERROR);
+        }
+        Err(payload) => {
+            log!("setup panicked: {}", panic_message(&*payload));
+            std::process::exit(EXIT_SETUP_ERROR);
+        }
+    };
+    let setup_secs = elapsed_secs();
+    log!(
+        "setup done in {setup_secs:.2}s, peak rss {}MiB",
+        memory_mib("VmHWM:").map_or_else(|| "?".to_string(), |m| m.to_string())
+    );
+
+    set_phase("explore");
     let mut explorer = Explorer {
         ctx: &ctx,
         flags: Flags {
             progress: env_gate!("PROGRESS"),
+            trace: args.trace,
             dump_formulas: env_gate!("DUMP_FORMULAS"),
             profile: env_gate!("PROFILE"),
             profile_canon: env_gate!("PROFILE_CANON"),
@@ -2031,12 +2557,27 @@ fn main() {
         dummy_swap_examples_shown: 0,
         automorphism_examples_shown: BTreeMap::new(),
         started: Instant::now(),
+        time_budget: args.time_budget.map(Duration::from_secs_f64),
+        canon_failure_examples: Vec::new(),
+        panic: None,
     };
-    let root = explorer.visit(initial_sys, 0, None);
-    assert_eq!(root, 0, "the root is the first OR node");
-    let truncated = explorer.run(args.max_nodes);
+    // The root's own visit runs outside `run`'s per-expansion panic capture;
+    // with no node to attach a partial result to, a panic there only logs.
+    match catch_unwind(AssertUnwindSafe(|| explorer.visit(initial_sys, 0, None))) {
+        Ok(root) => assert_eq!(root, 0, "the root is the first OR node"),
+        Err(payload) => {
+            log!("visiting the root PANICKED: {}", panic_message(&*payload));
+            std::process::exit(EXIT_PANIC_STOP);
+        }
+    }
+    let stop = explorer.run(args.max_nodes);
+    let explore_secs = elapsed_secs() - setup_secs;
 
+    set_phase("write");
     let summary = summarize(&explorer.graph, args.max_depth);
+    for v in &summary.violations {
+        log!("size invariant violated: {v}");
+    }
     let nodes: Vec<Value> = explorer
         .graph
         .nodes
@@ -2045,8 +2586,9 @@ fn main() {
         .map(|(id, n)| node_json(id, n))
         .collect();
     let check = &explorer.method_check;
+    let peak_rss_mib = memory_mib("VmHWM:");
     let doc = json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "theory": args.theory_path,
         "lemma": args.lemma,
         "argv": argv,
@@ -2054,17 +2596,30 @@ fn main() {
             "max_depth": args.max_depth,
             "max_nodes": args.max_nodes,
             "no_merge": args.no_merge,
+            "time_budget": args.time_budget,
         },
-        "truncated": truncated,
+        "stop_reason": stop.name(),
+        "truncated": stop != StopReason::Exhausted,
         "lower_bound": summary.lower_bound,
+        "timing": {
+            "setup_secs": setup_secs,
+            "explore_secs": explore_secs,
+        },
+        "peak_rss_mib": peak_rss_mib,
         "sizes": summary.sizes,
         "status_counts": summary.status_counts,
+        "canonicalize": {
+            "failures": explorer.canonicalize_failures,
+            "examples": explorer.canon_failure_examples,
+        },
         "method_check": {
             "checked": check.checked,
             "mismatches": check.mismatches,
             "failures": check.failures,
             "examples": check.examples,
         },
+        "panic": explorer.panic,
+        "invariant_violations": summary.violations,
         "methods": explorer.graph.methods,
         "nodes": nodes,
     });
@@ -2073,15 +2628,15 @@ fn main() {
         .out
         .clone()
         .unwrap_or_else(|| default_out_path(&args.theory_path, &args.lemma));
-    let file = std::fs::File::create(&out).unwrap_or_else(|e| panic!("create {out}: {e}"));
-    let mut writer = std::io::BufWriter::new(file);
-    serde_json::to_writer(&mut writer, &doc).unwrap_or_else(|e| panic!("write {out}: {e}"));
-    std::io::Write::flush(&mut writer).unwrap_or_else(|e| panic!("write {out}: {e}"));
+    if let Err(e) = write_json_atomically(&out, &doc) {
+        log!("writing {out} failed: {e}");
+        std::process::exit(EXIT_SETUP_ERROR);
+    }
 
     println!(
         "=== {} :: {} === graph={} processed={} tree={} canonicalize_failures={} \
          method_mismatches={}/{} method_canon_failures={} \
-         truncated={} lower_bound={} (max_depth={}, max_nodes={}{}) -> {out}",
+         stop_reason={} lower_bound={} (max_depth={}, max_nodes={}{}) -> {out}",
         args.theory_path,
         args.lemma,
         summary.graph,
@@ -2091,7 +2646,7 @@ fn main() {
         explorer.method_check.mismatches,
         explorer.method_check.checked,
         explorer.method_check.failures,
-        truncated,
+        stop.name(),
         summary.lower_bound,
         args.max_depth,
         args.max_nodes,
@@ -2124,4 +2679,14 @@ fn main() {
             .canon_profile
             .print(explorer.flags.profile.then_some(explorer.timers.canonicalize));
     }
+
+    let code = if stop == StopReason::Panic {
+        EXIT_PANIC_STOP
+    } else if !summary.violations.is_empty() {
+        EXIT_INVARIANT_VIOLATION
+    } else {
+        0
+    };
+    log!("done: stop_reason={} exit={code}", stop.name());
+    std::process::exit(code);
 }

@@ -49,11 +49,35 @@ pub fn load_theory_with_maude(
     tamarin_theory::theory::Theory,
     MaudeHandle,
 ) {
-    let source = std::fs::read_to_string(theory_path).expect("read theory");
-    let parsed = tamarin_parser::parse_theory(&source, &[]).expect("parse theory");
-    let elaborated = tamarin_theory::elaborate::elaborate(&parsed).expect("elaborate");
-    let maude_path = std::env::var("MAUDE_PATH").unwrap_or_else(|_| "maude".to_string());
+    try_load_theory_with_maude(theory_path).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`load_theory_with_maude`], returning which step failed instead of
+/// panicking -- for batch runs, whose logs must say why a theory was skipped.
+#[allow(dead_code)]
+pub fn try_load_theory_with_maude(
+    theory_path: &str,
+) -> Result<
+    (
+        tamarin_parser::ast::Theory,
+        tamarin_theory::theory::Theory,
+        MaudeHandle,
+    ),
+    String,
+> {
+    let source = std::fs::read_to_string(theory_path).map_err(|e| format!("read theory: {e}"))?;
+    let parsed =
+        tamarin_parser::parse_theory(&source, &[]).map_err(|e| format!("parse theory: {e}"))?;
+    let elaborated = tamarin_theory::elaborate::elaborate(&parsed)
+        .map_err(|e| format!("elaborate: {}", e.message))?;
+    let maude_path = maude_binary();
     let maude = MaudeHandle::start(&maude_path, elaborated.signature.maude_sig.clone())
-        .expect("start maude");
-    (parsed, elaborated, maude)
+        .map_err(|e| format!("start maude ({maude_path}): {e:?}"))?;
+    Ok((parsed, elaborated, maude))
+}
+
+/// The maude binary the examples start: `$MAUDE_PATH`, else `maude` on `PATH`.
+#[allow(dead_code)]
+pub fn maude_binary() -> String {
+    std::env::var("MAUDE_PATH").unwrap_or_else(|_| "maude".to_string())
 }

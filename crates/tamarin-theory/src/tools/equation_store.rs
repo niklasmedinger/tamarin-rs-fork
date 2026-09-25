@@ -1159,25 +1159,25 @@ impl EquationStore {
         for d in self.conj.iter_mut() {
             // Fast path: if no duplicate, no empty, and no contradictory subst
             // exists, this disj is left untouched (no change, no clone).  This
-            // is the common case and avoids the O(n^2) dedup-clone below.
-            let mut has_dup = false;
-            for (i, s) in d.substs.iter().enumerate() {
-                if d.substs[..i].iter().any(|x| x == s) {
-                    has_dup = true;
-                    break;
-                }
-            }
+            // is the common case.  Duplicates are found through an ordered set
+            // (`Ord` agrees with `Eq`, both derived): a pairwise scan was
+            // O(n^2) whole-substitution comparisons per disj per `simp` round,
+            // which dominated `splitEqs` on large AC-unifier disjunctions
+            // (bilinear-pairing `Joux`: ~90 s for one 160-case split).
+            let mut distinct: BTreeSet<&LNSubstVFresh> = BTreeSet::new();
+            let has_dup = !d.substs.iter().all(|s| distinct.insert(s));
             let needs_work = has_dup || d.substs.iter().any(|s| s == &empty || is_contr(s));
             if !needs_work {
                 continue;
             }
-            // Dedup in-place while preserving first occurrences.
-            let mut seen: Vec<LNSubstVFresh> = Vec::new();
-            for s in &d.substs {
-                if !seen.iter().any(|x| x == s) {
-                    seen.push(s.clone());
-                }
-            }
+            // Dedup while preserving first occurrences.
+            let mut distinct: BTreeSet<&LNSubstVFresh> = BTreeSet::new();
+            let mut seen: Vec<LNSubstVFresh> = d
+                .substs
+                .iter()
+                .filter(|s| distinct.insert(*s))
+                .cloned()
+                .collect();
             let original_len = d.substs.len();
             // Haskell-faithful `simpMinimize` (EquationStore.hs):
             // if any subst is empty (vacuously true) OR contradictory,
