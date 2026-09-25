@@ -325,7 +325,7 @@ pub fn generate_group(generators: &[Permutation], n: usize) -> Vec<Permutation> 
 
 /// Renders `part`'s vertices/edges as bliss's DIMACS-like input format
 /// (see the module docs), coloring each vertex via `part.colors` (the
-/// `ColorTable` a `GraphPart` now always carries — see
+/// per-vertex coloring a `GraphPart` always carries — see
 /// `canon_graph::GraphPart`'s own doc comment).
 ///
 /// Bliss numbers vertices from 1 — `GraphPart`'s own indices (0-based)
@@ -339,8 +339,8 @@ pub fn graph_part_to_dimacs(part: &GraphPart) -> Result<String, BlissError> {
     }
     let mut out = String::new();
     writeln!(out, "p edge {} {}", part.vertices.len(), part.edges.len()).ok();
-    for (idx, v) in part.vertices.iter().enumerate() {
-        writeln!(out, "n {} {}", idx + 1, part.colors.vertex_color(v)).ok();
+    for idx in 0..part.vertices.len() {
+        writeln!(out, "n {} {}", idx + 1, part.vertex_color(idx)).ok();
     }
     for e in &part.edges {
         writeln!(out, "e {} {}", e.src + 1, e.tgt + 1).ok();
@@ -505,8 +505,8 @@ pub struct CanonicalGraph {
 pub fn apply_labeling(part: &GraphPart, labeling: &Permutation) -> CanonicalGraph {
     let n = part.vertices.len();
     let mut vertex_colors = vec![0; n];
-    for (old_idx, v) in part.vertices.iter().enumerate() {
-        vertex_colors[labeling.image_of(old_idx)] = part.colors.vertex_color(v);
+    for old_idx in 0..n {
+        vertex_colors[labeling.image_of(old_idx)] = part.vertex_color(old_idx);
     }
     CanonicalGraph {
         vertex_colors,

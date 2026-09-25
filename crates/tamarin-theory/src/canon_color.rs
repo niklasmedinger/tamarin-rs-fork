@@ -7,12 +7,13 @@
 //! — Stage B of "Canonizing the constraint system", following Stage A
 //! ([`crate::canon_graph::extract_graph_part`]).
 //!
-//! Implements a FOUR reserved-color-block scheme (originally `TODO.md`'s
-//! three-block sketch; a fourth was added 2026-09-22 once intruder
+//! Two layers. The BASE color ([`ColorTable::vertex_color`]) comes from
+//! a FOUR reserved-color-block scheme (originally `TODO.md`'s three-block
+//! sketch; a fourth was added 2026-09-22 once intruder
 //! construction/destruction rules needed covering too — see block 2's own
-//! write-up), not the further skeleton-strengthening refinement (erase
-//! literals to sorts, `CAN_AC` the result) `TODO.md` goes on to sketch —
-//! that is a separate, later enhancement, not attempted here:
+//! write-up). The final per-graph coloring ([`ColorTable::shape_colors`])
+//! refines it by content shape — see "Shape refinement" below. The base
+//! blocks:
 //!
 //! 1. This crate's own structural relation-vertex kinds. Two parts:
 //!    - `VertexKind::Dummy`/`LessRelation`/`AtTimepointRelation`/
@@ -65,6 +66,27 @@
 //! still get different colors, for free, since rule-name and
 //! action-name colors always land in disjoint sub-ranges.
 //!
+//! **Shape refinement** (`TODO.md`'s skeleton-strengthening sketch: erase
+//! literals to sorts, `CAN_AC` the result). A base color only knows a
+//! vertex's rule name or fact tag, so e.g. sibling `!KU(t_i)` goals from a
+//! tuple decomposition are all interchangeable to bliss, and every such
+//! swap is a group element Stage F has to minimize over. The refined key
+//! of a vertex is `(base color, shape)`, where the shape of a
+//! `RuleInstance`/`Action` is its content term (`canon::rule_to_term`/
+//! `canon::fact_to_term`) with every literal replaced by a placeholder for
+//! its sort (and var-vs-name kind), rebuilt bottom-up through the AC/C
+//! smart constructors ([`erase_literals`]). This is constant on
+//! $\alphaeqac$-classes: a sort-respecting renaming never changes the
+//! erased term, and erasure maps AC-equal terms to AC-equal terms, whose
+//! normal forms coincide. No canonization is needed.
+//!
+//! The keys are then numbered by RANK among the distinct keys of the SAME
+//! graph part, never by the order vertices are encountered: vertex order
+//! follows `NodeId` numbering, which differs between equivalent systems,
+//! and bliss compares color VALUES, not just the partition they induce.
+//! An isomorphism between equivalent systems maps every vertex to one with
+//! the same key, so both have the same key set and hence the same ranks.
+//!
 //! **Soundness, not completeness, is the bar** (`TODO.md`'s own words:
 //! "the soundness condition on a color function is only that it be
 //! constant on alphaeqac-classes... finer is better but never
@@ -96,6 +118,11 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use tamarin_term::lterm::{LNTerm, LVar, Name};
+use tamarin_term::term::{f_app, Term};
+use tamarin_term::vterm::Lit;
+
+use crate::canon::{fact_to_term, rule_to_term};
 use crate::canon_graph::VertexKind;
 use crate::constraint::solver::context::IntrRuleCache;
 use crate::fact::fact_tag_name;
@@ -421,6 +448,53 @@ impl ColorTable {
         }
     }
 
+    /// The base color of every vertex, in order -- [`Self::vertex_color`]
+    /// without the shape refinement. Still a valid coloring for bliss (it
+    /// is constant on $\alphaeqac$-classes), just a coarser one.
+    pub fn base_colors(&self, vertices: &[VertexKind]) -> Vec<Color> {
+        vertices.iter().map(|v| self.vertex_color(v)).collect()
+    }
+
+    /// The coloring handed to bliss: each vertex's `(base color, shape)`
+    /// key, numbered by its rank among the distinct keys of `vertices`
+    /// (see the module docs' "Shape refinement" for why rank, not
+    /// encounter order). Ranking sorts by base color first, so a lower
+    /// base color always gets a lower final color.
+    pub fn shape_colors(&self, vertices: &[VertexKind]) -> Vec<Color> {
+        let keys: Vec<(Color, Option<LNTerm>)> = vertices
+            .iter()
+            .map(|v| (self.vertex_color(v), shape_term(v)))
+            .collect();
+        let ranks: BTreeMap<&(Color, Option<LNTerm>), Color> = keys
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .zip(0..)
+            .collect();
+        keys.iter().map(|k| ranks[k]).collect()
+    }
+}
+
+/// The shape of a content vertex's term (see the module docs' "Shape
+/// refinement"); `None` for content-free structural vertices.
+fn shape_term(v: &VertexKind) -> Option<LNTerm> {
+    match v {
+        VertexKind::RuleInstance(_, ru) => Some(erase_literals(&rule_to_term(ru))),
+        VertexKind::Action(_, fact) => Some(erase_literals(&fact_to_term(fact))),
+        _ => None,
+    }
+}
+
+/// `t` with every literal replaced by one placeholder per sort and kind
+/// (variable or name), rebuilt bottom-up through [`f_app`] so AC arguments
+/// are re-flattened and re-sorted, and C arguments re-sorted, around the
+/// placeholders -- i.e. the `CAN_AC` normal form of the erased term.
+fn erase_literals(t: &LNTerm) -> LNTerm {
+    match t {
+        Term::Lit(Lit::Var(v)) => Term::Lit(Lit::Var(LVar::new("_", v.sort, 0))),
+        Term::Lit(Lit::Con(n)) => Term::Lit(Lit::Con(Name::new(n.tag, "_"))),
+        Term::App(sym, args) => f_app(*sym, args.iter().map(erase_literals).collect()),
+    }
 }
 
 #[cfg(test)]
@@ -727,6 +801,93 @@ mod tests {
         let Some(table) = table_for(COLLIDING) else { return };
         let Some(empty_table) = table_for(EMPTY) else { return };
         assert_eq!(table.action_color("Fr"), empty_table.action_color("Fr"));
+    }
+
+    // -- Shape refinement (`shape_colors`) ----------------------------------
+    //
+    // Only built-in `KU` actions and structural vertices below, which a
+    // default (empty) table already colors -- no maude needed.
+
+    fn var(name: &str, sort: LSort) -> LNTerm {
+        var_idx(name, sort, 0)
+    }
+
+    fn var_idx(name: &str, sort: LSort, idx: u64) -> LNTerm {
+        tamarin_term::vterm::var_term(LVar::new(name, sort, idx))
+    }
+
+    fn fun2(name: &'static str, a: LNTerm, b: LNTerm) -> LNTerm {
+        use tamarin_term::function_symbols::{Constructability, FunSym, NoEqSym, Privacy};
+        let sym = NoEqSym::new(name.as_bytes().to_vec(), 2, Privacy::Public, Constructability::Constructor);
+        LNTerm::App(FunSym::NoEq(sym), std::sync::Arc::from([a, b]))
+    }
+
+    fn ku(t: LNTerm) -> VertexKind {
+        VertexKind::Action(nid(), crate::fact::ku_fact(t))
+    }
+
+    use tamarin_term::lterm::LSort;
+
+    #[test]
+    fn shape_colors_separate_different_sorts_and_symbols_but_not_renamings() {
+        let table = ColorTable::default();
+        let colors = table.shape_colors(&[
+            ku(var("x", LSort::Msg)),
+            ku(var("y", LSort::Msg)),
+            ku(var("p", LSort::Pub)),
+            ku(fun2("sign", var("x", LSort::Msg), var("k", LSort::Fresh))),
+            ku(fun2("mac", var("x", LSort::Msg), var("k", LSort::Fresh))),
+        ]);
+        assert_eq!(colors[0], colors[1], "renamed msg variables have the same shape");
+        assert_ne!(colors[0], colors[2], "a msg and a pub variable differ in shape");
+        assert_ne!(colors[3], colors[4], "sign(..) and mac(..) differ in shape");
+    }
+
+    /// Erasure must re-sort AC arguments: `xor(x.0:msg, $p.1)` and its
+    /// renaming `xor(x.1:msg, $p.0)` are sorted differently before erasure
+    /// (`LVar` orders by index first), and would get different shapes
+    /// without it.
+    #[test]
+    fn shape_colors_are_invariant_under_renaming_across_ac_argument_order() {
+        use tamarin_term::builtin::xor;
+        let table = ColorTable::default();
+        let t1 = xor(var_idx("x", LSort::Msg, 0), var_idx("p", LSort::Pub, 1));
+        let t2 = xor(var_idx("x", LSort::Msg, 1), var_idx("p", LSort::Pub, 0));
+        assert_ne!(
+            matches!(&t1, Term::App(_, args) if matches!(args[0], Term::Lit(Lit::Var(v)) if v.sort == LSort::Msg)),
+            matches!(&t2, Term::App(_, args) if matches!(args[0], Term::Lit(Lit::Var(v)) if v.sort == LSort::Msg)),
+            "precondition: the two terms order their msg/pub arguments differently"
+        );
+        let colors = table.shape_colors(&[ku(t1), ku(t2)]);
+        assert_eq!(colors[0], colors[1]);
+    }
+
+    /// Colors are ranks among the part's distinct keys, so listing the
+    /// same vertices in a different order permutes the colors along with
+    /// them, and a lower base color always gets a lower final color.
+    #[test]
+    fn shape_colors_do_not_depend_on_vertex_order() {
+        let table = ColorTable::default();
+        let vertices = vec![
+            ku(var("p", LSort::Pub)),
+            VertexKind::Dummy(nid()),
+            ku(var("x", LSort::Msg)),
+            VertexKind::LessRelation,
+        ];
+        let reversed: Vec<VertexKind> = vertices.iter().rev().cloned().collect();
+        let forward = table.shape_colors(&vertices);
+        let mut backward = table.shape_colors(&reversed);
+        backward.reverse();
+        assert_eq!(forward, backward);
+
+        let base = table.base_colors(&vertices);
+        for i in 0..vertices.len() {
+            for j in 0..vertices.len() {
+                if base[i] < base[j] {
+                    assert!(forward[i] < forward[j], "rank must preserve base-color order");
+                }
+            }
+        }
     }
 }
 

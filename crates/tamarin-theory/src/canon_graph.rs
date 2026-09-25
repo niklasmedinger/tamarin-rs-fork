@@ -160,33 +160,31 @@ pub struct GraphEdge {
 
 /// The extracted graph part `(V, E, c)` — vertices, edges, AND the
 /// coloring `c` (`TODO.md`'s skeleton scheme, [`crate::canon_color`]),
-/// bundled together as ONE value rather than passed around as two
-/// separately-threaded arguments. A `ColorTable` is meaningful only
-/// relative to the specific `GraphPart` it colors (it's built from the
-/// same theory the part's `System` came from), so keeping them apart
-/// invited a caller to mismatch a part with the wrong table — this
-/// couples them at construction time instead: [`extract_graph_part`] is
-/// the only place a `GraphPart` is built, and it always builds its own
-/// `colors` alongside `vertices`/`edges`.
+/// bundled together as ONE value rather than passed around as separately
+/// threaded arguments. `colors[i]` is the color of `vertices[i]`: the
+/// shape-refined coloring ([`ColorTable::shape_colors`]), which depends on
+/// the whole vertex set (colors are ranks among this part's own keys), so
+/// it is computed once here rather than looked up per vertex.
+/// [`extract_graph_part`] is the only production place a `GraphPart` is
+/// built, and it always builds `colors` alongside `vertices`/`edges`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GraphPart {
     pub vertices: Vec<VertexKind>,
     pub edges: Vec<GraphEdge>,
-    pub colors: ColorTable,
+    pub colors: Vec<Color>,
 }
 
 impl GraphPart {
-    /// The color of `self.vertices[idx]`, per `self.colors` — the
-    /// entry point most callers actually want over reaching into
-    /// `self.colors.vertex_color(&self.vertices[idx])` directly.
+    /// The color of `self.vertices[idx]`.
     pub fn vertex_color(&self, idx: usize) -> Color {
-        self.colors.vertex_color(&self.vertices[idx])
+        self.colors[idx]
     }
 }
 
 /// Extracts the graph part from `sys` (Stage A — see the module docs),
-/// pairing it with the caller-supplied `colors` table ([`crate::canon_color`],
-/// Stage B) in the same call — `colors` must be the table for the SAME
+/// coloring its vertices with the caller-supplied `colors` table
+/// ([`ColorTable::shape_colors`], Stage B) in the same call — `colors`
+/// must be the table for the SAME
 /// (elaborated) theory `sys` was produced from, or vertex coloring later
 /// panics on a rule/action name this table wasn't built to cover. This
 /// function needs no `&Theory` at all: `colors` is unique per theory and
@@ -315,9 +313,9 @@ pub fn extract_graph_part(sys: &System, colors: &ColorTable) -> GraphPart {
     }
 
     GraphPart {
+        colors: colors.shape_colors(&vertices),
         vertices,
         edges,
-        colors: colors.clone(),
     }
 }
 
@@ -495,7 +493,7 @@ fn varspec_to_node_id(v: &VarSpec) -> NodeId {
 //
 // The FILL color, in contrast, is not hardcoded per kind — it comes
 // straight from `part.colors` via [`dot_fill_color`]: two vertices the
-// canonizer considers indistinguishable (same `ColorTable` color) always
+// canonizer considers indistinguishable (same color) always
 // render with the exact same fill, and two vertices it distinguishes
 // always render with visibly different fills. This makes the coloring
 // stage's own output directly inspectable (e.g. "why do these two
@@ -512,7 +510,7 @@ pub fn to_graphviz(part: &GraphPart) -> String {
     out.push_str("  edge [fontname=\"Helvetica\", fontsize=10];\n\n");
 
     for (idx, v) in part.vertices.iter().enumerate() {
-        let fill = dot_fill_color(part.colors.vertex_color(v));
+        let fill = dot_fill_color(part.vertex_color(idx));
         write_vertex(&mut out, idx, v, &fill);
     }
     out.push('\n');
@@ -687,13 +685,12 @@ mod tests {
 
     /// The `&ColorTable` [`extract_graph_part`] needs, built from `src`'s
     /// own protocol rules and an EMPTY `IntrRuleCache` — none of this
-    /// module's tests color a `RuleInfo::Intr` vertex (only
-    /// `to_graphviz_renders_a_well_formed_digraph_document`/
-    /// `same_timepoint_actions_render_as_two_ellipses_with_attimepoint_relations`
-    /// actually query colors at all, and only for THIS theory's own
-    /// declared rules/actions), so an empty cache is both correct here
-    /// and avoids needing a real maude process for tests that are
-    /// otherwise purely structural. See `canon_color.rs`'s own test
+    /// module's tests color a `RuleInfo::Intr` vertex, so an empty cache
+    /// is both correct here and avoids needing a real maude process for
+    /// tests that are otherwise purely structural. Extraction colors
+    /// EVERY vertex (the shape coloring ranks the whole part's keys), so
+    /// `src` must declare every protocol rule/action a test's system uses
+    /// -- see [`RULES_A_B_ACTIONS_P_Q`]. See `canon_color.rs`'s own test
     /// module for the maude-backed helper real intruder-rule coverage
     /// needs.
     fn color_table(src: &str) -> ColorTable {
@@ -706,7 +703,13 @@ mod tests {
         )
     }
 
-    const EMPTY: &str = "theory T begin\nend";
+    /// Declares every protocol rule (`A`, `B`) and action (`P`, `Q`) the
+    /// structural tests below use, plus one premise and one conclusion so
+    /// `EdgeRelation(ConcIdx(0), PremIdx(0))` is in range.
+    const RULES_A_B_ACTIONS_P_Q: &str = "theory T begin\n\
+        rule A:\n  [] --[ P() ]-> [ M() ]\n\
+        rule B:\n  [ M() ] --[ Q() ]-> []\n\
+        end";
 
     fn nid(name: &str, idx: u64) -> NodeId {
         LVar::new(name, LSort::Node, idx)
@@ -828,7 +831,7 @@ mod tests {
             tgt: (nid("i", 2), PremIdx(0)),
         });
 
-        let part = extract_graph_part(&sys, &color_table(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(RULES_A_B_ACTIONS_P_Q));
 
         // 2 rule instances + 1 reified EdgeRelation vertex.
         assert_eq!(part.vertices.len(), 3);
@@ -848,7 +851,7 @@ mod tests {
             tgt: (nid("i", 2), PremIdx(0)),
         });
 
-        let part = extract_graph_part(&sys, &color_table(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(RULES_A_B_ACTIONS_P_Q));
 
         // 1 rule instance + 1 dummy + 1 reified EdgeRelation vertex.
         assert_eq!(part.vertices.len(), 3);
@@ -864,7 +867,7 @@ mod tests {
             .less_atoms
             .push(LessAtom::new(nid("i", 1), nid("i", 2), Reason::Formula));
 
-        let part = extract_graph_part(&sys, &color_table(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(RULES_A_B_ACTIONS_P_Q));
 
         // 2 dummies + 1 reified LessRelation vertex.
         assert_eq!(part.vertices.len(), 3);
@@ -879,7 +882,7 @@ mod tests {
         let mut sys = System::default();
         sys.content_mut().last_atom = Some(nid("i", 7));
 
-        let part = extract_graph_part(&sys, &color_table(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(RULES_A_B_ACTIONS_P_Q));
 
         // A Dummy for the target NodeId, PLUS a LastAtomRelation marker
         // reifying that it specifically is `last_atom` (see
@@ -920,8 +923,8 @@ mod tests {
         sys_b.add_node(nid("i", 2), proto_rule("A"));
         sys_b.content_mut().last_atom = Some(nid("i", 2));
 
-        let part_a = extract_graph_part(&sys_a, &color_table(EMPTY));
-        let part_b = extract_graph_part(&sys_b, &color_table(EMPTY));
+        let part_a = extract_graph_part(&sys_a, &color_table(RULES_A_B_ACTIONS_P_Q));
+        let part_b = extract_graph_part(&sys_b, &color_table(RULES_A_B_ACTIONS_P_Q));
 
         // Same vertex set (both nodes have rule instances, plus the
         // LastAtomRelation marker), but the marker's edge target differs.
@@ -942,7 +945,7 @@ mod tests {
             .formulas
             .push(Arc::new(g("P(x) @ #i & Q(y) @ #i")));
 
-        let part = extract_graph_part(&sys, &color_table(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(RULES_A_B_ACTIONS_P_Q));
 
         assert_eq!(
             action_fact_names(&part),
@@ -979,7 +982,7 @@ mod tests {
             .solved_formulas
             .push(Arc::new(g("P(x) @ #i")));
 
-        let part = extract_graph_part(&sys, &color_table(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(RULES_A_B_ACTIONS_P_Q));
 
         assert_eq!(
             action_fact_names(&part),
@@ -998,7 +1001,7 @@ mod tests {
             .formulas
             .push(Arc::new(g("P(z) @ #j & Ex x #i. Q(x) @ #i")));
 
-        let part = extract_graph_part(&sys, &color_table(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(RULES_A_B_ACTIONS_P_Q));
 
         assert_eq!(
             action_fact_names(&part),
@@ -1111,7 +1114,7 @@ mod tests {
     fn dummy_vertex_renders_as_a_dashed_diamond() {
         let mut sys = System::default();
         sys.content_mut().last_atom = Some(nid("i", 7));
-        let part = extract_graph_part(&sys, &color_table(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(RULES_A_B_ACTIONS_P_Q));
 
         let dot = to_graphviz(&part);
 
@@ -1128,7 +1131,7 @@ mod tests {
         sys.content_mut()
             .less_atoms
             .push(LessAtom::new(nid("i", 1), nid("i", 2), Reason::Formula));
-        let part = extract_graph_part(&sys, &color_table(EMPTY));
+        let part = extract_graph_part(&sys, &color_table(RULES_A_B_ACTIONS_P_Q));
 
         let dot = to_graphviz(&part);
 

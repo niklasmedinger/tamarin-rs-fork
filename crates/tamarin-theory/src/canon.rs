@@ -3288,10 +3288,14 @@ mod tests {
             VertexKind::RuleInstance(node(2), rule_with_conclusion("Leaf", a_fun)),
         ];
         let edges = vec![GraphEdge { src: 0, tgt: 1 }, GraphEdge { src: 0, tgt: 2 }];
+        // BASE colors, not `shape_colors`: the leaves' shapes differ (`aaa`
+        // vs `zzz`), so the shape refinement would already separate them and
+        // leave no automorphism to minimize over. Any coloring constant on
+        // alpha-eq-ac classes is valid Stage F input.
         let part = GraphPart {
+            colors: colors.base_colors(&vertices),
             vertices,
             edges,
-            colors,
         };
 
         let dimacs = graph_part_to_dimacs(&part).unwrap_or_else(|e| panic!("dimacs: {e}"));
@@ -3410,10 +3414,12 @@ mod tests {
             GraphEdge { src: 3, tgt: 4 },
             GraphEdge { src: 3, tgt: 5 },
         ];
+        // BASE colors, for the same reason as in
+        // `minimal_graph_part_labelings_resolves_a_tie_broken_by_content`.
         let part = GraphPart {
+            colors: colors.base_colors(&vertices),
             vertices,
             edges,
-            colors,
         };
 
         let dimacs = graph_part_to_dimacs(&part).unwrap_or_else(|e| panic!("dimacs: {e}"));
@@ -3529,10 +3535,12 @@ mod tests {
             ),
             VertexKind::Action(node(2), proto_fact(Multiplicity::Linear, "K", vec![fxy])),
         ];
+        // `Fr(x)`/`Fr(y)` have the same shape, so the swap survives even
+        // the shape refinement.
         let part = GraphPart {
+            colors: colors.shape_colors(&vertices),
             vertices,
             edges: Vec::new(),
-            colors,
         };
 
         let dimacs = graph_part_to_dimacs(&part).unwrap_or_else(|e| panic!("dimacs: {e}"));
@@ -3586,6 +3594,52 @@ mod tests {
              one from canonizing Fr(x) before Fr(y) -- discarding the swapped K(f(mv(1), \
              mv(0))) variant even though bliss reported the swap as a real automorphism"
         );
+    }
+
+    /// The case the shape coloring (`ColorTable::shape_colors`) exists for:
+    /// two `!KU` sibling goals on `Dummy` timepoints, both `<` a common
+    /// parent -- the gadget a tuple decomposition leaves behind. Under base
+    /// colors bliss swaps them; once `!KU(x)` (msg) and `!KU($p)` (pub)
+    /// differ in shape, the group is trivial.
+    #[test]
+    fn shape_colors_remove_a_sibling_ku_swap_that_base_colors_allow() {
+        if !bliss_available() {
+            return;
+        }
+        use crate::bliss_proc::{graph_part_to_dimacs, run_bliss};
+        use crate::canon_graph::{GraphEdge, GraphPart};
+        use crate::fact::ku_fact;
+
+        let table = empty_color_table();
+        let vertices = vec![
+            VertexKind::Dummy(node(0)), // 0: parent
+            VertexKind::Dummy(node(1)), // 1
+            VertexKind::Dummy(node(2)), // 2
+            VertexKind::LessRelation,   // 3: 1 < 0
+            VertexKind::LessRelation,   // 4: 2 < 0
+            VertexKind::Action(node(1), ku_fact(v("x", LSort::Msg))), // 5
+            VertexKind::Action(node(2), ku_fact(v("p", LSort::Pub))), // 6
+            VertexKind::AtTimepointRelation, // 7: 5 @ 1
+            VertexKind::AtTimepointRelation, // 8: 6 @ 2
+        ];
+        let edges: Vec<GraphEdge> = [(1, 3), (3, 0), (2, 4), (4, 0), (5, 7), (7, 1), (6, 8), (8, 2)]
+            .into_iter()
+            .map(|(src, tgt)| GraphEdge { src, tgt })
+            .collect();
+        let generator_count = |colors: Vec<crate::canon_color::Color>| {
+            let part = GraphPart {
+                vertices: vertices.clone(),
+                edges: edges.clone(),
+                colors,
+            };
+            let dimacs = graph_part_to_dimacs(&part).unwrap_or_else(|e| panic!("dimacs: {e}"));
+            run_bliss(&dimacs)
+                .unwrap_or_else(|e| panic!("run_bliss: {e}"))
+                .generators
+                .len()
+        };
+        assert_eq!(generator_count(table.base_colors(&vertices)), 1);
+        assert_eq!(generator_count(table.shape_colors(&vertices)), 0);
     }
 
     // -- Stage G: eq_store.conj --------------------------------------------
