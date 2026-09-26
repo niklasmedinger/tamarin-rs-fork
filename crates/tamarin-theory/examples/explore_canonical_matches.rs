@@ -92,7 +92,7 @@
 //! compact JSON object, `schema_version` 3 (use `jq .` to read it), via a
 //! temporary file and a rename (a killed run never leaves a truncated one):
 //! `theory`, `lemma`, `argv`, `params`, `stop_reason` (`exhausted`,
-//! `max_nodes`, `time_budget` or `panic`), `truncated` (anything but
+//! `max_nodes`, `time_budget`, `max_rss` or `panic`), `truncated` (anything but
 //! `exhausted`), `lower_bound` (some node is unexpanded or failed to
 //! canonicalize or expand, so `tree` undercounts), `timing` (`setup_secs`,
 //! `explore_secs`), `peak_rss_mib`, `canonicalize` (`failures` and up to 20
@@ -114,7 +114,7 @@
 //! `inapplicable`, and `and` (`method` index, `kind`, `cases` as
 //! `[name, child_id]` pairs).
 //!
-//! Usage: `cargo run --example explore_canonical_matches -- <theory.spthy> <lemma> [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--time-budget SECS] [--heartbeat SECS] [--trace]`
+//! Usage: `cargo run --example explore_canonical_matches -- <theory.spthy> <lemma> [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--time-budget SECS] [--max-rss-gb GB] [--heartbeat SECS] [--trace]`
 //! or `... -- --list-lemmas <theory.spthy>`.
 //!
 //! - `--max-depth` (default 4): don't expand nodes at this depth.
@@ -125,6 +125,11 @@
 //! - `--time-budget SECS`: likewise, stop expanding once the process has
 //!   run this long (setup included); the JSON is written as usual. Also
 //!   checked only between expansions, so one expansion can overrun it.
+//! - `--max-rss-gb GB`: likewise, stop expanding once the resident set
+//!   reaches GB GiB (read from `/proc/self/status`), so a run approaching
+//!   an external memory limit still writes its JSON instead of being
+//!   killed. One expansion can overshoot it (a large `splitEqs` can take
+//!   over 1 GB), so leave headroom below any hard limit.
 //! - `--heartbeat SECS`: log a progress line (processed, graph, queue,
 //!   rate, RSS, and the current node's step and how long it has run) every
 //!   SECS, from a background thread, so a single long step (one
@@ -1702,6 +1707,9 @@ struct Explorer<'a> {
     started: Instant,
     /// `--time-budget`: stop expanding once the PROCESS has run this long.
     time_budget: Option<Duration>,
+    /// `--max-rss-gb`, in MiB: stop expanding once the resident set is this
+    /// large.
+    max_rss_mib: Option<u64>,
     /// The first [`FAILURE_EXAMPLES_LIMIT`] canonicalization failures.
     canon_failure_examples: Vec<Value>,
     /// Set when expanding a node panicked (see [`StopReason::Panic`]).
@@ -1717,6 +1725,8 @@ enum StopReason {
     MaxNodes,
     /// `--time-budget` ran out.
     TimeBudget,
+    /// The resident set reached `--max-rss-gb`.
+    MaxRss,
     /// Expanding a node panicked outside canonicalization. Exploration
     /// stops there: the panic may have left the shared solver state (e.g.
     /// the maude connection) inconsistent.
@@ -1729,6 +1739,7 @@ impl StopReason {
             StopReason::Exhausted => "exhausted",
             StopReason::MaxNodes => "max_nodes",
             StopReason::TimeBudget => "time_budget",
+            StopReason::MaxRss => "max_rss",
             StopReason::Panic => "panic",
         }
     }
@@ -1987,16 +1998,22 @@ impl Explorer<'_> {
                 .is_some_and(|b| elapsed_secs() >= b.as_secs_f64())
             {
                 Some(StopReason::TimeBudget)
+            } else if self
+                .max_rss_mib
+                .is_some_and(|max| memory_mib("VmRSS:").is_some_and(|rss| rss >= max))
+            {
+                Some(StopReason::MaxRss)
             } else {
                 None
             };
             if let Some(stop) = stop {
                 log!(
-                    "stopping ({}): processed={} graph={} queue={}",
+                    "stopping ({}): processed={} graph={} queue={} rss={}MiB",
                     stop.name(),
                     self.processed,
                     self.graph.nodes.len(),
-                    self.queue.len() + 1
+                    self.queue.len() + 1,
+                    memory_mib("VmRSS:").map_or_else(|| "?".to_string(), |m| m.to_string())
                 );
                 self.queue.push_front((id, sys, methods));
                 return stop;
@@ -2301,6 +2318,9 @@ struct Args {
     /// `--time-budget SECS`: stop expanding once the process has run this
     /// long (setup included), then write the JSON as usual.
     time_budget: Option<f64>,
+    /// `--max-rss-gb GB`: stop expanding once the resident set reaches this
+    /// many GiB, then write the JSON as usual.
+    max_rss_gb: Option<f64>,
     /// `--heartbeat SECS`: log a progress line every SECS (background thread).
     heartbeat: Option<f64>,
     /// `--trace`: log every expansion and every applied method.
@@ -2315,7 +2335,7 @@ enum Mode {
 
 const USAGE: &str = "usage: explore_canonical_matches <theory.spthy> <lemma> \
      [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] \
-     [--time-budget SECS] [--heartbeat SECS] [--trace]\n       \
+     [--time-budget SECS] [--max-rss-gb GB] [--heartbeat SECS] [--trace]\n       \
      explore_canonical_matches --list-lemmas <theory.spthy>";
 
 fn usage_error(message: &str) -> ! {
@@ -2341,6 +2361,7 @@ fn parse_args(raw: &[String]) -> Mode {
         out: None,
         no_merge: false,
         time_budget: None,
+        max_rss_gb: None,
         heartbeat: None,
         trace: false,
     };
@@ -2360,6 +2381,7 @@ fn parse_args(raw: &[String]) -> Mode {
             "--max-nodes" => args.max_nodes = number(value()) as u64,
             "--out" => args.out = Some(value().clone()),
             "--time-budget" => args.time_budget = Some(number(value())),
+            "--max-rss-gb" => args.max_rss_gb = Some(number(value())),
             "--heartbeat" => args.heartbeat = Some(number(value())),
             "--no-merge" => args.no_merge = true,
             "--trace" => args.trace = true,
@@ -2508,7 +2530,8 @@ fn main() {
         return;
     }
 
-    if let Some(every) = args.heartbeat {
+    // `--heartbeat 0` (or less) means off, not a busy loop.
+    if let Some(every) = args.heartbeat.filter(|&secs| secs > 0.0) {
         spawn_heartbeat(Duration::from_secs_f64(every));
     }
     set_phase("setup");
@@ -2558,6 +2581,7 @@ fn main() {
         automorphism_examples_shown: BTreeMap::new(),
         started: Instant::now(),
         time_budget: args.time_budget.map(Duration::from_secs_f64),
+        max_rss_mib: args.max_rss_gb.map(|gb| (gb * 1024.0) as u64),
         canon_failure_examples: Vec::new(),
         panic: None,
     };
@@ -2597,6 +2621,7 @@ fn main() {
             "max_nodes": args.max_nodes,
             "no_merge": args.no_merge,
             "time_budget": args.time_budget,
+            "max_rss_gb": args.max_rss_gb,
         },
         "stop_reason": stop.name(),
         "truncated": stop != StopReason::Exhausted,
