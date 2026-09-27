@@ -12,7 +12,8 @@
 //! This binary instead explores EXHAUSTIVELY (breadth-first, bounded by
 //! `--max-depth`/`--max-nodes`): at every node it executes ALL of
 //! `candidate_methods`' candidates, and every resulting case becomes a
-//! child. Each child is canonicalized (`canonicalize_constraint_system`)
+//! child (or, with `--top-methods N`, only the N best-ranked applicable
+//! candidates -- see below). Each child is canonicalized (`canonicalize_constraint_system`)
 //! and fingerprinted as soon as it is generated; a child whose fingerprint
 //! was already seen is MERGED into the existing node instead of becoming a
 //! new one. The result is written as JSON (see "Output" below); profiling
@@ -111,10 +112,11 @@
 //! `unexpanded`, `canon_panic`, `exec_panic`), `canon_err` (canonicalization returned an
 //! error: expanded normally but never merged into), `first_parent`
 //! (`[parent, and_index, case_index]` of the occurrence that created it),
-//! `inapplicable`, and `and` (`method` index, `kind`, `cases` as
+//! `inapplicable`, `untried` (candidates skipped by `--top-methods`), and
+//! `and` (`method` index, `kind`, `cases` as
 //! `[name, child_id]` pairs).
 //!
-//! Usage: `cargo run --example explore_canonical_matches -- <theory.spthy> <lemma> [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--time-budget SECS] [--max-rss-gb GB] [--setup-timeout SECS] [--heartbeat SECS] [--trace]`
+//! Usage: `cargo run --example explore_canonical_matches -- <theory.spthy> <lemma> [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--top-methods N] [--time-budget SECS] [--max-rss-gb GB] [--setup-timeout SECS] [--heartbeat SECS] [--trace]`
 //! or `... -- --list-lemmas <theory.spthy>`.
 //!
 //! - `--max-depth` (default 4): don't expand nodes at this depth.
@@ -122,6 +124,14 @@
 //!   occurrences have been canonicalized. Checked before each expansion, so
 //!   it can be exceeded by one node's fan-out; queued nodes stay
 //!   `unexpanded`.
+//! - `--top-methods N`: at each node, apply only the first N candidate
+//!   methods whose `exec_proof_method` succeeds, in `candidate_methods`'
+//!   (heuristic) order; inapplicable candidates don't count, the rest are
+//!   recorded as `untried`. `--top-methods 1` follows the prover's own
+//!   greedy choice at every node. The merge check still compares ALL
+//!   candidates. With a heuristic of several round-robin rankings the order
+//!   depends on the depth, and a merged node is expanded only once, at its
+//!   first (minimum) depth -- so its top N follow that depth's ranking.
 //! - `--time-budget SECS`: likewise, stop expanding once the process has
 //!   run this long (setup included); the JSON is written as usual. Also
 //!   checked only between expansions, so one expansion can overrun it.
@@ -492,6 +502,9 @@ struct OrNode {
     first_parent: Option<(OrId, u32, u32)>,
     /// Candidate methods whose `exec_proof_method` returned `None`.
     inapplicable: u32,
+    /// Candidate methods never tried because `--top-methods` were already
+    /// applied.
+    untried: u32,
     and: Vec<AndNode>,
     /// The candidate methods of the system that created the node, for
     /// checking every later merge into it; `None` if canonicalization (of
@@ -593,6 +606,7 @@ impl Graph {
             canon_err: false,
             first_parent,
             inapplicable: 0,
+            untried: 0,
             and: Vec::new(),
             methods_sig: None,
         });
@@ -1694,6 +1708,8 @@ struct Explorer<'a> {
     flags: Flags,
     max_depth: usize,
     no_merge: bool,
+    /// `--top-methods`: apply only this many candidate methods per node.
+    top_methods: Option<usize>,
     graph: Graph,
     by_fingerprint: FastMap<CanonicalSystemFingerprint, OrId>,
     /// Nodes awaiting expansion, with the `System` only they still carry and
@@ -2094,7 +2110,15 @@ impl Explorer<'_> {
         }
         self.graph.node_mut(id).status = Status::Expanded;
         let method_count = methods.len();
+        let mut applied = 0usize;
         for (k, method) in methods.into_iter().enumerate() {
+            // `candidate_methods` is in heuristic order, so this keeps the
+            // best-ranked applicable methods -- `--top-methods 1` follows
+            // the prover's own greedy choice.
+            if self.top_methods.is_some_and(|n| applied >= n) {
+                self.graph.node_mut(id).untried = (method_count - k) as u32;
+                break;
+            }
             let text = pretty_proof_method_inline(&method);
             let step = format!("method {}/{method_count} {text}", k + 1);
             if self.flags.trace {
@@ -2108,6 +2132,7 @@ impl Explorer<'_> {
                 self.graph.node_mut(id).inapplicable += 1;
                 continue;
             };
+            applied += 1;
             let method_id = self.graph.intern_method(text);
             let and_idx = self.graph.node(id).and.len() as u32;
             self.graph.node_mut(id).and.push(AndNode {
@@ -2295,6 +2320,7 @@ fn node_json(id: usize, n: &OrNode) -> Value {
         "canon_err": n.canon_err,
         "first_parent": n.first_parent.map(|(p, a, c)| json!([p, a, c])),
         "inapplicable": n.inapplicable,
+        "untried": n.untried,
         "and": n.and.iter().map(|a| json!({
             "method": a.method,
             "kind": a.kind,
@@ -2318,6 +2344,9 @@ struct Args {
     max_nodes: u64,
     out: Option<String>,
     no_merge: bool,
+    /// `--top-methods N`: apply only the N best-ranked applicable candidate
+    /// methods per node (default: all).
+    top_methods: Option<usize>,
     /// `--time-budget SECS`: stop expanding once the process has run this
     /// long (setup included), then write the JSON as usual.
     time_budget: Option<f64>,
@@ -2340,7 +2369,7 @@ enum Mode {
 }
 
 const USAGE: &str = "usage: explore_canonical_matches <theory.spthy> <lemma> \
-     [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] \
+     [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--top-methods N] \
      [--time-budget SECS] [--max-rss-gb GB] [--setup-timeout SECS] [--heartbeat SECS] \
      [--trace]\n       \
      explore_canonical_matches --list-lemmas <theory.spthy>";
@@ -2367,6 +2396,7 @@ fn parse_args(raw: &[String]) -> Mode {
         max_nodes: 2000,
         out: None,
         no_merge: false,
+        top_methods: None,
         time_budget: None,
         max_rss_gb: None,
         setup_timeout: None,
@@ -2393,6 +2423,13 @@ fn parse_args(raw: &[String]) -> Mode {
             "--setup-timeout" => args.setup_timeout = Some(number(value())),
             "--heartbeat" => args.heartbeat = Some(number(value())),
             "--no-merge" => args.no_merge = true,
+            "--top-methods" => {
+                let n = number(value());
+                if n < 1.0 || n.fract() != 0.0 {
+                    usage_error(&format!("--top-methods wants a positive integer, got {n}"));
+                }
+                args.top_methods = Some(n as usize);
+            }
             "--trace" => args.trace = true,
             other => usage_error(&format!("unrecognized argument: {other}")),
         }
@@ -2607,6 +2644,7 @@ fn main() {
         },
         max_depth: args.max_depth,
         no_merge: args.no_merge,
+        top_methods: args.top_methods,
         graph: Graph::default(),
         by_fingerprint: FastMap::default(),
         queue: VecDeque::new(),
@@ -2658,6 +2696,7 @@ fn main() {
             "max_depth": args.max_depth,
             "max_nodes": args.max_nodes,
             "no_merge": args.no_merge,
+            "top_methods": args.top_methods,
             "time_budget": args.time_budget,
             "max_rss_gb": args.max_rss_gb,
             "setup_timeout": args.setup_timeout,
