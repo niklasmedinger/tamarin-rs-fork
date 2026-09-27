@@ -96,7 +96,12 @@
 //! `max_nodes`, `time_budget`, `max_rss` or `panic`), `truncated` (anything but
 //! `exhausted`), `lower_bound` (some node is unexpanded or failed to
 //! canonicalize or expand, so `tree` undercounts), `timing` (`setup_secs`,
-//! `explore_secs`), `peak_rss_mib`, `canonicalize` (`failures` and up to 20
+//! `explore_secs`, and the wall time per stage, always measured:
+//! `canonicalize_secs` (every occurrence) of which `canonicalize_merged_secs`
+//! (occurrences merged into an existing node), `fingerprint_secs`,
+//! `candidate_methods_secs` (ranking, for every created node),
+//! `exec_proof_method_secs`, `method_check_secs` (this tool's own merge
+//! check) and `profile_canon_secs` (`PROFILE_CANON`)), `peak_rss_mib`, `canonicalize` (`failures` and up to 20
 //! `examples`, each with its `kind` -- `panic` or `error` --, `path` and
 //! `message`), `panic` (null, or where expanding a node panicked: `node`,
 //! `path`, `activity`, `message`), `invariant_violations` (see "Three
@@ -112,7 +117,9 @@
 //! `unexpanded`, `canon_panic`, `exec_panic`), `canon_err` (canonicalization returned an
 //! error: expanded normally but never merged into), `first_parent`
 //! (`[parent, and_index, case_index]` of the occurrence that created it),
-//! `inapplicable`, `untried` (candidates skipped by `--top-methods`), and
+//! `inapplicable`, `untried` (candidates skipped by `--top-methods`),
+//! `canon_secs`/`methods_secs`/`exec_secs` (canonicalizing the occurrence
+//! that created it, ranking its methods, executing them), and
 //! `and` (`method` index, `kind`, `cases` as
 //! `[name, child_id]` pairs).
 //!
@@ -178,12 +185,14 @@
 //!   `candidate_methods`' enormous branching factor.
 //! - `DUMP_FORMULAS=1` -- dump `sys.formulas`/`sys.solved_formulas`/
 //!   `sys.nodes`/`sys.last_atom`/`sys.goals` for every occurrence, to stderr.
-//! - `PROFILE=1` -- wall time per stage: `canonicalize_constraint_system`,
+//! - `PROFILE=1` -- prints the wall time per stage (always recorded in the
+//!   JSON's `timing`): `canonicalize_constraint_system`,
 //!   fingerprint + dedup lookup, `candidate_methods` (ranking, including
-//!   its `is_finished` check; computed for every occurrence, merged ones
-//!   too, for the method check), and `exec_proof_method` (solving -- the one most likely to
-//!   route through `MaudeHandle`). The first two are this tool's layer, the
-//!   last two Tamarin's own search.
+//!   its `is_finished` check, for every created node), `exec_proof_method`
+//!   (solving -- the one most likely to route through `MaudeHandle`), and
+//!   the merge check (candidate methods of merged occurrences, method
+//!   signatures). The first two are what merging costs, the next two
+//!   Tamarin's own search, the last this tool's verification.
 //! - `PROFILE_CANON=1` -- breaks the canonicalization bucket down into its
 //!   internal stages: Stage A graph extraction, Stage C's external `bliss`
 //!   subprocess (dimacs, spawn and parse), Stage F's automorphism GROUP
@@ -524,6 +533,14 @@ struct OrNode {
     /// Candidate methods never tried because `--top-methods` were already
     /// applied.
     untried: u32,
+    /// Seconds spent canonicalizing (and fingerprinting) the occurrence
+    /// that created the node, ranking its candidate methods, and executing
+    /// the methods applied to it -- the latter two are what a search that
+    /// merges into this node saves per merged occurrence (plus the same for
+    /// the node's subtree).
+    canon_secs: f64,
+    methods_secs: f64,
+    exec_secs: f64,
     and: Vec<AndNode>,
     /// The candidate methods of the system that created the node, for
     /// checking every later merge into it; `None` if canonicalization (of
@@ -626,6 +643,9 @@ impl Graph {
             first_parent,
             inapplicable: 0,
             untried: 0,
+            canon_secs: 0.0,
+            methods_secs: 0.0,
+            exec_secs: 0.0,
             and: Vec::new(),
             methods_sig: None,
         });
@@ -815,13 +835,19 @@ mod sizes {
 // =============================================================================
 
 /// Runs `f`, adding its wall time to `acc` when `on`.
-fn timed<T>(on: bool, acc: &mut Duration, f: impl FnOnce() -> T) -> T {
+/// Runs `f`, adds its wall time to `acc`, and returns its result and that
+/// time.
+fn timed<T>(acc: &mut Duration, f: impl FnOnce() -> T) -> (T, Duration) {
     let start = Instant::now();
     let out = f();
-    if on {
-        *acc += start.elapsed();
-    }
-    out
+    let took = start.elapsed();
+    *acc += took;
+    (out, took)
+}
+
+/// `secs` rounded to microseconds, for the per-node JSON timings.
+fn micros(secs: f64) -> f64 {
+    (secs * 1e6).round() / 1e6
 }
 
 /// `part` as a percentage of `total` (0 when `total` is zero).
@@ -1697,13 +1723,25 @@ impl CanonProfile {
     }
 }
 
-/// `PROFILE=1` stage timers.
+/// Wall time per stage, always measured (written to the JSON's `timing`;
+/// `PROFILE=1` also prints it). What a search that merges canonically equal
+/// systems would pay is `canonicalize` + `fingerprint` for every occurrence,
+/// on top of the search's own `candidate_methods` + `exec_proof_method`;
+/// `method_check` is this tool's own verification of merges.
 #[derive(Default)]
 struct StageTimers {
+    /// Canonicalizing every occurrence (including failed ones).
     canonicalize: Duration,
+    /// The part of `canonicalize` spent on occurrences merged into an
+    /// existing node.
+    canonicalize_merged: Duration,
     fingerprint: Duration,
+    /// Ranking the candidate methods of every node that was created.
     candidate_methods: Duration,
     exec_proof_method: Duration,
+    /// Merge verification only: candidate methods of merged occurrences,
+    /// canonicalizing every occurrence's methods, comparing them.
+    method_check: Duration,
 }
 
 // =============================================================================
@@ -1854,11 +1892,13 @@ impl Explorer<'_> {
             }
         }
         set_activity_step("canonicalize");
-        let canon = timed(self.flags.profile, &mut self.timers.canonicalize, || {
+        let (canon, canon_took) = timed(&mut self.timers.canonicalize, || {
             catch_unwind(AssertUnwindSafe(|| {
                 canonicalize_constraint_system_with_labelling(&sys, &ctx.color_table)
             }))
         });
+        let mut fingerprint_took = Duration::ZERO;
+        let mut methods_took = Duration::ZERO;
 
         if self.flags.profile_canon {
             self.profile_canon(&sys, edge);
@@ -1875,7 +1915,9 @@ impl Explorer<'_> {
                     self.graph.path(edge)
                 );
                 let id = self.graph.add_node(depth, edge);
-                self.graph.node_mut(id).status = Status::CanonPanic;
+                let node = self.graph.node_mut(id);
+                node.status = Status::CanonPanic;
+                node.canon_secs = canon_took.as_secs_f64();
                 self.record_canon_failure("panic", Some(id), depth, edge, message);
                 return id;
             }
@@ -1888,30 +1930,42 @@ impl Explorer<'_> {
                 (None, None, None)
             }
             Ok(Ok((canon, labelling))) => {
-                let fp = timed(self.flags.profile, &mut self.timers.fingerprint, || {
+                let (fp, took) = timed(&mut self.timers.fingerprint, || {
                     fingerprint_constraint_system(&canon)
                 });
+                fingerprint_took = took;
                 set_activity_step("candidate_methods");
-                let methods = timed(self.flags.profile, &mut self.timers.candidate_methods, || {
-                    candidate_methods(&sys, ctx, depth)
-                });
+                let start = Instant::now();
+                let methods = candidate_methods(&sys, ctx, depth);
+                methods_took = start.elapsed();
+                let start = Instant::now();
                 let sig = self.method_signature(&sys, &labelling, &methods, edge);
+                self.timers.method_check += start.elapsed();
                 (Some(fp), Some(methods), sig)
             }
         };
 
         if let (Some(fp), false) = (fingerprint, self.no_merge) {
             if let Some(&existing) = self.by_fingerprint.get(&fp) {
+                // A merged occurrence's candidate methods only feed the
+                // merge check.
+                self.timers.canonicalize_merged += canon_took;
+                self.timers.method_check += methods_took;
                 if let Some(sig) = &methods_sig {
+                    let start = Instant::now();
                     self.check_methods(existing, sig, depth, edge);
+                    self.timers.method_check += start.elapsed();
                 }
                 return existing;
             }
         }
+        self.timers.candidate_methods += methods_took;
         let id = self.graph.add_node(depth, edge);
         let node = self.graph.node_mut(id);
         node.canon_err = fingerprint.is_none();
         node.methods_sig = methods_sig;
+        node.canon_secs = (canon_took + fingerprint_took).as_secs_f64();
+        node.methods_secs = methods_took.as_secs_f64();
         if let (Some(fp), false) = (fingerprint, self.no_merge) {
             self.by_fingerprint.insert(fp, id);
         }
@@ -2108,7 +2162,6 @@ impl Explorer<'_> {
     /// them (every node except `canon_err` ones).
     fn expand(&mut self, id: OrId, sys: &System, methods: Option<Vec<ProofMethod>>) {
         let ctx = self.ctx;
-        let profile = self.flags.profile;
         let depth = self.graph.node(id).depth as usize;
         if depth >= self.max_depth {
             self.graph.node_mut(id).status = Status::DepthLimit;
@@ -2118,9 +2171,11 @@ impl Explorer<'_> {
         set_breadcrumb_node(id, depth as u32, path);
         let methods = methods.unwrap_or_else(|| {
             set_activity("candidate_methods".to_string());
-            timed(profile, &mut self.timers.candidate_methods, || {
+            let (methods, took) = timed(&mut self.timers.candidate_methods, || {
                 candidate_methods(sys, ctx, depth)
-            })
+            });
+            self.graph.node_mut(id).methods_secs += took.as_secs_f64();
+            methods
         });
         // `candidate_methods` offers exactly `[Finished(r)]` for a terminal
         // (solved/contradictory/unfinishable) system.
@@ -2157,9 +2212,10 @@ impl Explorer<'_> {
                 log!("  exec {}", truncate_for_log(&step, 300));
             }
             set_activity(format!("exec_proof_method {step}"));
-            let exec = timed(profile, &mut self.timers.exec_proof_method, || {
+            let (exec, took) = timed(&mut self.timers.exec_proof_method, || {
                 exec_proof_method(ctx, &method, sys)
             });
+            self.graph.node_mut(id).exec_secs += took.as_secs_f64();
             let Some(cases) = exec else {
                 self.graph.node_mut(id).inapplicable += 1;
                 continue;
@@ -2391,6 +2447,9 @@ fn node_json(id: usize, n: &OrNode) -> Value {
         "first_parent": n.first_parent.map(|(p, a, c)| json!([p, a, c])),
         "inapplicable": n.inapplicable,
         "untried": n.untried,
+        "canon_secs": micros(n.canon_secs),
+        "methods_secs": micros(n.methods_secs),
+        "exec_secs": micros(n.exec_secs),
         "and": n.and.iter().map(|a| json!({
             "method": a.method,
             "kind": a.kind,
@@ -2787,6 +2846,13 @@ fn main() {
         "timing": {
             "setup_secs": setup_secs,
             "explore_secs": explore_secs,
+            "canonicalize_secs": explorer.timers.canonicalize.as_secs_f64(),
+            "canonicalize_merged_secs": explorer.timers.canonicalize_merged.as_secs_f64(),
+            "fingerprint_secs": explorer.timers.fingerprint.as_secs_f64(),
+            "candidate_methods_secs": explorer.timers.candidate_methods.as_secs_f64(),
+            "exec_proof_method_secs": explorer.timers.exec_proof_method.as_secs_f64(),
+            "method_check_secs": explorer.timers.method_check.as_secs_f64(),
+            "profile_canon_secs": explorer.canon_profile.wall.as_secs_f64(),
         },
         "peak_rss_mib": peak_rss_mib,
         "sizes": summary.sizes,
@@ -2838,7 +2904,11 @@ fn main() {
 
     if explorer.flags.profile {
         let t = &explorer.timers;
-        let total = t.canonicalize + t.fingerprint + t.candidate_methods + t.exec_proof_method;
+        let total = t.canonicalize
+            + t.fingerprint
+            + t.candidate_methods
+            + t.exec_proof_method
+            + t.method_check;
         println!(
             "\n--- PROFILE: wall time by pipeline stage, summed over {} occurrence(s) ---",
             summary.processed
@@ -2848,6 +2918,7 @@ fn main() {
             ("fingerprint + dedup lookup:", t.fingerprint),
             ("candidate_methods (ranking, incl. is_finished):", t.candidate_methods),
             ("exec_proof_method (solving -- maude/AC here):", t.exec_proof_method),
+            ("merge check (methods of merged + signatures):", t.method_check),
         ] {
             println!("  {label:<47}{:>8.2}s ({:>5.1}%)", d.as_secs_f64(), pct(d, total));
         }
