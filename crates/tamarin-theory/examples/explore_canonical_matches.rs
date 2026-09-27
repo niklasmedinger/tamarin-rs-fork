@@ -114,7 +114,7 @@
 //! `inapplicable`, and `and` (`method` index, `kind`, `cases` as
 //! `[name, child_id]` pairs).
 //!
-//! Usage: `cargo run --example explore_canonical_matches -- <theory.spthy> <lemma> [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--time-budget SECS] [--max-rss-gb GB] [--heartbeat SECS] [--trace]`
+//! Usage: `cargo run --example explore_canonical_matches -- <theory.spthy> <lemma> [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--time-budget SECS] [--max-rss-gb GB] [--setup-timeout SECS] [--heartbeat SECS] [--trace]`
 //! or `... -- --list-lemmas <theory.spthy>`.
 //!
 //! - `--max-depth` (default 4): don't expand nodes at this depth.
@@ -130,6 +130,9 @@
 //!   an external memory limit still writes its JSON instead of being
 //!   killed. One expansion can overshoot it (a large `splitEqs` can take
 //!   over 1 GB), so leave headroom below any hard limit.
+//! - `--setup-timeout SECS`: give up if setup (parse, elaborate, maude,
+//!   source precomputation) takes longer; setup can't be interrupted, so a
+//!   watchdog thread exits the process with code 6 (no JSON).
 //! - `--heartbeat SECS`: log a progress line (processed, graph, queue,
 //!   rate, RSS, and the current node's step and how long it has run) every
 //!   SECS, from a background thread, so a single long step (one
@@ -155,8 +158,8 @@
 //! stops the exploration there, marks the node `exec_panic`, and still
 //! writes the JSON. Exit codes: 0 done (whatever `stop_reason`), 2 usage,
 //! 3 setup failed (read/parse/elaborate/maude/lemma; no JSON), 4 stopped by
-//! a panic (partial JSON), 5 a size invariant failed (JSON written), 101 an
-//! uncaught panic.
+//! a panic (partial JSON), 5 a size invariant failed (JSON written), 6 setup
+//! exceeded `--setup-timeout` (no JSON), 101 an uncaught panic.
 //!
 //! Env vars (all opt-in, unset = off), all terminal-only:
 //! - `PROGRESS=1` -- stderr heartbeat every 20 canonicalizations (elapsed,
@@ -216,8 +219,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -2321,6 +2324,9 @@ struct Args {
     /// `--max-rss-gb GB`: stop expanding once the resident set reaches this
     /// many GiB, then write the JSON as usual.
     max_rss_gb: Option<f64>,
+    /// `--setup-timeout SECS`: give up (exit 6, no JSON) if setup takes
+    /// longer than this.
+    setup_timeout: Option<f64>,
     /// `--heartbeat SECS`: log a progress line every SECS (background thread).
     heartbeat: Option<f64>,
     /// `--trace`: log every expansion and every applied method.
@@ -2335,7 +2341,8 @@ enum Mode {
 
 const USAGE: &str = "usage: explore_canonical_matches <theory.spthy> <lemma> \
      [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] \
-     [--time-budget SECS] [--max-rss-gb GB] [--heartbeat SECS] [--trace]\n       \
+     [--time-budget SECS] [--max-rss-gb GB] [--setup-timeout SECS] [--heartbeat SECS] \
+     [--trace]\n       \
      explore_canonical_matches --list-lemmas <theory.spthy>";
 
 fn usage_error(message: &str) -> ! {
@@ -2362,6 +2369,7 @@ fn parse_args(raw: &[String]) -> Mode {
         no_merge: false,
         time_budget: None,
         max_rss_gb: None,
+        setup_timeout: None,
         heartbeat: None,
         trace: false,
     };
@@ -2382,6 +2390,7 @@ fn parse_args(raw: &[String]) -> Mode {
             "--out" => args.out = Some(value().clone()),
             "--time-budget" => args.time_budget = Some(number(value())),
             "--max-rss-gb" => args.max_rss_gb = Some(number(value())),
+            "--setup-timeout" => args.setup_timeout = Some(number(value())),
             "--heartbeat" => args.heartbeat = Some(number(value())),
             "--no-merge" => args.no_merge = true,
             "--trace" => args.trace = true,
@@ -2405,6 +2414,27 @@ const EXIT_USAGE: i32 = 2;
 const EXIT_SETUP_ERROR: i32 = 3;
 const EXIT_PANIC_STOP: i32 = 4;
 const EXIT_INVARIANT_VIOLATION: i32 = 5;
+const EXIT_SETUP_TIMEOUT: i32 = 6;
+
+/// `--setup-timeout`: setup (elaboration, intruder variants, source
+/// precomputation) is one uninterruptible call, so a watchdog thread ends
+/// the process if it is still running after `limit`. `done` is set once
+/// setup returns.
+fn spawn_setup_watchdog(limit: Duration, done: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        while !done.load(Ordering::Relaxed) {
+            if start.elapsed() >= limit {
+                log!(
+                    "setup exceeded --setup-timeout {:.0}s, giving up (no JSON)",
+                    limit.as_secs_f64()
+                );
+                std::process::exit(EXIT_SETUP_TIMEOUT);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
+}
 
 /// `--list-lemmas`: prints one JSON object describing the theory and its
 /// lemmas, for a batch runner to plan jobs from. `error` is non-null (and
@@ -2488,7 +2518,10 @@ fn setup(
         &args.lemma,
         maude,
         None,
-        "",
+        // The theory's path, as the CLI passes it: relative oracle paths
+        // (`heuristic: o "..."`) and the default `<theory>.oracle` resolve
+        // against its directory.
+        &args.theory_path,
         &CliHeuristic::default(),
         CutStrategy::Dfs,
         None,
@@ -2535,6 +2568,10 @@ fn main() {
         spawn_heartbeat(Duration::from_secs_f64(every));
     }
     set_phase("setup");
+    let setup_done = Arc::new(AtomicBool::new(false));
+    if let Some(limit) = args.setup_timeout.filter(|&secs| secs > 0.0) {
+        spawn_setup_watchdog(Duration::from_secs_f64(limit), Arc::clone(&setup_done));
+    }
     // `_user_funs_guard` must stay alive for the WHOLE exploration:
     // canonicalization needs the installed signature.
     let (ctx, initial_sys, _user_funs_guard) = match catch_unwind(AssertUnwindSafe(|| setup(&args))) {
@@ -2548,6 +2585,7 @@ fn main() {
             std::process::exit(EXIT_SETUP_ERROR);
         }
     };
+    setup_done.store(true, Ordering::Relaxed);
     let setup_secs = elapsed_secs();
     log!(
         "setup done in {setup_secs:.2}s, peak rss {}MiB",
@@ -2622,6 +2660,7 @@ fn main() {
             "no_merge": args.no_merge,
             "time_budget": args.time_budget,
             "max_rss_gb": args.max_rss_gb,
+            "setup_timeout": args.setup_timeout,
         },
         "stop_reason": stop.name(),
         "truncated": stop != StopReason::Exhausted,
