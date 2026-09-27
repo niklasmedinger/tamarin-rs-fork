@@ -215,6 +215,11 @@
 //!   `sys.less_atoms`, so one can be reproduced in the GUI. Raw NodeIds are
 //!   internal to this run; compare the printed `sys.nodes`/`less_atoms`
 //!   against what the GUI shows at the same point in the path.
+//! - `DUMP_DIMACS_AT=N` -- writes the graph part of the N-th canonicalized
+//!   occurrence (`processed` = N) as bliss input to `<--out>.occ<N>.dimacs`,
+//!   plus its vertex kinds to `<--out>.occ<N>.vertices`, before
+//!   canonicalizing it -- for a canonicalization that takes very long
+//!   (`bliss -directed <file>` reports `|Aut|`).
 //! - `DUMP_CANON_PANIC=1` -- for the first occurrence whose canonicalization
 //!   panics, prints its rule instances and non-graph part (formulas,
 //!   equation store, goals, ...) to stderr, to find which content the
@@ -399,7 +404,7 @@ fn spawn_heartbeat(every: Duration) {
             (
                 b.phase,
                 b.node,
-                truncate_for_log(&b.activity, 300).to_string(),
+                activity_for_log(&b.activity),
                 b.since.map_or(0.0, |t| t.elapsed().as_secs_f64()),
             )
         });
@@ -434,6 +439,16 @@ fn memory_mib(field: &str) -> Option<u64> {
     let line = status.lines().find(|l| l.starts_with(field))?;
     let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some(kib / 1024)
+}
+
+/// The activity for a heartbeat line: the description cut to 300 bytes,
+/// but always with its ` :: <step>` suffix (which stage of visiting a child
+/// runs) -- the part that matters when one step takes minutes.
+fn activity_for_log(activity: &str) -> String {
+    match activity.rfind(" :: ") {
+        Some(at) => format!("{} ...{}", truncate_for_log(&activity[..at], 300), &activity[at..]),
+        None => truncate_for_log(activity, 300).to_string(),
+    }
 }
 
 /// `s` cut to at most `max` bytes (at a char boundary), for log lines.
@@ -1285,7 +1300,7 @@ fn profile_canonicalize_stages(
     // closure is negligible next to minimization, so `group_minimization`
     // simply absorbs that second closure.
     let t3 = Instant::now();
-    let survivors = minimal_graph_part_labelings(&part, &result);
+    let (_, survivors) = minimal_graph_part_labelings(&part, &result);
     let group_minimization = t3.elapsed();
 
     // Stage D (re-derive the SEEDED labelling for each survivor) + Stage G,
@@ -1293,7 +1308,7 @@ fn profile_canonicalize_stages(
     // machinery as minimization, so it gets its own timer.
     let mut stage_d_per_survivor = Duration::ZERO;
     let mut content = ContentStageTimes::default();
-    for (i, (labeling, _)) in survivors.iter().enumerate() {
+    for (i, labeling) in survivors.iter().enumerate() {
         let t4 = Instant::now();
         let ordered = canonical_vertex_order(&part, labeling);
         let edges = canonical_edges(&part, labeling);
@@ -1706,6 +1721,8 @@ struct Flags {
     /// `DUMP_CANON_PANIC=1`: print the first system whose canonicalization
     /// panics.
     dump_canon_panic: bool,
+    /// `DUMP_DIMACS_AT=N`, with the `--out` path the dump is named after.
+    dump_dimacs_at: Option<(u64, String)>,
     /// `DUMP_AUTOMORPHISMS=N`: examples to print per [`GroupSizes::category`].
     dump_automorphisms: usize,
 }
@@ -1831,6 +1848,11 @@ impl Explorer<'_> {
         // A canonicalization panic (e.g. a `theta` miss) must not end the
         // whole exploration: this tool's job is to FIND such gaps across
         // every path, not stop at the first.
+        if let Some((n, out)) = &self.flags.dump_dimacs_at {
+            if self.processed == *n {
+                dump_dimacs(&sys, &ctx.color_table, &format!("{out}.occ{n}"));
+            }
+        }
         set_activity_step("canonicalize");
         let canon = timed(self.flags.profile, &mut self.timers.canonicalize, || {
             catch_unwind(AssertUnwindSafe(|| {
@@ -2215,6 +2237,25 @@ impl Explorer<'_> {
         for la in sys.less_atoms_in_set_order() {
             eprintln!("    {} < {}  ({:?})", la.smaller, la.larger, la.reason);
         }
+    }
+}
+
+/// `DUMP_DIMACS_AT`: `sys`'s graph part as bliss input and its vertex kinds.
+fn dump_dimacs(sys: &System, colors: &ColorTable, stem: &str) {
+    let part = extract_graph_part(sys, colors);
+    match graph_part_to_dimacs(&part) {
+        Ok(dimacs) => {
+            let written = std::fs::write(format!("{stem}.dimacs"), dimacs);
+            let kinds: String = part
+                .vertices
+                .iter()
+                .enumerate()
+                .map(|(i, v)| format!("{} {} {} {}\n", i + 1, part.colors[i], vertex_kind_label(v), vertex_label(v).unwrap_or_default()))
+                .collect();
+            let written = written.and_then(|()| std::fs::write(format!("{stem}.vertices"), kinds));
+            log!("DUMP_DIMACS_AT: wrote {stem}.dimacs/.vertices: {written:?}");
+        }
+        Err(e) => log!("DUMP_DIMACS_AT: no graph part to write: {e:?}"),
     }
 }
 
@@ -2669,6 +2710,15 @@ fn main() {
             profile_canon: env_gate!("PROFILE_CANON"),
             dump_dummy_swaps: env_gate!("DUMP_DUMMY_SWAPS"),
             dump_canon_panic: env_gate!("DUMP_CANON_PANIC"),
+            dump_dimacs_at: std::env::var("DUMP_DIMACS_AT").ok().and_then(|v| v.parse().ok()).map(
+                |n| {
+                    let out = args
+                        .out
+                        .clone()
+                        .unwrap_or_else(|| default_out_path(&args.theory_path, &args.lemma));
+                    (n, out)
+                },
+            ),
             dump_automorphisms: std::env::var("DUMP_AUTOMORPHISMS")
                 .map_or(0, |v| v.parse().unwrap_or(3)),
         },

@@ -194,12 +194,17 @@ pub fn bliss_available() -> bool {
 /// relabeling under which the graph maps to itself) — the same
 /// underlying mathematical object serves both roles; only the caller's
 /// interpretation differs.
+///
+/// Entries are stored as `u32`, not `usize`: Stage F materializes the whole
+/// automorphism group ([`generate_group`]) and keeps every tied survivor,
+/// so a permutation's size multiplies with the group's, and a graph part
+/// never comes close to `u32::MAX` vertices (asserted on construction).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Permutation(Vec<usize>);
+pub struct Permutation(Vec<u32>);
 
 impl Permutation {
     pub fn identity(n: usize) -> Self {
-        Permutation((0..n).collect())
+        Permutation((0..vertex_index(n)).collect())
     }
 
     pub fn len(&self) -> usize {
@@ -212,10 +217,10 @@ impl Permutation {
 
     /// Where vertex `v` maps to.
     pub fn image_of(&self, v: usize) -> usize {
-        self.0[v]
+        self.0[v] as usize
     }
 
-    pub fn as_slice(&self) -> &[usize] {
+    pub fn as_slice(&self) -> &[u32] {
         &self.0
     }
 
@@ -231,7 +236,7 @@ impl Permutation {
     /// the module docs' vertex-numbering caveat and `CanonicalGraph`'s
     /// own doc comment on "minimum over automorphisms").
     pub fn compose(&self, other: &Permutation) -> Permutation {
-        Permutation(other.0.iter().map(|&v| self.image_of(v)).collect())
+        Permutation(other.0.iter().map(|&v| self.0[v as usize]).collect())
     }
 
     /// Parses bliss's 1-indexed cycle notation (e.g. `"(1,2,3)(4,5)"`,
@@ -239,7 +244,7 @@ impl Permutation {
     /// (needed because fixed points are omitted from the text — see the
     /// module docs).
     fn from_cycle_notation(s: &str, n: usize) -> Result<Self, BlissError> {
-        let mut perm: Vec<usize> = (0..n).collect();
+        let mut perm: Vec<u32> = (0..vertex_index(n)).collect();
         let s = s.trim();
         if s.is_empty() || s == "()" {
             return Ok(Permutation(perm));
@@ -275,11 +280,16 @@ impl Permutation {
                         "vertex out of range [1,{n}] in cycle notation: {s:?}"
                     )));
                 }
-                perm[from] = to;
+                perm[from] = vertex_index(to);
             }
         }
         Ok(Permutation(perm))
     }
+}
+
+/// `v` as a stored [`Permutation`] entry.
+fn vertex_index(v: usize) -> u32 {
+    u32::try_from(v).expect("graph part with more than u32::MAX vertices")
 }
 
 /// Closes `generators` (typically `BlissResult::generators` — a

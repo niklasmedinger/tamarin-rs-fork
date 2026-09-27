@@ -395,8 +395,11 @@ pub fn canonicalize_graph_part(
 /// `result.generators` -- NOT just the raw generators bliss reports; see
 /// its own doc comment for why that would miss candidates) to
 /// `result.canonical_labeling`, canonizes each resulting candidate via
-/// [`canonicalize_graph_part`], and returns every `(labeling, term)` pair
-/// achieving the minimum term.
+/// [`canonicalize_graph_part`], and returns the minimum term together with
+/// every labeling achieving it. The term is kept ONCE, not per labeling:
+/// with k interchangeable substructures (e.g. k identical protocol
+/// sessions) all k! labelings tie, and a copy of the full graph-part term
+/// per survivor was what made such systems run out of memory.
 ///
 /// **This resolves the ambiguity only at the graph-part level.** When the
 /// minimum is achieved by more than one labeling — a real possibility
@@ -418,31 +421,26 @@ pub fn canonicalize_graph_part(
 pub fn minimal_graph_part_labelings(
     part: &crate::canon_graph::GraphPart,
     result: &crate::bliss_proc::BlissResult,
-) -> Vec<(crate::bliss_proc::Permutation, LNTerm)> {
+) -> (LNTerm, Vec<crate::bliss_proc::Permutation>) {
     use crate::bliss_proc::{canonical_edges, canonical_vertex_order, generate_group};
 
     let group = generate_group(&result.generators, part.vertices.len());
-    let mut best: Vec<(crate::bliss_proc::Permutation, LNTerm)> = Vec::new();
+    let mut best: Option<(LNTerm, Vec<crate::bliss_proc::Permutation>)> = None;
     for g in group {
         let candidate_labeling = result.canonical_labeling.compose(&g);
         let ordered = canonical_vertex_order(part, &candidate_labeling);
         let edges = canonical_edges(part, &candidate_labeling);
         let term = canonicalize_graph_part(&ordered, &edges);
-        match best.first() {
-            None => best.push((candidate_labeling, term)),
-            Some((_, best_term)) => match term.cmp(best_term) {
-                std::cmp::Ordering::Less => {
-                    best.clear();
-                    best.push((candidate_labeling, term));
-                }
-                std::cmp::Ordering::Equal => {
-                    best.push((candidate_labeling, term));
-                }
+        match &mut best {
+            None => best = Some((term, vec![candidate_labeling])),
+            Some((best_term, labelings)) => match term.cmp(best_term) {
+                std::cmp::Ordering::Less => best = Some((term, vec![candidate_labeling])),
+                std::cmp::Ordering::Equal => labelings.push(candidate_labeling),
                 std::cmp::Ordering::Greater => {}
             },
         }
     }
-    best
+    best.expect("the group contains at least the identity")
 }
 
 // =============================================================================
@@ -1386,7 +1384,7 @@ pub fn canonicalize_constraint_system_with_labelling(
     // is not always resolvable without looking at the rest of the system
     // (see its own doc comment for the concrete counterexample; the loop
     // below is what actually resolves it, per survivor).
-    let survivors = minimal_graph_part_labelings(&part, &result);
+    let (graph_term, survivors) = minimal_graph_part_labelings(&part, &result);
     debug_assert!(
         !survivors.is_empty(),
         "bliss always returns at least the identity labeling as a candidate"
@@ -1400,27 +1398,34 @@ pub fn canonicalize_constraint_system_with_labelling(
     // no new invocation of) and extend it through formulas ->
     // solved_formulas -> lemmas -> eq_store -> subterm_store -- a fixed,
     // deterministic order.
-    let mut candidates: Vec<(CanonicalSystem, CanonLabelling)> = Vec::with_capacity(survivors.len());
-    for (labeling, graph_term) in &survivors {
+    //
+    // Stage F's system-level tie-break: the minimum CanonicalSystem over
+    // every graph-part-level survivor, via the dedicated comparison
+    // function `Guarded`'s missing `Ord` impl forces (see
+    // `cmp_canonical_system`'s own doc comment). A RUNNING minimum, not a
+    // collected list: there can be k! survivors (see
+    // `minimal_graph_part_labelings`), each a full `CanonicalSystem`. Only a
+    // strictly smaller candidate replaces the current one, so on ties the
+    // first survivor wins, as `Iterator::min_by` would pick.
+    let mut best: Option<(CanonicalSystem, CanonLabelling)> = None;
+    for labeling in &survivors {
         let ordered = crate::bliss_proc::canonical_vertex_order(&part, labeling);
         let edges = crate::bliss_proc::canonical_edges(&part, labeling);
         let (graph_term_again, labelling) = canonicalize_graph_part_seeded(&ordered, &edges);
         debug_assert_eq!(
-            &graph_term_again, graph_term,
+            graph_term_again, graph_term,
             "re-running canonicalize_graph_part_seeded for a winning labeling must \
              reproduce the same term minimal_graph_part_labelings already found"
         );
-        candidates.push(canonicalize_system_content_seeded(sys, &labelling, graph_term_again));
+        let candidate = canonicalize_system_content_seeded(sys, &labelling, graph_term_again);
+        let better = best
+            .as_ref()
+            .map_or(true, |(current, _)| cmp_canonical_system(&candidate.0, current).is_lt());
+        if better {
+            best = Some(candidate);
+        }
     }
-
-    // Stage F's system-level tie-break: the minimum CanonicalSystem over
-    // every graph-part-level survivor, via the dedicated comparison
-    // function `Guarded`'s missing `Ord` impl forces (see
-    // `cmp_canonical_system`'s own doc comment).
-    Ok(candidates
-        .into_iter()
-        .min_by(|(a, _), (b, _)| cmp_canonical_system(a, b))
-        .expect("`candidates` has one entry per (non-empty) `survivors` entry"))
+    Ok(best.expect("`survivors` holds at least one labeling"))
 }
 
 /// Extends `labelling` (already seeded from a graph-part survivor) through
@@ -3351,7 +3356,7 @@ mod tests {
              group as bliss's own G_1 example"
         );
 
-        let survivors = minimal_graph_part_labelings(&part, &result);
+        let (min_term, survivors) = minimal_graph_part_labelings(&part, &result);
         assert_eq!(
             survivors.len(),
             1,
@@ -3378,9 +3383,9 @@ mod tests {
             2,
             "Aut(G) = {{id, swap}} has exactly 2 elements"
         );
-        assert_eq!(&survivors[0].1, all_terms.iter().min().unwrap());
+        assert_eq!(&min_term, all_terms.iter().min().unwrap());
         assert!(
-            all_terms.iter().any(|t| *t != survivors[0].1),
+            all_terms.iter().any(|t| *t != min_term),
             "the two candidates must actually differ, or this test isn't exercising \
              the content-based tie-break at all"
         );
@@ -3508,8 +3513,8 @@ mod tests {
 
         // Correct: minimize over the FULL closed group (what
         // `minimal_graph_part_labelings` actually does).
-        let survivors = minimal_graph_part_labelings(&part, &result);
-        let true_min = &survivors[0].1;
+        let (min_term, _) = minimal_graph_part_labelings(&part, &result);
+        let true_min = &min_term;
 
         assert!(
             *true_min < naive_min,
@@ -3602,7 +3607,7 @@ mod tests {
             "Aut(G) = {{id, swap}} has exactly 2 elements"
         );
 
-        let survivors = minimal_graph_part_labelings(&part, &result);
+        let (min_term, survivors) = minimal_graph_part_labelings(&part, &result);
         assert_eq!(
             survivors.len(),
             1,
@@ -3633,7 +3638,7 @@ mod tests {
              LEXICOGRAPHICALLY SMALLER candidate -- the one minimization is expected to keep"
         );
         assert_eq!(
-            survivors[0].1, identity_term,
+            min_term, identity_term,
             "minimal_graph_part_labelings must pick the K(f(mv(0), mv(1))) variant -- the \
              one from canonizing Fr(x) before Fr(y) -- discarding the swapped K(f(mv(1), \
              mv(0))) variant even though bliss reported the swap as a real automorphism"
