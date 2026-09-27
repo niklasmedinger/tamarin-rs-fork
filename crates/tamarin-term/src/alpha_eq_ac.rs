@@ -860,14 +860,25 @@ impl Canonizer {
     /// [`apply_renaming`] rebuilds through the term's smart constructors
     /// (Algorithm 1, `CAN_alphaeqac`, `work.tex`).
     ///
-    /// Returns the winning candidate packaged as a [`CanonLabelling`], not
-    /// a bare `theta`: `self.fresh_vars` at this point is well-defined
-    /// regardless of WHICH candidate wins, since
-    /// [`Self::allocate_fresh_var_indices`] mutates the SAME shared counters
-    /// before branching into the permutation cross-product -- every live
-    /// candidate consumed identical index ranges, just assigned to
-    /// different variables.
-    fn canonize(&mut self) -> (LNTerm, CanonLabelling) {
+    /// Returns EVERY candidate reaching that result, in candidate order,
+    /// each packaged as a [`CanonLabelling`], not a bare `theta`:
+    /// `self.fresh_vars` at this point is well-defined regardless of WHICH
+    /// candidate wins, since [`Self::allocate_fresh_var_indices`] mutates
+    /// the SAME shared counters before branching into the permutation
+    /// cross-product -- every live candidate consumed identical index
+    /// ranges, just assigned to different variables.
+    ///
+    /// The schedule of batches depends only on the term's positions, which
+    /// renaming and AC leave unchanged, so the candidates are exactly the
+    /// renamings mapping each batch bijectively onto its block of canonical
+    /// variables. A renaming symmetry `σ` of the term (`σ(t) =AC t`, fixing
+    /// the seeded variables) maps every batch onto itself, so for a winning
+    /// `θ`, `θ ∘ σ` is a candidate producing the same result; conversely two
+    /// winners differ by such a `σ`. The winners are therefore one winner
+    /// composed with every renaming symmetry of the term: which of them is
+    /// listed first depends on raw variable order, so a caller that goes on
+    /// to use `theta` beyond this one term must consider all of them.
+    fn canonize_all(&mut self) -> (LNTerm, Vec<CanonLabelling>) {
         while let Some(lits) = self.next_literals() {
             self.canonize_literals(&lits);
         }
@@ -875,19 +886,37 @@ impl Canonizer {
         let term = self.term.clone();
         let candidates = std::mem::take(&mut self.subst);
         self.considered_permutations = candidates.len();
-        let (canon_term, theta) = candidates
+        let mut best: Option<LNTerm> = None;
+        let mut winners: Vec<BTreeMap<LVar, LVar>> = Vec::new();
+        for subst in candidates {
+            let canon_term = apply_renaming(&subst, term.clone());
+            match best.as_ref().map(|b| canon_term.cmp(b)) {
+                None | Some(std::cmp::Ordering::Less) => {
+                    best = Some(canon_term);
+                    winners = vec![subst];
+                }
+                Some(std::cmp::Ordering::Equal) => winners.push(subst),
+                Some(std::cmp::Ordering::Greater) => {}
+            }
+        }
+        let fresh_vars = self.fresh_vars;
+        (
+            best.expect("Canonizer::subst always holds at least one candidate renaming"),
+            winners
+                .into_iter()
+                .map(|theta| CanonLabelling { theta, fresh_vars })
+                .collect(),
+        )
+    }
+
+    /// [`Self::canonize_all`], keeping only the first winner.
+    fn canonize(&mut self) -> (LNTerm, CanonLabelling) {
+        let (canon_term, winners) = self.canonize_all();
+        let first = winners
             .into_iter()
-            .map(|subst| {
-                let canon_term = apply_renaming(&subst, term.clone());
-                (canon_term, subst)
-            })
-            .min_by(|(a, _), (b, _)| a.cmp(b))
+            .next()
             .expect("Canonizer::subst always holds at least one candidate renaming");
-        let labelling = CanonLabelling {
-            theta,
-            fresh_vars: self.fresh_vars,
-        };
-        (canon_term, labelling)
+        (canon_term, first)
     }
 }
 
@@ -976,6 +1005,21 @@ pub fn canonicalize_alpha_eq_ac_seeded(t: &LNTerm, labelling: &mut CanonLabellin
     let (canon_term, updated) = c.canonize();
     *labelling = updated;
     canon_term
+}
+
+/// [`canonicalize_alpha_eq_ac_seeded`], returning EVERY extension of
+/// `labelling` that produces the canonical term instead of only the first.
+/// There is more than one exactly when `t` has a renaming symmetry fixing
+/// `labelling`'s variables (e.g. `x ⊕ y` with `x`, `y` new); the first is
+/// the one [`canonicalize_alpha_eq_ac_seeded`] keeps, and which one that is
+/// depends on raw variable order. A caller that uses the labelling beyond
+/// `t` -- to rename other content consistently with it -- must minimize
+/// over all of them for its result to be canonical.
+pub fn canonicalize_alpha_eq_ac_seeded_all(
+    t: &LNTerm,
+    labelling: &CanonLabelling,
+) -> (LNTerm, Vec<CanonLabelling>) {
+    Canonizer::new_with_labelling(t, labelling.clone()).canonize_all()
 }
 
 /// Canonize `t` with respect to $\alphaeqac$: two terms are $\alphaeqac$ iff
@@ -1121,6 +1165,46 @@ mod tests {
             arg_of(&c2),
             "the variable shared between t1 and t2 must canonize to the identical literal in both"
         );
+    }
+
+    /// `x ⊕ y` cannot tell `x` from `y`: both namings produce the canonical
+    /// term, and the first is the one `canonicalize_alpha_eq_ac_seeded`
+    /// keeps.
+    #[test]
+    fn seeded_all_returns_every_tied_labelling() {
+        let (x, y) = (LVar::new("x", LSort::Msg, 5), LVar::new("y", LSort::Msg, 7));
+        let t = xor(var_term(x), var_term(y));
+
+        let (canon, winners) = canonicalize_alpha_eq_ac_seeded_all(&t, &CanonLabelling::empty());
+
+        assert_eq!(winners.len(), 2);
+        assert_ne!(winners[0].theta(), winners[1].theta());
+        for w in &winners {
+            assert_eq!(apply_renaming(w.theta(), t.clone()), canon);
+        }
+        let mut first = CanonLabelling::empty();
+        assert_eq!(canonicalize_alpha_eq_ac_seeded(&t, &mut first), canon);
+        assert_eq!(first.theta(), winners[0].theta());
+    }
+
+    /// Without a renaming symmetry there is exactly one winner. A seeded
+    /// variable is never renamed, so fixing `x` leaves `x ⊕ y` a single
+    /// naming for `y`.
+    #[test]
+    fn seeded_all_returns_one_labelling_without_a_symmetry() {
+        let (x, y) = (LVar::new("x", LSort::Msg, 5), LVar::new("y", LSort::Msg, 7));
+        let (_, winners) = canonicalize_alpha_eq_ac_seeded_all(
+            &f_app_no_eq(no_eq_sym("f", 2), vec![var_term(x), var_term(y)]),
+            &CanonLabelling::empty(),
+        );
+        assert_eq!(winners.len(), 1);
+
+        let mut seeded = CanonLabelling::empty();
+        canonicalize_alpha_eq_ac_seeded(&var_term(x), &mut seeded);
+        let (_, winners) =
+            canonicalize_alpha_eq_ac_seeded_all(&xor(var_term(x), var_term(y)), &seeded);
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0].theta()[&x], seeded.theta()[&x]);
     }
 
     /// Names are never scheduled for renaming: the worklist only ever

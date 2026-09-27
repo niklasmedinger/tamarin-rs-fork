@@ -58,7 +58,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use tamarin_term::alpha_eq_ac::{
-    canonicalize_alpha_eq_ac, canonicalize_alpha_eq_ac_seeded, CanonLabelling,
+    canonicalize_alpha_eq_ac, canonicalize_alpha_eq_ac_seeded, canonicalize_alpha_eq_ac_seeded_all,
+    CanonLabelling,
 };
 use tamarin_term::function_symbols::{Constructability, FunSym, NoEqSym, Privacy};
 use tamarin_term::lterm::LNTerm;
@@ -1321,11 +1322,27 @@ pub fn canonicalize_graph_part_seeded(
     (term, labelling)
 }
 
+/// [`canonicalize_graph_part_seeded`], returning EVERY labelling that
+/// produces the canonical term (see
+/// [`canonicalize_alpha_eq_ac_seeded_all`]): more than one when the graph
+/// part has a renaming symmetry that no vertex permutation accounts for,
+/// e.g. two variables that only ever occur together under an AC symbol.
+/// The driver needs all of them because the rest of the system can still
+/// tell those variables apart.
+pub fn canonicalize_graph_part_seeded_all(
+    ordered: &[&VertexKind],
+    edges: &BTreeSet<(usize, usize)>,
+) -> (LNTerm, Vec<CanonLabelling>) {
+    canonicalize_alpha_eq_ac_seeded_all(&graph_part_to_term(ordered, edges), &CanonLabelling::empty())
+}
+
 /// Canonizes a whole constraint `System` (Stage G, composing A-F): builds
 /// the graph part, asks bliss for its automorphism group, and takes the
 /// minimum `CanonicalSystem` over every labeling in that group -- for each
 /// one, the graph part canonized under it (Stage F) and its accumulated
-/// labelling extended through the rest of the system. Since
+/// labelling extended through the rest of the system, for every renaming
+/// tied for that graph-part term (see
+/// [`canonicalize_graph_part_seeded_all`]). Since
 /// [`cmp_canonical_system`] compares the graph part first, this resolves
 /// "minimum over automorphisms" at the graph-part level and breaks any tie
 /// there with the rest of the system (the system-level tie-break
@@ -1384,36 +1401,43 @@ pub fn canonicalize_constraint_system_with_labelling(
     let result = crate::bliss_proc::run_bliss(&dimacs)?;
 
     // Stages F and G in one pass: the minimum `CanonicalSystem` over every
-    // labeling in the CLOSED automorphism group. `cmp_canonical_system`
+    // labeling in the CLOSED automorphism group, and for each, every
+    // renaming tied for its graph-part term. `cmp_canonical_system`
     // compares `graph_part` first, so this is the minimum graph-part term
     // (Stage F) with ties on it broken by the rest of the system (Stage G)
     // -- a graph-part tie must not be broken arbitrarily, see
-    // `minimal_graph_part_labelings`'s doc comment. A candidate whose term
-    // is already greater than the incumbent's cannot win, so its content is
-    // never canonicalized. Each candidate's labelling comes from the same
-    // canonization that produced its term, and none is kept beyond the
-    // incumbent: there can be k! tied labelings. Only a strictly smaller
-    // candidate replaces the incumbent, so on ties the first in group order
-    // wins.
+    // `minimal_graph_part_labelings`'s doc comment. That holds for both
+    // kinds of tie: between vertex orders (bliss's automorphisms) and, for
+    // one vertex order, between renamings the graph part cannot tell apart
+    // (variables that only occur together under an AC symbol, say), which
+    // bliss cannot see because variables are not vertices. A candidate
+    // whose term is already greater than the incumbent's cannot win, so its
+    // content is never canonicalized. Each candidate's labellings come from
+    // the same canonization that produced its term, and none is kept beyond
+    // the incumbent: there can be k! tied labelings. Only a strictly smaller
+    // candidate replaces the incumbent, so on ties the first in group order,
+    // then canonizer order, wins.
     let group = crate::bliss_proc::generate_group(&result.generators, part.vertices.len());
     let mut best: Option<(CanonicalSystem, CanonLabelling)> = None;
     for g in &group {
         let labeling = result.canonical_labeling.compose(g);
         let ordered = crate::bliss_proc::canonical_vertex_order(&part, &labeling);
         let edges = crate::bliss_proc::canonical_edges(&part, &labeling);
-        let (graph_term, labelling) = canonicalize_graph_part_seeded(&ordered, &edges);
+        let (graph_term, labellings) = canonicalize_graph_part_seeded_all(&ordered, &edges);
         if best
             .as_ref()
             .is_some_and(|(current, _)| graph_term.cmp(&current.graph_part).is_gt())
         {
             continue;
         }
-        let candidate = canonicalize_system_content_seeded(sys, &labelling, graph_term);
-        let better = best
-            .as_ref()
-            .map_or(true, |(current, _)| cmp_canonical_system(&candidate.0, current).is_lt());
-        if better {
-            best = Some(candidate);
+        for labelling in &labellings {
+            let candidate = canonicalize_system_content_seeded(sys, labelling, graph_term.clone());
+            let better = best
+                .as_ref()
+                .map_or(true, |(current, _)| cmp_canonical_system(&candidate.0, current).is_lt());
+            if better {
+                best = Some(candidate);
+            }
         }
     }
     Ok(best.expect("the group contains at least the identity"))
@@ -1960,13 +1984,19 @@ fn canonicalize_eq_disj(disj: &EqDisj, labelling: &CanonLabelling) -> Vec<Vec<(L
 ///    keys untouched), with an allocator that avoids every raw variable
 ///    index already claimed by `labelling.theta()`
 ///    ([`raw_var_idx_avoid_floor`]).
-/// 2. **Canonize each freshened range term against a FRESH FORK of
-///    `labelling`** (`labelling.clone()`, mutated across this one
-///    alternative's own entries so a witness shared between two of its
-///    own range terms still gets tied together -- see
+/// 2. **Canonize all freshened range terms together, as ONE list term in
+///    canonical key order, in a single call against a FRESH FORK of
+///    `labelling`** (`labelling.clone()`), then split the result back into
+///    per-key range terms and DISCARD the fork. Never mutate the real,
+///    continuing `labelling` itself. One call ties a witness shared
+///    between two range terms together (see
 ///    `eq_disj_alternative_shares_a_witness_across_two_of_its_own_range_terms`),
-///    then DISCARD the fork. Never mutate the real, continuing
-///    `labelling` itself.
+///    and it lets every range term take part in naming every witness: the
+///    `Canonizer` settles a tie between renamings that produce the same
+///    term by keeping the first candidate, i.e. by raw variable order, so
+///    canonizing the range terms one after another would settle a tie
+///    inside one of them that way and hand the choice on to the later ones
+///    (see `eq_disj_alternative_resolves_a_tie_across_its_range_terms_by_content`).
 ///
 /// Step 2's fork is NOT optional, unlike an earlier revision of this
 /// function assumed. `EqDisj`'s alternatives (`sigma_i1 ∨ … ∨ sigma_ik_i`)
@@ -2045,10 +2075,9 @@ fn canonicalize_eq_disj_alternative(
         start
     });
 
-    let mut scratch = labelling.clone();
-    entries
-        .into_iter()
-        .map(|(canon_key, v)| {
+    let range_terms: Vec<LNTerm> = entries
+        .iter()
+        .map(|(_, v)| {
             // `fresh_to_free_avoiding`'s output drops a trivial `v -> v`
             // mapping (`Subst::from_list`'s own trivial-drop) -- which
             // can only happen if `v` had no occurrences anywhere in the
@@ -2057,13 +2086,21 @@ fn canonicalize_eq_disj_alternative(
             // the allocator only ever hands out indices strictly above
             // everything currently in scope). Either way, `v` itself
             // (unchanged) is the correct range term to canonize.
-            let range_term = freshened
-                .image_of(&v)
+            freshened
+                .image_of(v)
                 .cloned()
-                .unwrap_or_else(|| var_term(v));
-            let canon_term = canonicalize_alpha_eq_ac_seeded(&range_term, &mut scratch);
-            (canon_key, canon_term)
+                .unwrap_or_else(|| var_term(*v))
         })
+        .collect();
+    let LNTerm::App(_, canon_ranges) =
+        canonicalize_alpha_eq_ac_seeded(&f_app_list(range_terms), &mut labelling.clone())
+    else {
+        unreachable!("canonizing a list application yields a list application")
+    };
+    entries
+        .into_iter()
+        .map(|(canon_key, _)| canon_key)
+        .zip(canon_ranges.iter().cloned())
         .collect()
 }
 
@@ -3783,10 +3820,9 @@ mod tests {
 
     /// A witness appearing in TWO of an alternative's own range terms (not
     /// just twice within one) must canonize to the SAME canonical literal
-    /// both times -- confirming the per-entry `canonicalize_alpha_eq_ac_seeded`
-    /// calls correctly share identity via the one mutable `labelling`
-    /// threaded across them, the same way two different graph vertices
-    /// sharing a variable already do (Stage D).
+    /// both times -- confirming that canonizing all range terms in one
+    /// `Canonizer` call shares identity across them, the same way two
+    /// different graph vertices sharing a variable already do (Stage D).
     #[test]
     fn eq_disj_alternative_shares_a_witness_across_two_of_its_own_range_terms() {
         let p = LVar::new("p", LSort::Msg, 7);
@@ -3818,6 +3854,37 @@ mod tests {
             }
             other => panic!("expected a pair(..) term, got {other:?}"),
         }
+    }
+
+    /// `w1 ⊕ w2` alone cannot tell its two witnesses apart; the second range
+    /// term, `pair(w, w)` for one of them, can. The four alternatives below
+    /// are equal up to renaming their local witnesses, and their keys get the
+    /// same canonical names, so they must canonize identically whichever
+    /// witness `q`'s range uses and whatever the keys' raw indices -- the tie
+    /// in `w1 ⊕ w2` must be settled by the other range term, not by raw
+    /// variable order.
+    #[test]
+    fn eq_disj_alternative_resolves_a_tie_across_its_range_terms_by_content() {
+        use tamarin_term::builtin::xor;
+        let w1 = LVar::new("w", LSort::Msg, 900);
+        let w2 = LVar::new("w", LSort::Msg, 901);
+        let mut outputs = Vec::new();
+        for (p_idx, q_idx) in [(7, 8), (8, 7)] {
+            let p = LVar::new("p", LSort::Msg, p_idx);
+            let q = LVar::new("q", LSort::Msg, q_idx);
+            let labelling = labelling_covering(&[p, q]);
+            for w in [w1, w2] {
+                let alt = LNSubstVFresh::from_list(vec![
+                    (p, xor(var_term(w1), var_term(w2))),
+                    (q, f_app_no_eq(pair_sym(), vec![var_term(w), var_term(w)])),
+                ]);
+                outputs.push(canonicalize_eq_disj_alternative(&alt, &labelling));
+            }
+        }
+        assert!(
+            outputs.windows(2).all(|pair| pair[0] == pair[1]),
+            "equivalent alternatives canonized differently: {outputs:#?}"
+        );
     }
 
     /// Regression test for the exact collision risk `canonicalize_eq_disj_alternative`'s
@@ -4428,7 +4495,8 @@ mod tests {
 
     /// The minimization as two separate stages: every labeling achieving
     /// the minimum graph-part term (`minimal_graph_part_labelings`), then
-    /// the minimum `CanonicalSystem` over those, the first one winning ties.
+    /// the minimum `CanonicalSystem` over those and every renaming tied for
+    /// their term, the first one winning ties.
     /// `canonicalize_constraint_system_with_labelling` does both in one pass
     /// and must agree with this exactly, labelling included.
     fn two_stage_reference(sys: &System, colors: &ColorTable) -> (CanonicalSystem, CanonLabelling) {
@@ -4440,16 +4508,17 @@ mod tests {
         let (_, survivors) = minimal_graph_part_labelings(&part, &result);
         let mut best: Option<(CanonicalSystem, CanonLabelling)> = None;
         for labeling in &survivors {
-            let (term, labelling) = canonicalize_graph_part_seeded(
+            let (term, labellings) = canonicalize_graph_part_seeded_all(
                 &canonical_vertex_order(&part, labeling),
                 &canonical_edges(&part, labeling),
             );
-            let candidate = canonicalize_system_content_seeded(sys, &labelling, term);
-            if best
-                .as_ref()
-                .map_or(true, |(current, _)| cmp_canonical_system(&candidate.0, current).is_lt())
-            {
-                best = Some(candidate);
+            for labelling in &labellings {
+                let candidate = canonicalize_system_content_seeded(sys, labelling, term.clone());
+                if best.as_ref().map_or(true, |(current, _)| {
+                    cmp_canonical_system(&candidate.0, current).is_lt()
+                }) {
+                    best = Some(candidate);
+                }
             }
         }
         best.expect("at least one survivor")
@@ -4587,6 +4656,58 @@ mod tests {
 
         assert_eq!(original, renumbered_and_renamed);
         assert_ne!(original, solved_moved);
+    }
+
+    /// `!KU(x ⊕ y)` cannot tell `x` from `y`, and no vertex permutation
+    /// swaps them, so the graph part has two tied renamings; only a subterm
+    /// goal on `x`, outside the graph part, tells the variables apart. The
+    /// two systems differ only in the raw indices of `x` and `y`, so they
+    /// must canonicalize identically -- which takes trying both renamings,
+    /// since the order the canonizer lists them in follows raw indices.
+    #[test]
+    fn a_renaming_tie_in_the_graph_part_is_broken_by_the_rest_of_the_system() {
+        if !bliss_available() {
+            return;
+        }
+        use crate::bliss_proc::{
+            canonical_edges, canonical_vertex_order, graph_part_to_dimacs, run_bliss,
+        };
+        use tamarin_term::builtin::xor;
+        use tamarin_term::lterm::pub_term;
+        let colors = empty_color_table();
+        let with_raw_indices = |x_idx: u64, y_idx: u64| {
+            let x = var_term(LVar::new("x", LSort::Msg, x_idx));
+            let y = var_term(LVar::new("y", LSort::Msg, y_idx));
+            let mut sys = System::empty();
+            sys.content_mut().goals = std::sync::Arc::new(vec![
+                (
+                    Goal::Action(node(0), crate::fact::ku_fact(xor(x.clone(), y))),
+                    GoalStatus::default(),
+                ),
+                (Goal::Subterm((x, pub_term("c"))), GoalStatus::default()),
+            ]);
+            sys
+        };
+        let x_first = with_raw_indices(1, 2);
+        let y_first = with_raw_indices(2, 1);
+
+        let part = crate::canon_graph::extract_graph_part(&x_first, &colors);
+        let result = run_bliss(&graph_part_to_dimacs(&part).expect("dimacs")).expect("bliss");
+        let l = &result.canonical_labeling;
+        let (_, tied) = canonicalize_graph_part_seeded_all(
+            &canonical_vertex_order(&part, l),
+            &canonical_edges(&part, l),
+        );
+        assert_eq!(tied.len(), 2, "x and y must be interchangeable in the graph part");
+
+        let canon = |sys: &System| canonicalize_constraint_system(sys, &colors).expect("canonicalize");
+        assert_eq!(canon(&x_first), canon(&y_first));
+
+        let (got, got_labelling) =
+            canonicalize_constraint_system_with_labelling(&x_first, &colors).expect("canonicalize");
+        let (expected, expected_labelling) = two_stage_reference(&x_first, &colors);
+        assert_eq!(got, expected);
+        assert_eq!(got_labelling.theta(), expected_labelling.theta());
     }
 
     // -- canonicalize_constraint_system: empty graph parts --
