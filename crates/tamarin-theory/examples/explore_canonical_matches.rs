@@ -215,6 +215,10 @@
 //!   `sys.less_atoms`, so one can be reproduced in the GUI. Raw NodeIds are
 //!   internal to this run; compare the printed `sys.nodes`/`less_atoms`
 //!   against what the GUI shows at the same point in the path.
+//! - `DUMP_CANON_PANIC=1` -- for the first occurrence whose canonicalization
+//!   panics, prints its rule instances and non-graph part (formulas,
+//!   equation store, goals, ...) to stderr, to find which content the
+//!   graph part missed.
 //!
 //! Requires `bliss` on `PATH` (or `$BLISS_PATH`) -- skips (via
 //! `bliss_available()`'s panic-unless-opted-out gate) if
@@ -1699,6 +1703,9 @@ struct Flags {
     profile: bool,
     profile_canon: bool,
     dump_dummy_swaps: bool,
+    /// `DUMP_CANON_PANIC=1`: print the first system whose canonicalization
+    /// panics.
+    dump_canon_panic: bool,
     /// `DUMP_AUTOMORPHISMS=N`: examples to print per [`GroupSizes::category`].
     dump_automorphisms: usize,
 }
@@ -1838,6 +1845,9 @@ impl Explorer<'_> {
         let (fingerprint, methods, methods_sig) = match canon {
             Err(payload) => {
                 let message = panic_message(&*payload).to_string();
+                if self.flags.dump_canon_panic && self.canonicalize_failures == 0 {
+                    dump_system(&sys);
+                }
                 log!(
                     "canonicalize_constraint_system PANICKED at {}: {message}",
                     self.graph.path(edge)
@@ -2206,6 +2216,25 @@ impl Explorer<'_> {
             eprintln!("    {} < {}  ({:?})", la.smaller, la.larger, la.reason);
         }
     }
+}
+
+/// The rule instances and non-graph part of `sys`, for `DUMP_CANON_PANIC`.
+fn dump_system(sys: &System) {
+    eprintln!("--- rule instances ---");
+    for (nid, ru) in sys.nodes_in_map_order() {
+        let facts = |fs: &[tamarin_theory::fact::LNFact]| {
+            fs.iter().map(pretty_fact).collect::<Vec<_>>().join(", ")
+        };
+        eprintln!(
+            "  {nid} : {}[{}] --[{}]-> [{}]",
+            rule_name_string(ru),
+            facts(&ru.premises),
+            facts(&ru.actions),
+            facts(&ru.conclusions)
+        );
+    }
+    eprintln!("--- non-graph part ---\n{}", tamarin_theory::pretty_system::pretty_non_graph_system(sys));
+    eprintln!("--- end of system ---");
 }
 
 fn dump_formulas(sys: &System, path: &str) {
@@ -2639,6 +2668,7 @@ fn main() {
             profile: env_gate!("PROFILE"),
             profile_canon: env_gate!("PROFILE_CANON"),
             dump_dummy_swaps: env_gate!("DUMP_DUMMY_SWAPS"),
+            dump_canon_panic: env_gate!("DUMP_CANON_PANIC"),
             dump_automorphisms: std::env::var("DUMP_AUTOMORPHISMS")
                 .map_or(0, |v| v.parse().unwrap_or(3)),
         },

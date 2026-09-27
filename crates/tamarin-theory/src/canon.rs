@@ -496,7 +496,7 @@ use crate::guarded::{
 };
 use tamarin_parser::ast as p;
 use tamarin_term::alpha_eq_ac::{apply_renaming, rename_var};
-use tamarin_term::lterm::{LSort, LVar};
+use tamarin_term::lterm::{HasFrees, LSort, LVar};
 use tamarin_utils::fingerprint::{Fingerprint, FingerprintHasher};
 
 /// The canonical labelling's renaming: variables only, names are never
@@ -1369,8 +1369,7 @@ pub fn canonicalize_constraint_system_with_labelling(
     // canonicalizable content (formulas, eq_store, ...) still to process.
     if part.vertices.is_empty() {
         let (graph_term, labelling) = canonicalize_graph_part_seeded(&[], &BTreeSet::new());
-        let canon = canonicalize_system_content_seeded(sys, &labelling, graph_term);
-        return Ok((canon, labelling));
+        return Ok(canonicalize_system_content_seeded(sys, &labelling, graph_term));
     }
 
     // Stage C: bliss's own canonical labeling plus a GENERATING set for
@@ -1411,8 +1410,7 @@ pub fn canonicalize_constraint_system_with_labelling(
             "re-running canonicalize_graph_part_seeded for a winning labeling must \
              reproduce the same term minimal_graph_part_labelings already found"
         );
-        let canon = canonicalize_system_content_seeded(sys, &labelling, graph_term_again);
-        candidates.push((canon, labelling));
+        candidates.push(canonicalize_system_content_seeded(sys, &labelling, graph_term_again));
     }
 
     // Stage F's system-level tie-break: the minimum CanonicalSystem over
@@ -1427,15 +1425,18 @@ pub fn canonicalize_constraint_system_with_labelling(
 
 /// Extends `labelling` (already seeded from a graph-part survivor) through
 /// every remaining field of `sys` this module treats as part of the
-/// canonical form, building the rest of a [`CanonicalSystem`].
+/// canonical form, building the rest of a [`CanonicalSystem`], and returns
+/// it together with the labelling the whole system was canonicalized with.
 ///
-/// Read-only (`&CanonLabelling`, not `&mut`): nothing past the graph part
-/// ever discovers a new literal EXCEPT `eq_store.conj`'s per-alternative
-/// range terms, and even those are canonized against their own
-/// independent FORK of `labelling` (see
-/// [`canonicalize_eq_disj_alternative`]'s own doc comment for why),
-/// never `labelling` itself -- so `labelling` truly never changes once
-/// this function is called.
+/// Nothing past the graph part discovers a new literal EXCEPT the equation
+/// store: the free variables that occur only there are bound to further
+/// canonical variables ([`canonicalize_eq_store_timed`]), and the returned
+/// labelling is `labelling` extended by exactly those -- a `solve(splitEqs)`
+/// proof method canonicalizes its disjunction through it
+/// ([`canonicalize_proof_method`]). `eq_store.conj`'s per-alternative range
+/// terms are canonized in throwaway forks (see
+/// [`canonicalize_eq_disj_alternative`]'s own doc comment for why) and never
+/// reach it.
 ///
 /// `pub(crate)` (not private) so [`canonicalize_system_content_seeded_profiled`]'s
 /// own doc comment -- and any other crate-internal profiling -- can
@@ -1444,7 +1445,7 @@ pub(crate) fn canonicalize_system_content_seeded(
     sys: &System,
     labelling: &CanonLabelling,
     graph_part: LNTerm,
-) -> CanonicalSystem {
+) -> (CanonicalSystem, CanonLabelling) {
     // formulas / solved_formulas / lemmas: read-only against the `theta`
     // accumulated by the graph part -- `canonicalize_guarded` assumes
     // `theta` is EXHAUSTIVE (work.tex's guardedness argument: every free
@@ -1473,11 +1474,11 @@ pub(crate) fn canonicalize_system_content_seeded(
             .collect(),
     );
 
-    let eq_store = canonicalize_eq_store(&sys.eq_store, labelling);
+    let (eq_store, labelling) = canonicalize_eq_store(&sys.eq_store, labelling);
     let subterm_store = canonicalize_subterm_store(&sys.subterm_store, labelling.theta());
     let goals = canonicalize_goals(&sys.goals, labelling.theta());
 
-    CanonicalSystem {
+    let canon = CanonicalSystem {
         graph_part,
         formulas,
         solved_formulas,
@@ -1487,7 +1488,8 @@ pub(crate) fn canonicalize_system_content_seeded(
         goals,
         source_kind: sys.source_kind,
         side: sys.side,
-    }
+    };
+    (canon, labelling)
 }
 
 /// Per-field wall-time and size breakdown of Stage G
@@ -1657,35 +1659,15 @@ pub fn canonicalize_system_content_seeded_profiled(
     );
     stats.lemmas = t.elapsed();
 
-    // `eq_store.subst` and `eq_store.conj`, timed SEPARATELY -- mirrors
-    // `canonicalize_eq_store`'s own body exactly, just split so the
-    // per-alternative fork cost in `conj` doesn't hide inside a single
-    // `eq_store` bucket.
+    // `eq_store.subst` and `eq_store.conj`, timed separately by the same
+    // function `canonicalize_eq_store` uses, so the per-alternative fork
+    // cost in `conj` doesn't hide inside a single `eq_store` bucket. Naming
+    // the store-only free variables (`eq_store_namings`) counts as `conj`.
     let t = std::time::Instant::now();
-    let mut subst: Vec<(LVar, LNTerm)> = sys
-        .eq_store
-        .subst
-        .iter()
-        .map(|(v, term)| {
-            let canon_key = rename_var(labelling.theta(), *v);
-            let canon_term = apply_renaming(labelling.theta(), term.clone());
-            (canon_key, canon_term)
-        })
-        .collect();
-    subst.sort();
-    stats.eq_store_subst = t.elapsed();
-
-    let t = std::time::Instant::now();
-    let mut conj: Vec<Vec<Vec<(LVar, LNTerm)>>> = sys
-        .eq_store
-        .conj
-        .iter()
-        .map(|disj| canonicalize_eq_disj(disj, labelling))
-        .collect();
-    conj.sort();
-    stats.eq_store_conj = t.elapsed();
-
-    let eq_store = CanonicalEqStore { subst, conj };
+    let (eq_store, labelling, subst_time, _conj_time) =
+        canonicalize_eq_store_timed(&sys.eq_store, labelling);
+    stats.eq_store_subst = subst_time;
+    stats.eq_store_conj = t.elapsed().saturating_sub(subst_time);
 
     let t = std::time::Instant::now();
     let subterm_store = canonicalize_subterm_store(&sys.subterm_store, labelling.theta());
@@ -1709,14 +1691,75 @@ pub fn canonicalize_system_content_seeded_profiled(
     (canon, stats)
 }
 
-/// Canonicalizes `store` -- `eq_store.subst` and `eq_store.conj`.
-fn canonicalize_eq_store(store: &EquationStore, labelling: &CanonLabelling) -> CanonicalEqStore {
-    // eq_store.subst: domain vars are real, graph-reachable variables --
-    // same guardedness-style assumption as formulas, so a missing theta
-    // entry PANICS rather than silently passing the raw var through, on
-    // BOTH halves: `rename_var` for the domain key, and
-    // `apply_renaming` for the range term (which enforces the
-    // identical assumption the identical way -- see its own doc comment).
+/// Canonicalizes `store` -- `eq_store.subst` and `eq_store.conj` -- see
+/// [`canonicalize_eq_store_timed`].
+fn canonicalize_eq_store(
+    store: &EquationStore,
+    labelling: &CanonLabelling,
+) -> (CanonicalEqStore, CanonLabelling) {
+    let (canon, labelling, _, _) = canonicalize_eq_store_timed(store, labelling);
+    (canon, labelling)
+}
+
+/// Canonicalizes `store`, also returning the labelling it was canonicalized
+/// under (`labelling` extended by the store-only variables, see below) and
+/// the time spent on `subst` and on `conj` (summed over every naming tried)
+/// for [`canonicalize_system_content_seeded_profiled`].
+///
+/// **Which variables are free.** Per EquationStore.hs's `EqStore` docs, the
+/// variables of `subst` and the DOMAIN keys of every alternative `sigma_ij`
+/// in `conj` are free (globally existentially quantified), while the
+/// variables in an alternative's RANGE are fresh, local to that one
+/// alternative. Most free variables also occur in the graph part and so are
+/// already named by `labelling`; but not all of them:
+///
+/// - A variable can occur ONLY in the store. Merging two rule instances
+///   unifies their variant-carrying terms, which adds the unifiers as a
+///   disjunction over BOTH instances' variables; once the merged instance is
+///   gone, its variables survive only as keys of that disjunction and of its
+///   own rule-variant disjunction (idbased/BP_IBS_1: `em(x.4, x.5)` unified
+///   with `em(x, x.1)`). Such a variable still links the disjunctions it
+///   occurs in, so it can be neither dropped nor treated as local.
+/// - `subst`'s domain variables no longer occur in the system once
+///   `substSystem` has applied it. (Every system a proof method returns has
+///   an empty `subst` -- `System::cleanup` -- so this only matters for a
+///   system canonicalized mid-reduction.)
+///
+/// Those store-only variables are bound here to further canonical
+/// variables, via [`eq_store_namings`]; each candidate naming yields a
+/// canonical store ([`canonicalize_eq_store_under`]) and the smallest wins.
+/// They occur nowhere else in the system, so minimizing the store alone is
+/// exact. The winning naming is returned: a `solve(splitEqs)` proof method
+/// canonicalizes its disjunction through it. If several namings tie, they
+/// differ by a symmetry of the store, and any of them will do.
+fn canonicalize_eq_store_timed(
+    store: &EquationStore,
+    labelling: &CanonLabelling,
+) -> (CanonicalEqStore, CanonLabelling, std::time::Duration, std::time::Duration) {
+    let mut subst_time = std::time::Duration::ZERO;
+    let mut conj_time = std::time::Duration::ZERO;
+    let (best, naming) = eq_store_namings(store, labelling)
+        .into_iter()
+        .map(|naming| {
+            let canon = canonicalize_eq_store_under(store, &naming, &mut subst_time, &mut conj_time);
+            (canon, naming)
+        })
+        .min_by(|(a, _), (b, _)| a.cmp(b))
+        .expect("eq_store_namings returns at least one naming");
+    (best, naming, subst_time, conj_time)
+}
+
+/// Canonicalizes `store` under `labelling`, which must name every free
+/// variable of the store ([`eq_store_namings`] extends the graph part's
+/// labelling so it does): `rename_var`/`apply_renaming` panic on a miss.
+fn canonicalize_eq_store_under(
+    store: &EquationStore,
+    labelling: &CanonLabelling,
+    subst_time: &mut std::time::Duration,
+    conj_time: &mut std::time::Duration,
+) -> CanonicalEqStore {
+    // eq_store.subst: domain AND range variables are free.
+    let t = std::time::Instant::now();
     let mut subst: Vec<(LVar, LNTerm)> = store
         .subst
         .iter()
@@ -1727,20 +1770,156 @@ fn canonicalize_eq_store(store: &EquationStore, labelling: &CanonLabelling) -> C
         })
         .collect();
     subst.sort();
+    *subst_time += t.elapsed();
 
     // eq_store.conj: `split_id` DROPPED (see this file's struct docs
     // above). Each `EqDisj`'s alternatives are a MULTISET (see
     // `CanonicalEqStore::conj`'s own doc comment for why duplicates must
     // survive), sorted once canonical; likewise the outer list of
     // `EqDisj`s.
+    let t = std::time::Instant::now();
     let mut conj: Vec<Vec<Vec<(LVar, LNTerm)>>> = store
         .conj
         .iter()
         .map(|disj| canonicalize_eq_disj(disj, labelling))
         .collect();
     conj.sort();
+    *conj_time += t.elapsed();
 
     CanonicalEqStore { subst, conj }
+}
+
+/// Upper bound on the namings [`eq_store_namings`] tries (7!). Beyond it a
+/// single naming is used: still sound (the canonical store still encodes the
+/// store faithfully), but two equivalent systems may then get different
+/// forms and not be merged.
+const MAX_EQ_STORE_NAMINGS: usize = 5040;
+
+/// Candidate extensions of `labelling` that name every free variable of
+/// `store` it doesn't name yet (see [`canonicalize_eq_store_timed`]).
+///
+/// The store-only variables are grouped by [`eq_store_var_invariant`], which
+/// doesn't depend on any variable's name. Groups are named in invariant
+/// order; within a group every order is tried, since the invariant can't
+/// tell its members apart. Two equivalent stores therefore produce the same
+/// candidate set up to their correspondence, and so the same minimum. One
+/// naming (the given labelling itself, if nothing is missing) in the common
+/// case.
+fn eq_store_namings(store: &EquationStore, labelling: &CanonLabelling) -> Vec<CanonLabelling> {
+    let theta = labelling.theta();
+    let mut missing: BTreeSet<LVar> = BTreeSet::new();
+    for (v, t) in store.subst.iter() {
+        missing.insert(*v);
+        t.for_each_free(&mut |w| {
+            missing.insert(*w);
+        });
+    }
+    for disj in &store.conj {
+        for alt in &disj.substs {
+            missing.extend(alt.iter().map(|(v, _)| *v));
+        }
+    }
+    missing.retain(|v| !theta.contains_key(v));
+    if missing.is_empty() {
+        return vec![labelling.clone()];
+    }
+
+    // Group by invariant; `BTreeMap` iteration is the invariant order.
+    let mut groups: std::collections::BTreeMap<EqVarInvariant, Vec<LVar>> =
+        std::collections::BTreeMap::new();
+    for v in missing {
+        groups.entry(eq_store_var_invariant(store, v)).or_default().push(v);
+    }
+    let groups: Vec<Vec<LVar>> = groups.into_values().collect();
+
+    let count = groups
+        .iter()
+        .map(|g| (1..=g.len()).fold(1usize, |acc, k| acc.saturating_mul(k)))
+        .fold(1usize, |acc, n| acc.saturating_mul(n));
+    let orders: Vec<Vec<LVar>> = if count > MAX_EQ_STORE_NAMINGS {
+        vec![groups.concat()]
+    } else {
+        groups.iter().fold(vec![Vec::new()], |prefixes, group| {
+            let perms = permutations(group);
+            prefixes
+                .iter()
+                .flat_map(|prefix| {
+                    perms.iter().map(move |perm| {
+                        let mut order = prefix.clone();
+                        order.extend_from_slice(perm);
+                        order
+                    })
+                })
+                .collect()
+        })
+    };
+    orders
+        .into_iter()
+        .map(|order| {
+            let mut naming = labelling.clone();
+            for v in order {
+                naming.bind_next(v);
+            }
+            naming
+        })
+        .collect()
+}
+
+/// A description of how a free variable occurs in an equation store that
+/// doesn't depend on any variable's name: its sort; for every disjunction
+/// in which it is a domain key, the number of alternatives and the sorted
+/// multiset of its range terms there (each canonized on its own, so the
+/// fresh variables' names drop out; `None` for alternatives without it);
+/// whether it is a key of `subst`, and the canonized `subst` terms it
+/// occurs in.
+type EqVarInvariant = (LSort, Vec<(usize, Vec<Option<LNTerm>>)>, bool, Vec<LNTerm>);
+
+fn eq_store_var_invariant(store: &EquationStore, v: LVar) -> EqVarInvariant {
+    let mut disjunctions: Vec<(usize, Vec<Option<LNTerm>>)> = store
+        .conj
+        .iter()
+        .filter(|d| d.substs.iter().any(|alt| alt.image_of(&v).is_some()))
+        .map(|d| {
+            let mut ranges: Vec<Option<LNTerm>> = d
+                .substs
+                .iter()
+                .map(|alt| alt.image_of(&v).map(canonicalize_alpha_eq_ac))
+                .collect();
+            ranges.sort();
+            (d.substs.len(), ranges)
+        })
+        .collect();
+    disjunctions.sort();
+    let in_subst_domain = store.subst.iter().any(|(k, _)| *k == v);
+    let mut subst_terms: Vec<LNTerm> = store
+        .subst
+        .iter()
+        .filter(|(_, t)| {
+            let mut occurs = false;
+            t.for_each_free(&mut |w| occurs |= *w == v);
+            occurs
+        })
+        .map(|(_, t)| canonicalize_alpha_eq_ac(t))
+        .collect();
+    subst_terms.sort();
+    (v.sort, disjunctions, in_subst_domain, subst_terms)
+}
+
+/// Every ordering of `items`.
+fn permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+    if items.len() <= 1 {
+        return vec![items.to_vec()];
+    }
+    let mut out = Vec::new();
+    for i in 0..items.len() {
+        let mut rest = items.to_vec();
+        let first = rest.remove(i);
+        for mut tail in permutations(&rest) {
+            tail.insert(0, first.clone());
+            out.push(tail);
+        }
+    }
+    out
 }
 
 /// Canonicalizes one `EqDisj`'s alternatives, preserving multiplicity (no
@@ -1760,10 +1939,11 @@ fn canonicalize_eq_disj(disj: &EqDisj, labelling: &CanonLabelling) -> Vec<Vec<(L
 /// EquationStore.hs's `sigma_i1 ∨ … ∨ sigma_ik_i` notation) of an
 /// `EqDisj`.
 ///
-/// **Domain keys** are real, graph-reachable variables (the `x_i` in
-/// EquationStore.hs's own semantics) -- canonicalized via the shared
-/// `theta` (panicking on a miss, same guardedness-style assumption as
-/// everywhere else -- see [`rename_var`]) and sorted by that CANONICAL
+/// **Domain keys** are free variables (the `x_i` in EquationStore.hs's own
+/// semantics) -- canonicalized via the shared `theta`, which by now names
+/// every one of them: those the graph part named, and those that occur only
+/// in the equation store, named by [`eq_store_namings`] (a miss still
+/// panics, see [`rename_var`]) -- and sorted by that CANONICAL
 /// identity, not raw `LVar` Ord, so the range terms below get visited
 /// (and their local witnesses numbered) in a content-driven,
 /// cross-system-stable order rather than one that depends on incidental
@@ -3739,6 +3919,144 @@ mod tests {
         assert_eq!(
             out[0], out[1],
             "and their canonical forms must actually be equal"
+        );
+    }
+
+    // -- Stage G: free variables that occur only in the equation store -----
+    //
+    // Modeled on idbased/BP_IBS_1, where merging two responder instances
+    // leaves `x.4`, `x.5` only in the store: a linking disjunction
+    // (`em(x, x.1) = em(x.4, x.5)`, `em` commutative) and the merged
+    // instance's own variant disjunction both constrain them. Here `x`, `x1`
+    // are graph variables (in the labelling), `a`, `b` store-only.
+
+    fn msg(name: &str, idx: u64) -> LVar {
+        LVar::new(name, LSort::Msg, idx)
+    }
+
+    fn alt(entries: Vec<(LVar, LNTerm)>) -> LNSubstVFresh {
+        LNSubstVFresh::from_list(entries)
+    }
+
+    fn store(conj: Vec<Vec<LNSubstVFresh>>) -> EquationStore {
+        let mut store = EquationStore::empty();
+        for (i, substs) in conj.into_iter().enumerate() {
+            store.conj.push(EqDisj {
+                split_id: crate::tools::equation_store::SplitId(i as i64),
+                substs,
+            });
+        }
+        store
+    }
+
+    /// The linking disjunction: `(x, x1)` equals `(a, b)` up to swapping,
+    /// or all four are equal.
+    fn linking_disj(x: LVar, x1: LVar, a: LVar, b: LVar, w: u64) -> Vec<LNSubstVFresh> {
+        let w0 = var_term(msg("w", w));
+        let (w1, w2) = (var_term(msg("w", w + 1)), var_term(msg("w", w + 2)));
+        vec![
+            alt(vec![(x, w0.clone()), (x1, w0.clone()), (a, w0.clone()), (b, w0)]),
+            alt(vec![(x, w1.clone()), (x1, w2.clone()), (a, w1.clone()), (b, w2.clone())]),
+            alt(vec![(x, w1.clone()), (x1, w2.clone()), (a, w2), (b, w1)]),
+        ]
+    }
+
+    /// The variant disjunction: one of `a`, `b` is the constant `P`.
+    fn variant_disj(a: LVar, b: LVar, w: u64) -> Vec<LNSubstVFresh> {
+        let p = zero_ary_fun_term("P");
+        vec![
+            alt(vec![(a, var_term(msg("w", w))), (b, p.clone())]),
+            alt(vec![(a, p), (b, var_term(msg("w", w + 1)))]),
+        ]
+    }
+
+    #[test]
+    fn eq_store_with_store_only_variables_canonicalizes() {
+        let (x, x1, a, b) = (msg("x", 0), msg("x", 1), msg("x", 4), msg("x", 5));
+        let s = store(vec![linking_disj(x, x1, a, b, 20), variant_disj(a, b, 30)]);
+        let (canon, naming) = canonicalize_eq_store(&s, &labelling_covering(&[x, x1]));
+        // The returned labelling names `a`/`b` too, so a `solve(splitEqs)`
+        // method can canonicalize one disjunction on its own through it.
+        for disj in &s.conj {
+            assert!(canon.conj.contains(&canonicalize_eq_disj(disj, &naming)));
+        }
+        // `a`/`b` got canonical names after the graph's `mv0`/`mv1`, and the
+        // SAME ones in both disjunctions.
+        let keys = |d: &Vec<Vec<(LVar, LNTerm)>>| -> BTreeSet<LVar> {
+            d.iter().flatten().map(|(k, _)| *k).collect()
+        };
+        let all_keys: BTreeSet<LVar> = canon.conj.iter().flat_map(keys).collect();
+        assert_eq!(
+            all_keys,
+            [0, 1, 2, 3].map(|i| LVar::new("mv", LSort::Msg, i)).into_iter().collect()
+        );
+    }
+
+    /// Completeness: renaming the store-only variables (here also reversing
+    /// their raw order) and reordering alternatives and disjunctions
+    /// doesn't change the canonical store.
+    #[test]
+    fn store_only_variables_are_named_independently_of_their_raw_names() {
+        let (x, x1) = (msg("x", 0), msg("x", 1));
+        let labelling = labelling_covering(&[x, x1]);
+        let (a, b) = (msg("x", 4), msg("x", 5));
+        let s1 = store(vec![linking_disj(x, x1, a, b, 20), variant_disj(a, b, 30)]);
+        // `b` now sorts before `a` by raw identity.
+        let (a2, b2) = (msg("y", 41), msg("y", 40));
+        let mut linking = linking_disj(x, x1, a2, b2, 70);
+        linking.reverse();
+        let s2 = store(vec![variant_disj(a2, b2, 50), linking]);
+        assert_eq!(canonicalize_eq_store(&s1, &labelling).0, canonicalize_eq_store(&s2, &labelling).0);
+    }
+
+    /// Completeness where the invariant can't separate the store-only
+    /// variables: in `x = w ∧ a = w  ∨  x = P ∧ b = w`, `a` and `b` each
+    /// occur once with a variable range, so they look alike -- but the store
+    /// with `a`, `b` swapped differs, and is equivalent only via the renaming
+    /// `a ↔ b`. Only trying both namings finds that.
+    #[test]
+    fn symmetric_store_only_variables_get_the_same_canonical_store() {
+        let (x, a, b) = (msg("x", 0), msg("x", 4), msg("x", 5));
+        let labelling = labelling_covering(&[x]);
+        let disj = |first: LVar, second: LVar| {
+            let w = var_term(msg("w", 20));
+            vec![
+                alt(vec![(x, w.clone()), (first, w.clone())]),
+                alt(vec![(x, zero_ary_fun_term("P")), (second, w)]),
+            ]
+        };
+        let s1 = store(vec![disj(a, b)]);
+        let s2 = store(vec![disj(b, a)]);
+        assert_eq!(canonicalize_eq_store(&s1, &labelling).0, canonicalize_eq_store(&s2, &labelling).0);
+    }
+
+    /// Soundness: the store-only variables LINK the two disjunctions.
+    /// Replacing them by unrelated ones in the variant disjunction breaks the
+    /// link, which must change the canonical store.
+    #[test]
+    fn links_through_store_only_variables_are_preserved() {
+        let (x, x1, a, b) = (msg("x", 0), msg("x", 1), msg("x", 4), msg("x", 5));
+        let labelling = labelling_covering(&[x, x1]);
+        let linked = store(vec![linking_disj(x, x1, a, b, 20), variant_disj(a, b, 30)]);
+        let (c, d) = (msg("x", 6), msg("x", 7));
+        let unlinked = store(vec![linking_disj(x, x1, a, b, 20), variant_disj(c, d, 30)]);
+        assert_ne!(
+            canonicalize_eq_store(&linked, &labelling).0,
+            canonicalize_eq_store(&unlinked, &labelling).0
+        );
+    }
+
+    /// The free substitution's variables are free too: a domain variable
+    /// `substSystem` already eliminated from the graph no longer panics.
+    #[test]
+    fn free_substitution_with_variables_outside_the_graph_canonicalizes() {
+        let (x, gone) = (msg("x", 0), msg("x", 9));
+        let mut s = EquationStore::empty();
+        s.subst = LNSubst::from_list(vec![(gone, var_term(x))]);
+        let canon = canonicalize_eq_store(&s, &labelling_covering(&[x])).0;
+        assert_eq!(
+            canon.subst,
+            vec![(LVar::new("mv", LSort::Msg, 1), var_term(LVar::new("mv", LSort::Msg, 0)))]
         );
     }
 

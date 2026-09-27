@@ -533,6 +533,24 @@ impl CanonLabelling {
         &self.theta
     }
 
+    /// Binds `v` to the next unused canonical variable of its sort and
+    /// returns it -- for a variable the caller names in an order it chose
+    /// canonically itself, outside any term the `Canonizer` walks (e.g. the
+    /// equation store's free variables that occur nowhere else, see
+    /// `tamarin_theory::canon`). Panics if `v` is already bound: rebinding
+    /// would break `theta`'s injectivity.
+    pub fn bind_next(&mut self, v: LVar) -> LVar {
+        assert!(
+            !self.theta.contains_key(&v),
+            "CanonLabelling::bind_next: {v:?} is already bound to {:?}",
+            self.theta[&v]
+        );
+        let idx = self.fresh_vars.get_mut(v.sort).fresh_idents(1);
+        let canonical = canonical_var(v.sort, idx);
+        self.theta.insert(v, canonical);
+        canonical
+    }
+
     /// Consumes the labelling, keeping only the accumulated renaming --
     /// what a caller that's done accumulating (e.g. about to canonize a
     /// formula via `canon::canonicalize_guarded`, which takes `theta` by
