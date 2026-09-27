@@ -413,11 +413,11 @@ pub fn canonicalize_graph_part(
 /// forms. Breaking such a tie needs the REST of the system (formulas/
 /// lemmas/eq_store/subterm_store) as a secondary key, by extending each
 /// survivor's own accumulated labelling and re-minimizing at the
-/// full-system level — implemented in `canonicalize_constraint_system`
-/// (below), which is the caller that actually needs more than one
-/// survivor; THIS function deliberately still stops at returning every
-/// tied candidate rather than picking one itself, since it has no way to
-/// know whether the caller needs that system-level tie-break.
+/// full-system level. `canonicalize_constraint_system` (below) does both
+/// levels in one pass over the group and never collects the survivors, so
+/// it does not call this function; this is the graph-part-only view, for
+/// inspecting the survivors themselves (the Stage F tests, and the
+/// explorer's `PROFILE_CANON` breakdown).
 pub fn minimal_graph_part_labelings(
     part: &crate::canon_graph::GraphPart,
     result: &crate::bliss_proc::BlissResult,
@@ -1014,10 +1014,11 @@ fn hash_sort_hint(h: &mut FingerprintHasher, s: p::SortHint) {
 // =============================================================================
 //
 // `canonicalize_constraint_system` composes every earlier stage:
-//   A/B (extract_graph_part) -> C (run_bliss) -> F (minimal_graph_part_labelings)
-//   -> G (this section: extend each graph-part survivor's own labelling
-//   through formulas/solved_formulas/lemmas/eq_store/subterm_store, then
-//   take the minimum `CanonicalSystem` over survivors).
+//   A/B (extract_graph_part) -> C (run_bliss) -> F+G in one pass over the
+//   closed automorphism group: per labeling, canonize the graph part (F)
+//   and extend its labelling through formulas/solved_formulas/lemmas/
+//   eq_store/subterm_store/goals (G, this section), keeping the minimum
+//   `CanonicalSystem`.
 //
 // Every field, including `eq_store.conj`'s per-alternative range-term
 // canonicalization, is real, working code, exercised end to end by
@@ -1171,9 +1172,12 @@ pub struct CanonicalSubtermStore {
 /// Lexicographic comparison over [`CanonicalSystem`]'s fields, in the same
 /// order the driver ([`canonicalize_constraint_system`]) fills them in.
 /// Needed because `Guarded` has no `Ord` impl, so `CanonicalSystem` can't
-/// `#[derive(Ord)]` -- see its own doc comment. This is what the
-/// system-level tie-break minimizes over when `minimal_graph_part_labelings`
-/// returns more than one graph-part-level survivor.
+/// `#[derive(Ord)]` -- see its own doc comment. The driver minimizes this
+/// over every labeling in the graph's automorphism group. `graph_part` must
+/// stay the FIRST key: that is what makes the minimum the smallest
+/// graph-part term with ties broken by the rest of the system, and what
+/// lets the driver skip a candidate whose graph-part term is already
+/// greater than the incumbent's without canonicalizing its content.
 pub fn cmp_canonical_system(a: &CanonicalSystem, b: &CanonicalSystem) -> std::cmp::Ordering {
     a.graph_part
         .cmp(&b.graph_part)
@@ -1318,12 +1322,14 @@ pub fn canonicalize_graph_part_seeded(
 }
 
 /// Canonizes a whole constraint `System` (Stage G, composing A-F): builds
-/// the graph part, asks bliss for its automorphism group, resolves
-/// "minimum over automorphisms" at the graph-part level (Stage F), then --
-/// for EVERY graph-part-level survivor, not just bliss's own pick --
-/// extends that survivor's own accumulated labelling through the rest of
-/// the system and takes the minimum `CanonicalSystem` over all of them
-/// (the system-level tie-break Stage F's own doc comment requires).
+/// the graph part, asks bliss for its automorphism group, and takes the
+/// minimum `CanonicalSystem` over every labeling in that group -- for each
+/// one, the graph part canonized under it (Stage F) and its accumulated
+/// labelling extended through the rest of the system. Since
+/// [`cmp_canonical_system`] compares the graph part first, this resolves
+/// "minimum over automorphisms" at the graph-part level and breaks any tie
+/// there with the rest of the system (the system-level tie-break
+/// [`minimal_graph_part_labelings`]'s doc comment requires), in one pass.
 ///
 /// Fallible only through the two bliss subprocess steps
 /// (`graph_part_to_dimacs`/`run_bliss`); everything after that is pure.
@@ -1335,10 +1341,10 @@ pub fn canonicalize_constraint_system(
 }
 
 /// [`canonicalize_constraint_system`], also returning the winning
-/// survivor's [`CanonLabelling`] -- the renaming that maps `sys` onto its
+/// labeling's [`CanonLabelling`] -- the renaming that maps `sys` onto its
 /// canonical form, for canonicalizing anything else derived from `sys`
 /// consistently with it (e.g. its proof methods, [`canonicalize_proof_method`]).
-/// With several tied survivors this is one of them; anything canonicalized
+/// With several tied labelings this is one of them; anything canonicalized
 /// through it should be compared as a multiset, which a symmetry of the
 /// system maps onto itself.
 pub fn canonicalize_constraint_system_with_labelling(
@@ -1377,47 +1383,32 @@ pub fn canonicalize_constraint_system_with_labelling(
     let dimacs = crate::bliss_proc::graph_part_to_dimacs(&part)?;
     let result = crate::bliss_proc::run_bliss(&dimacs)?;
 
-    // Stage F: every labeling in the CLOSED automorphism group achieving
-    // the minimum graph-part TERM (not just bliss's single pick) --
-    // `minimal_graph_part_labelings` deliberately returns every tied
-    // survivor rather than choosing one, because a graph-part-level tie
-    // is not always resolvable without looking at the rest of the system
-    // (see its own doc comment for the concrete counterexample; the loop
-    // below is what actually resolves it, per survivor).
-    let (graph_term, survivors) = minimal_graph_part_labelings(&part, &result);
-    debug_assert!(
-        !survivors.is_empty(),
-        "bliss always returns at least the identity labeling as a candidate"
-    );
-
-    // Stage G: for EACH survivor, re-derive its own accumulated
-    // `CanonLabelling` (not just its term -- `minimal_graph_part_labelings`
-    // only returns the term, so this recomputes the same canonization a
-    // second time via the `_seeded` sibling to also recover the
-    // labelling; cheap relative to the bliss subprocess call this reuses
-    // no new invocation of) and extend it through formulas ->
-    // solved_formulas -> lemmas -> eq_store -> subterm_store -- a fixed,
-    // deterministic order.
-    //
-    // Stage F's system-level tie-break: the minimum CanonicalSystem over
-    // every graph-part-level survivor, via the dedicated comparison
-    // function `Guarded`'s missing `Ord` impl forces (see
-    // `cmp_canonical_system`'s own doc comment). A RUNNING minimum, not a
-    // collected list: there can be k! survivors (see
-    // `minimal_graph_part_labelings`), each a full `CanonicalSystem`. Only a
-    // strictly smaller candidate replaces the current one, so on ties the
-    // first survivor wins, as `Iterator::min_by` would pick.
+    // Stages F and G in one pass: the minimum `CanonicalSystem` over every
+    // labeling in the CLOSED automorphism group. `cmp_canonical_system`
+    // compares `graph_part` first, so this is the minimum graph-part term
+    // (Stage F) with ties on it broken by the rest of the system (Stage G)
+    // -- a graph-part tie must not be broken arbitrarily, see
+    // `minimal_graph_part_labelings`'s doc comment. A candidate whose term
+    // is already greater than the incumbent's cannot win, so its content is
+    // never canonicalized. Each candidate's labelling comes from the same
+    // canonization that produced its term, and none is kept beyond the
+    // incumbent: there can be k! tied labelings. Only a strictly smaller
+    // candidate replaces the incumbent, so on ties the first in group order
+    // wins.
+    let group = crate::bliss_proc::generate_group(&result.generators, part.vertices.len());
     let mut best: Option<(CanonicalSystem, CanonLabelling)> = None;
-    for labeling in &survivors {
-        let ordered = crate::bliss_proc::canonical_vertex_order(&part, labeling);
-        let edges = crate::bliss_proc::canonical_edges(&part, labeling);
-        let (graph_term_again, labelling) = canonicalize_graph_part_seeded(&ordered, &edges);
-        debug_assert_eq!(
-            graph_term_again, graph_term,
-            "re-running canonicalize_graph_part_seeded for a winning labeling must \
-             reproduce the same term minimal_graph_part_labelings already found"
-        );
-        let candidate = canonicalize_system_content_seeded(sys, &labelling, graph_term_again);
+    for g in &group {
+        let labeling = result.canonical_labeling.compose(g);
+        let ordered = crate::bliss_proc::canonical_vertex_order(&part, &labeling);
+        let edges = crate::bliss_proc::canonical_edges(&part, &labeling);
+        let (graph_term, labelling) = canonicalize_graph_part_seeded(&ordered, &edges);
+        if best
+            .as_ref()
+            .is_some_and(|(current, _)| graph_term.cmp(&current.graph_part).is_gt())
+        {
+            continue;
+        }
+        let candidate = canonicalize_system_content_seeded(sys, &labelling, graph_term);
         let better = best
             .as_ref()
             .map_or(true, |(current, _)| cmp_canonical_system(&candidate.0, current).is_lt());
@@ -1425,10 +1416,10 @@ pub fn canonicalize_constraint_system_with_labelling(
             best = Some(candidate);
         }
     }
-    Ok(best.expect("`survivors` holds at least one labeling"))
+    Ok(best.expect("the group contains at least the identity"))
 }
 
-/// Extends `labelling` (already seeded from a graph-part survivor) through
+/// Extends `labelling` (already seeded from a graph-part canonization) through
 /// every remaining field of `sys` this module treats as part of the
 /// canonical form, building the rest of a [`CanonicalSystem`], and returns
 /// it together with the labelling the whole system was canonicalized with.
@@ -4431,6 +4422,171 @@ mod tests {
             finished(Contradiction::NodeAfterLast(node(0), node(1))),
             finished(Contradiction::Cyclic)
         );
+    }
+
+    // -- canonicalize_constraint_system: ties across automorphisms --
+
+    /// The minimization as two separate stages: every labeling achieving
+    /// the minimum graph-part term (`minimal_graph_part_labelings`), then
+    /// the minimum `CanonicalSystem` over those, the first one winning ties.
+    /// `canonicalize_constraint_system_with_labelling` does both in one pass
+    /// and must agree with this exactly, labelling included.
+    fn two_stage_reference(sys: &System, colors: &ColorTable) -> (CanonicalSystem, CanonLabelling) {
+        use crate::bliss_proc::{
+            canonical_edges, canonical_vertex_order, graph_part_to_dimacs, run_bliss,
+        };
+        let part = crate::canon_graph::extract_graph_part(sys, colors);
+        let result = run_bliss(&graph_part_to_dimacs(&part).expect("dimacs")).expect("bliss");
+        let (_, survivors) = minimal_graph_part_labelings(&part, &result);
+        let mut best: Option<(CanonicalSystem, CanonLabelling)> = None;
+        for labeling in &survivors {
+            let (term, labelling) = canonicalize_graph_part_seeded(
+                &canonical_vertex_order(&part, labeling),
+                &canonical_edges(&part, labeling),
+            );
+            let candidate = canonicalize_system_content_seeded(sys, &labelling, term);
+            if best
+                .as_ref()
+                .map_or(true, |(current, _)| cmp_canonical_system(&candidate.0, current).is_lt())
+            {
+                best = Some(candidate);
+            }
+        }
+        best.expect("at least one survivor")
+    }
+
+    /// One `!KU(<'tag', var>)` action goal per `(node, tag, var, solved)`.
+    fn ku_pair_goals_system(goals: &[(u64, &str, &str, bool)]) -> System {
+        use tamarin_term::builtin::pair;
+        use tamarin_term::lterm::pub_term;
+        let mut sys = System::empty();
+        sys.content_mut().goals = std::sync::Arc::new(
+            goals
+                .iter()
+                .map(|&(n, tag, var, solved)| {
+                    (
+                        Goal::Action(
+                            node(n),
+                            crate::fact::ku_fact(pair(pub_term(tag), v(var, LSort::Msg))),
+                        ),
+                        GoalStatus {
+                            solved,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+        );
+        sys
+    }
+
+    /// `!KU(<'a', x>)`, `!KU(<'a', y>)`, `!KU(<'b', x>)`, `!KU(<'b', y>)`:
+    /// automorphisms that break which `'a'` goal shares its variable with
+    /// which `'b'` goal lose on the graph-part term alone, and the two that
+    /// preserve it tie there. Only the solved flag, outside the graph part,
+    /// tells those two apart. Putting it on either `'a'` goal leaves the
+    /// graph part, and so the tied labelings' order, unchanged, so each
+    /// tied labeling wins for one of the two placements: the single pass
+    /// must skip candidates and still pick a tied labeling that is not the
+    /// first one, exactly as the two-stage version does.
+    #[test]
+    fn single_pass_minimization_matches_the_two_stage_reference() {
+        if !bliss_available() {
+            return;
+        }
+        use crate::bliss_proc::{
+            canonical_edges, canonical_vertex_order, generate_group, graph_part_to_dimacs,
+            run_bliss,
+        };
+        let colors = empty_color_table();
+        let with_solved = |solved_node: u64| {
+            ku_pair_goals_system(&[
+                (0, "a", "x", solved_node == 0),
+                (1, "a", "y", solved_node == 1),
+                (2, "b", "x", false),
+                (3, "b", "y", false),
+            ])
+        };
+
+        let part = crate::canon_graph::extract_graph_part(&with_solved(0), &colors);
+        let result = run_bliss(&graph_part_to_dimacs(&part).expect("dimacs")).expect("bliss");
+        let graph_term_under = |l: &crate::bliss_proc::Permutation| {
+            canonicalize_graph_part_seeded(
+                &canonical_vertex_order(&part, l),
+                &canonical_edges(&part, l),
+            )
+        };
+        let distinct_terms: BTreeSet<LNTerm> =
+            generate_group(&result.generators, part.vertices.len())
+                .iter()
+                .map(|g| graph_term_under(&result.canonical_labeling.compose(g)).0)
+                .collect();
+        assert!(
+            distinct_terms.len() > 1,
+            "some automorphisms must lose on the graph-part term alone"
+        );
+        let (_, survivors) = minimal_graph_part_labelings(&part, &result);
+        assert_eq!(survivors.len(), 2, "exactly the identity and the x <-> y swap tie");
+
+        let mut second_wins = BTreeSet::new();
+        for solved_node in [0, 1] {
+            let sys = with_solved(solved_node);
+            let [first, second] = [&survivors[0], &survivors[1]].map(|l| {
+                let (term, labelling) = graph_term_under(l);
+                canonicalize_system_content_seeded(&sys, &labelling, term).0
+            });
+            assert_ne!(first, second, "the solved flag must break the graph-part tie");
+            second_wins.insert(cmp_canonical_system(&second, &first).is_lt());
+
+            let (canon, labelling) =
+                canonicalize_constraint_system_with_labelling(&sys, &colors).expect("canonicalize");
+            let (expected, expected_labelling) = two_stage_reference(&sys, &colors);
+            assert_eq!(canon, expected, "solved flag on node {solved_node}");
+            assert_eq!(labelling.theta(), expected_labelling.theta());
+        }
+        assert_eq!(
+            second_wins.len(),
+            2,
+            "each tied labeling must win for one of the two placements"
+        );
+    }
+
+    /// The system above with its nodes renumbered and its variables renamed
+    /// canonicalizes identically, so the tie-break depends only on the
+    /// system; moving the solved flag to `!KU(<'b', x>)` gives a different
+    /// system and must not.
+    #[test]
+    fn a_system_level_tie_break_is_independent_of_node_numbering_and_variable_names() {
+        if !bliss_available() {
+            return;
+        }
+        let colors = empty_color_table();
+        let canon = |goals: &[(u64, &str, &str, bool)]| {
+            canonicalize_constraint_system(&ku_pair_goals_system(goals), &colors)
+                .expect("canonicalize")
+        };
+
+        let original = canon(&[
+            (0, "a", "x", true),
+            (1, "a", "y", false),
+            (2, "b", "x", false),
+            (3, "b", "y", false),
+        ]);
+        let renumbered_and_renamed = canon(&[
+            (0, "a", "w", false),
+            (1, "b", "u", false),
+            (2, "b", "w", false),
+            (3, "a", "u", true),
+        ]);
+        let solved_moved = canon(&[
+            (0, "a", "x", false),
+            (1, "a", "y", false),
+            (2, "b", "x", true),
+            (3, "b", "y", false),
+        ]);
+
+        assert_eq!(original, renumbered_and_renamed);
+        assert_ne!(original, solved_moved);
     }
 
     // -- canonicalize_constraint_system: empty graph parts --
