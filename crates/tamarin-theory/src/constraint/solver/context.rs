@@ -252,6 +252,13 @@ pub struct ProofContext {
     /// (`fromMaybe CutDFS`); consumed once per lemma by `run_proof_search`
     /// (search.rs).  Per-lemma / theory-global, so owned.
     pub cut: CutStrategy,
+    /// RS-only, opt-in: search the top N ranked proof methods per system
+    /// instead of the heuristic's first (`TAM_RS_TOP_METHODS`, see
+    /// [`crate::constraint::solver::topn_search`]).  `None`, the default,
+    /// keeps the HS-faithful greedy search.  Set per lemma by `prove.rs`;
+    /// the nested searches of derivation checks build their own contexts
+    /// and stay greedy.
+    pub top_n: Option<crate::constraint::solver::topn_search::TopNConfig>,
     /// Pending typing assumptions (from `[sources]`-tagged lemmas)
     /// applied during `ensure_saturated`'s refinement step.  Set by
     /// `prove_lemma` before any source-case access; refinement is
@@ -329,6 +336,7 @@ impl Clone for ProofContext {
             injective_fact_insts: self.injective_fact_insts.clone(),
             is_exists_trace: self.is_exists_trace,
             cut: self.cut,
+            top_n: self.top_n,
             typing_assumptions: self.typing_assumptions.clone(),
             heuristic: self.heuristic.clone(),
             lemma_name: self.lemma_name.clone(),
@@ -434,6 +442,7 @@ impl ProofContext {
             injective_fact_insts: self.injective_fact_insts.clone(),
             is_exists_trace: self.is_exists_trace,
             cut: self.cut,
+            top_n: self.top_n,
             typing_assumptions: self.typing_assumptions.clone(),
             heuristic: self.heuristic.clone(),
             lemma_name: self.lemma_name.clone(),
@@ -1152,6 +1161,7 @@ impl ProofContext {
             injective_fact_insts,
             is_exists_trace: false,
             cut: CutStrategy::Dfs,
+            top_n: None,
             typing_assumptions: Vec::new(),
             heuristic: None,
             lemma_name: String::new(),

@@ -24,6 +24,8 @@
 //! - [`sources`] — port of `Solver.Sources`. Source/case-distinction
 //!   precomputation.
 //! - [`tactic_show`] — pretty-printing for tactic diagnostics.
+//! - [`topn_search`] — RS-only, opt-in: searches the top N ranked proof
+//!   methods per system, merging canonically equal systems.
 //! - [`trace`] — RS-only diagnostic execution-trace scaffolding.
 //!
 //! The full Haskell source is ~4 k LOC across `ProofMethod`,
@@ -41,6 +43,7 @@ pub mod search;
 pub mod simplify;
 pub mod sources;
 pub mod tactic_show;
+pub mod topn_search;
 pub mod trace;
 
 pub use context::ProofContext;

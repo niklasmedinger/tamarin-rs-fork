@@ -968,6 +968,8 @@ impl ProverSession {
         // HS `apCut` is theory-global (one `TheoryLoadOptions.stopOnTrace`),
         // so stamp the session's cut onto every per-lemma context.
         ctx.cut = self.cut;
+        // RS-only, opt-in top-N search (`TAM_RS_TOP_METHODS`).
+        ctx.top_n = crate::constraint::solver::topn_search::config_for_lemma(theory.is_sapic);
         let session_in_file = &theory.in_file;
         ctx.heuristic = resolve_heuristic(
             &self.cli_heuristic,
@@ -1673,6 +1675,8 @@ pub fn build_lemma_proof_context(
     // Solved-leaf extraction strategy (HS `apCut`, threaded from
     // `--stop-on-trace`).  Consumed once by `run_proof_search` below.
     ctx.cut = cut;
+    // RS-only, opt-in top-N search (`TAM_RS_TOP_METHODS`).
+    ctx.top_n = crate::constraint::solver::topn_search::config_for_lemma(theory.is_sapic);
 
     // Resolve the goal-ranking heuristic.  HS `selectHeuristic prover ctx =
     // ... apDefaultHeuristic prover <|> L.get pcHeuristic ctx`

@@ -81,7 +81,7 @@ pub enum NodeStatus {
 }
 
 /// Map a terminal `is_finished` result to its leaf [`NodeStatus`].
-fn node_status_of(r: &MethodResult) -> NodeStatus {
+pub(crate) fn node_status_of(r: &MethodResult) -> NodeStatus {
     match r {
         MethodResult::Solved => NodeStatus::Solved,
         MethodResult::Contradictory(_) => NodeStatus::Contradictory,
@@ -283,7 +283,7 @@ pub fn set_sys_retention(policy: SysRetention) {
 /// [`SysRetention::KeepAll`] by the `TAM_RS_KEEP_SYS` env presence
 /// (diagnostic).
 #[inline]
-fn sys_retention() -> SysRetention {
+pub(crate) fn sys_retention() -> SysRetention {
     if keep_sys_env() {
         return SysRetention::KeepAll;
     }
@@ -443,6 +443,13 @@ fn clear_deadline() {
     DEADLINE.with(|d| d.set(None));
 }
 
+/// Installs `deadline` as the calling thread's search deadline and returns
+/// the previous one, for a helper that runs solver code on a worker thread
+/// and must restore what that thread had (`topn_search`'s worker setup).
+pub(crate) fn replace_deadline(deadline: Option<std::time::Instant>) -> Option<std::time::Instant> {
+    DEADLINE.with(|d| d.replace(deadline))
+}
+
 /// Run an iterative-deepening search.  Heuristic: try `Simplify`
 /// once, then pick the first ranked open goal each round.
 ///
@@ -522,6 +529,21 @@ pub fn run_proof_search(ctx: &ProofContext, initial: System, proof_bound: usize)
                 std::process::exit(124);
             })
             .ok();
+    }
+    // RS-only, opt-in (`TAM_RS_TOP_METHODS`): search the top N ranked
+    // methods per system instead of the heuristic's first.  The greedy
+    // strategies below never run then; `ctx.top_n` is `None` by default.
+    if let Some(config) = ctx.top_n {
+        let root = crate::constraint::solver::topn_search::run(
+            ctx,
+            initial,
+            proof_bound,
+            config,
+            deadline,
+        );
+        PROOF_BOUND.with(|b| b.set(usize::MAX));
+        clear_deadline();
+        return root;
     }
     let mut root = ProofNode {
         method: ProofMethod::Sorry(Some("initial".into())),
@@ -911,7 +933,7 @@ fn re_expand_depth_limited(
 /// `Sorry` for an empty child set (the defensive fallback both call
 /// sites already used); a caller that must leave `status` untouched on
 /// empty children guards the call itself.
-fn rollup_from_children(children: &BTreeMap<String, ProofNode>) -> NodeStatus {
+pub(crate) fn rollup_from_children(children: &BTreeMap<String, ProofNode>) -> NodeStatus {
     let mut any_solved = false;
     let mut any_contra = false;
     let mut any_unfin = false;
@@ -971,7 +993,7 @@ fn expand(
 /// `outputTraces`' selector (Batch.hs:285).  Keyed on `method`, not on
 /// the aggregate [`NodeStatus`], which rolls up from children and would
 /// retain interior nodes too.
-fn drop_sys_after_expand(node: &ProofNode, retention: SysRetention) -> bool {
+pub(crate) fn drop_sys_after_expand(node: &ProofNode, retention: SysRetention) -> bool {
     if is_depth_limited(node) {
         return false;
     }
