@@ -76,11 +76,15 @@ pub mod position {
     /// denotes the term itself.
     pub type Position = Vec<PosStep>;
 
-    /// $\mathit{Pos}(t)$: every valid position of `t`, including `ε`.
+    /// $\mathit{Pos}(t)$: every valid position of `t`, including `ε`, once.
     pub fn positions(t: &LNTerm) -> Vec<Position> {
         let mut out = vec![Vec::new()];
         let mut prefix = Vec::new();
         collect_positions(t, &mut prefix, &mut out);
+        // Children of an AC symbol with the same head reach the same
+        // positions as far as their shapes agree; keep each position once.
+        let mut seen = BTreeSet::new();
+        out.retain(|p| seen.insert(p.clone()));
         out
     }
 
@@ -94,16 +98,19 @@ pub mod position {
                 prefix.pop();
 
                 // `p = f . g . p'` for each distinct head symbol `g` among
-                // the (already AC-flattened) children.
-                let mut seen = BTreeSet::new();
+                // the (already AC-flattened) children, and each `p'` valid in
+                // SOME child headed by `g`: `t|_p` is the union over all of
+                // them (work.tex). Children with one head need not share a
+                // shape -- in `f('c') ++ f(g(z))` only the second reaches
+                // `z` -- so every one of them is walked, not just the first.
+                // Positions repeat across children; `positions` drops the
+                // repeats.
                 for a in args.iter() {
                     if let Term::App(sym, _) = a {
-                        if seen.insert(*sym) {
-                            prefix.push(PosStep::AcGroup(Some(*sym)));
-                            out.push(prefix.clone());
-                            collect_positions(a, prefix, out);
-                            prefix.pop();
-                        }
+                        prefix.push(PosStep::AcGroup(Some(*sym)));
+                        out.push(prefix.clone());
+                        collect_positions(a, prefix, out);
+                        prefix.pop();
                     }
                 }
             }
@@ -163,7 +170,7 @@ pub mod position {
         subterms_at(t, p)
             .into_iter()
             .filter_map(|s| match s {
-                Term::Lit(l) => Some(l.clone()),
+                Term::Lit(l) => Some(*l),
                 Term::App(..) => None,
             })
             .collect()
@@ -417,10 +424,57 @@ pub mod position {
             assert!(subterms_at(&t, &p).is_empty());
         }
 
+        /// `f('c') ++ f(g(z))`: of the two `f` children, only the second
+        /// reaches `z`; its position must be valid all the same.
+        #[test]
+        fn positions_cover_every_child_with_the_head() {
+            use crate::builtin::union;
+            use crate::lterm::{Name, NameTag};
+            use crate::vterm::const_term;
+            let f = no_eq_sym("f", 1);
+            let g = no_eq_sym("g", 1);
+            let c = const_term(Name::new(NameTag::Pub, "c"));
+            let t = union(
+                f_app_no_eq(f, vec![c]),
+                f_app_no_eq(f, vec![f_app_no_eq(g, vec![v("z")])]),
+            );
+            let deep = vec![
+                PosStep::AcGroup(Some(FunSym::NoEq(f))),
+                PosStep::Arg(0),
+                PosStep::Arg(0),
+            ];
+            let all = positions(&t);
+            assert!(all.contains(&deep), "{all:?} lacks {deep:?}");
+            assert_eq!(lit_pos(&t, &deep), BTreeSet::from([lit(&v("z"))]));
+            let unique: BTreeSet<_> = all.iter().collect();
+            assert_eq!(unique.len(), all.len(), "every position once");
+        }
+
+        /// \Cref{thm:alphaeqac_pos} where children with one head differ in
+        /// shape: renaming `y` to `a` puts `f(<a, g(z)>)` before
+        /// `f(<x, 'c'>)` in AC order, which must not change the positions.
+        #[test]
+        fn positions_are_invariant_under_renaming_that_reorders_differently_shaped_children() {
+            use crate::builtin::{pair, union};
+            use crate::lterm::{Name, NameTag};
+            use crate::vterm::const_term;
+            let f = |t: LNTerm| f_app_no_eq(no_eq_sym("f", 1), vec![t]);
+            let g = |t: LNTerm| f_app_no_eq(no_eq_sym("g", 1), vec![t]);
+            let c = const_term(Name::new(NameTag::Pub, "c"));
+            let shallow_first = union(f(pair(v("x"), c.clone())), f(pair(v("y"), g(v("z")))));
+            let deep_first = union(f(pair(v("x"), c)), f(pair(v("a"), g(v("z")))));
+            assert_eq!(
+                positions(&shallow_first)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                positions(&deep_first).into_iter().collect::<BTreeSet<_>>()
+            );
+        }
+
         /// Extracts the literal out of a term built by [`v`] (a bare variable).
         fn lit(t: &LNTerm) -> LNLit {
             match t {
-                Term::Lit(l) => l.clone(),
+                Term::Lit(l) => *l,
                 Term::App(..) => panic!("not a literal"),
             }
         }
@@ -638,8 +692,10 @@ impl Canonizer {
             for v in &vars {
                 occurs_in.entry(*v).or_default().push(p.clone());
             }
-            let uncanonicalized_lits: BTreeSet<LVar> =
-                vars.into_iter().filter(|v| !theta.contains_key(v)).collect();
+            let uncanonicalized_lits: BTreeSet<LVar> = vars
+                .into_iter()
+                .filter(|v| !theta.contains_key(v))
+                .collect();
             let mut sort_counts: BTreeMap<LSort, usize> = BTreeMap::new();
             for v in &uncanonicalized_lits {
                 *sort_counts.entry(v.sort).or_default() += 1;
@@ -885,6 +941,22 @@ impl Canonizer {
 
         let term = self.term.clone();
         let candidates = std::mem::take(&mut self.subst);
+        // Every candidate must rename every variable of the term. Checked
+        // here, rather than left to `rename_var`'s panic deep inside
+        // `apply_renaming`, so that the message can show the term whose
+        // variable the discovery above missed -- for a constraint system,
+        // its graph-part term. The candidates come from one discovery, so
+        // the first stands for all.
+        term.for_each_free(&mut |v| {
+            if let Some(theta) = candidates.first().filter(|theta| !theta.contains_key(v)) {
+                panic!(
+                    "Canonizer: variable {v:?} of the term being canonized is not covered by \
+                     the canonical renaming: the literal discovery never reached it.\n\
+                     renaming: {theta:?}\nterm: {}\nterm (debug): {term:?}",
+                    crate::pretty::pretty_lnterm(&term)
+                )
+            }
+        });
         self.considered_permutations = candidates.len();
         let mut best: Option<LNTerm> = None;
         let mut winners: Vec<BTreeMap<LVar, LVar>> = Vec::new();
@@ -1067,6 +1139,50 @@ mod tests {
         NoEqSym::new(name, arity, Privacy::Public, Constructability::Constructor)
     }
 
+    // -- A variable deeper than its AC siblings (`position::collect_positions`).
+
+    /// Top-3 search with merging on `sp14/group_joux.spthy` reached a
+    /// system whose graph-part term contains
+    /// `x ++ <indA, A> ++ <indA.1, A> ++ <(indB ++ indA.1), B>`, and `indB`
+    /// never got a canonical name. The trigger is not the nested union: two
+    /// arguments of an AC symbol with the same head (`f`, or the pair), one
+    /// of which holds a variable deeper than the other one reaches. The
+    /// positions were taken from the first such argument only, so in the
+    /// smallest form, `f('c') ++ f(g(z))`, `z` was never scheduled. Which
+    /// argument comes first can depend on variable names: of the last pair
+    /// below, only the first term panicked.
+    #[test]
+    fn a_variable_deeper_than_its_ac_siblings_is_renamed() {
+        use crate::builtin::{pair, union};
+        let f = |t: LNTerm| f_app_no_eq(no_eq_sym("f", 1), vec![t]);
+        let g = |t: LNTerm| f_app_no_eq(no_eq_sym("g", 1), vec![t]);
+        let c = const_term(Name::new(NameTag::Pub, "c"));
+        let [x, y, z, w, a] = ["x", "y", "z", "w", "a"].map(|n| v(n, LSort::Msg));
+        // The smallest form, and the shape of the group_joux term.
+        let smallest = union(f(c.clone()), f(g(z.clone())));
+        let group_joux = union(
+            pair(y.clone(), c.clone()),
+            pair(pair(z.clone(), w), c.clone()),
+        );
+        for t in [smallest, group_joux] {
+            let renamed = t
+                .clone()
+                .map_free(&mut |x| LVar::new(format!("{}_", x.name), x.sort, 7));
+            assert_eq!(
+                canonicalize_alpha_eq_ac(&t),
+                canonicalize_alpha_eq_ac(&renamed)
+            );
+        }
+        // Alpha-equivalent, but `y` and `a` put the `f` arguments in
+        // different AC orders.
+        let shallow_first = union(f(pair(x.clone(), c.clone())), f(pair(y, g(z.clone()))));
+        let deep_first = union(f(pair(x, c)), f(pair(a, g(z))));
+        assert_eq!(
+            canonicalize_alpha_eq_ac(&shallow_first),
+            canonicalize_alpha_eq_ac(&deep_first)
+        );
+    }
+
     /// Canonizes `t1` and `t2` independently and asserts that each
     /// considered exactly its expected number of candidate permutations
     /// (`expected_perms1` for `t1`, `expected_perms2` for `t2` —
@@ -1214,7 +1330,11 @@ mod tests {
         let f = no_eq_sym("f", 3);
         let t = f_app_no_eq(
             f,
-            vec![pub_term("a"), xor(fresh_term("n"), v("x", LSort::Fresh)), v("y", LSort::Msg)],
+            vec![
+                pub_term("a"),
+                xor(fresh_term("n"), v("x", LSort::Fresh)),
+                v("y", LSort::Msg),
+            ],
         );
         let x = LVar::new("x", LSort::Fresh, 0);
         let y = LVar::new("y", LSort::Msg, 0);
@@ -1413,7 +1533,10 @@ mod tests {
     #[test]
     fn message_tags_are_not_renamed() {
         let pair = |tag: &str, var: &str| {
-            f_app_no_eq(no_eq_sym("pair", 2), vec![pub_term(tag), v(var, LSort::Msg)])
+            f_app_no_eq(
+                no_eq_sym("pair", 2),
+                vec![pub_term(tag), v(var, LSort::Msg)],
+            )
         };
         let (ct1, ct2) = canonize_and_assert_perms(&pair("1", "x"), &pair("2", "x"), 1, 1);
         assert_ne!(ct1, ct2);

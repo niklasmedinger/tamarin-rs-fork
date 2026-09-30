@@ -188,14 +188,12 @@ pub fn top_n_from_env() -> Option<TopNConfig> {
 
 /// [`top_n_from_env`] for one lemma of a theory, checked against what
 /// merging needs up front rather than at the first canonicalization.
-pub fn config_for_lemma(theory_is_sapic: bool) -> Option<TopNConfig> {
+/// Theories with processes need nothing extra: the prover translates them
+/// before building the proof context, whose color table therefore covers
+/// the generated rules' actions.
+pub fn config_for_lemma() -> Option<TopNConfig> {
     let config = top_n_from_env()?;
     if config.merge {
-        assert!(
-            !theory_is_sapic,
-            "TAM_RS_MERGE: theories with processes are not supported: the canonicalizer's \
-             color table does not cover the actions generated from processes"
-        );
         // Panics itself, with install hints, unless TAM_ALLOW_NO_BLISS=1.
         assert!(
             crate::bliss_proc::bliss_available(),
@@ -553,12 +551,13 @@ impl SearchGraph {
 /// the class's [`Pending`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Entry {
-    /// `depth` ([`SearchOrder::IdDfs`]) or `u32::MAX - depth`
-    /// ([`SearchOrder::Bfs`]).
+    /// `depth` for ([`SearchOrder::IdDfs`]) or `u32::MAX - depth`
+    /// for ([`SearchOrder::Bfs`]).
     primary: u32,
     /// `N - idx`: the heuristic's first choice ranks highest.
     rank: u32,
-    /// The oldest class first among equals.
+    /// The oldest class first among equals. Cases of a class are sorted
+    /// lexicographically and given ascending ClassIds.
     class: Reverse<ClassId>,
 }
 
@@ -894,9 +893,7 @@ impl<'a> Engine<'a> {
             .min_cost
             .saturating_add(self.alt_cost(self.config.n - rank));
         let entry = Entry::new(self.config.order, depth, rank, c);
-        let queued = class
-            .pending
-            .is_some_and(|p| p.entry == entry && !p.parked);
+        let queued = class.pending.is_some_and(|p| p.entry == entry && !p.parked);
         self.graph.class_mut(c).pending = Some(Pending {
             entry,
             depth,
@@ -1005,7 +1002,13 @@ impl<'a> Engine<'a> {
     /// entry was replaced meanwhile ([`Self::push_entry`]) gets none.
     fn unpark(&mut self) {
         for c in std::mem::take(&mut self.parked) {
-            let Some(pending) = self.graph.class_mut(c).pending.as_mut().filter(|p| p.parked) else {
+            let Some(pending) = self
+                .graph
+                .class_mut(c)
+                .pending
+                .as_mut()
+                .filter(|p| p.parked)
+            else {
                 continue;
             };
             pending.parked = false;
@@ -1878,7 +1881,12 @@ mod tests {
             alt_cost,
             ..config(2, false, 1)
         };
-        Engine::new(ctx, config, DEPTH_CAP, Instant::now() + Duration::from_secs(3600))
+        Engine::new(
+            ctx,
+            config,
+            DEPTH_CAP,
+            Instant::now() + Duration::from_secs(3600),
+        )
     }
 
     fn with_system() -> Option<Stored> {
@@ -1906,13 +1914,19 @@ mod tests {
         let mut engine = engine(&ctx, 4);
         let c = engine.add_class(Status::Open, 0, 5, with_system());
         engine.push_entry(c, 2);
-        assert!(engine.select_batch(4).is_empty(), "cost 5 waits for a higher limit");
+        assert!(
+            engine.select_batch(4).is_empty(),
+            "cost 5 waits for a higher limit"
+        );
         assert_eq!(engine.parked, vec![c]);
         engine.lower(c, 0, 2);
         let tasks = engine.select_batch(4);
         assert_eq!(tasks.iter().map(|t| t.class).collect::<Vec<_>>(), vec![c]);
         engine.unpark();
-        assert!(engine.frontier.is_empty(), "the expanded entry is not parked any more");
+        assert!(
+            engine.frontier.is_empty(),
+            "the expanded entry is not parked any more"
+        );
     }
 
     #[test]

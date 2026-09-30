@@ -91,9 +91,18 @@ fn main() {
     });
     let protocol_rules: Vec<tamarin_theory::theory::OpenProtoRule> =
         elaborated_theory.rules().cloned().collect();
+    // A system exported from a proof carries the lemma's and the
+    // restrictions' formulas, so their actions need colors too.
+    let formula_actions = tamarin_theory::canon_color::formula_action_names(
+        elaborated_theory
+            .lemmas()
+            .map(|l| &l.formula)
+            .chain(elaborated_theory.restrictions().map(|r| &r.formula)),
+    );
     let colors = ColorTable::build(
         &protocol_rules,
         &IntrRuleCache::from(tamarin_theory::intruder_rules::special_intruder_rules(false)),
+        &formula_actions,
     );
 
     let json_text = match json_path.as_deref() {

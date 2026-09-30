@@ -920,6 +920,21 @@ impl ProofContext {
         Self::new_impl(maude, None, rules, restrictions, &[], Some(intruder_rules))
     }
 
+    /// Extends the color table to the actions `lemmas` mention
+    /// ([`crate::canon_color::formula_action_names`]). A lemma's formula
+    /// reaches the systems of its proof, and a reused or `[sources]` lemma
+    /// those of other proofs, but lemmas never reach the constructor, which
+    /// covers only the rules' and restrictions' actions. Call it right after
+    /// construction, while the shared bundle is still uniquely owned.
+    pub fn cover_lemma_actions(&mut self, lemmas: std::collections::BTreeSet<String>) {
+        let mut actions = crate::canon_color::guarded_action_names(&self.restrictions);
+        actions.extend(lemmas);
+        let table = ColorTable::build(&self.rules, &self.intruder_rules, &actions);
+        std::sync::Arc::get_mut(&mut self.shared)
+            .expect("cover_lemma_actions: the context's shared bundle is uniquely owned")
+            .color_table = table;
+    }
+
     fn new_impl(
         maude: MaudeHandle,
         maude_pool: Option<std::sync::Arc<MaudePool>>,
@@ -1152,7 +1167,13 @@ impl ProofContext {
         // `ColorTable::build`'s own doc comment for why it takes
         // `&[OpenProtoRule]` + `&IntrRuleCache` rather than `&Theory`.
         // Must happen before `rules` moves into the struct literal below.
-        let color_table = ColorTable::build(&rules, &intruder_rules);
+        // The restrictions' actions are covered here, the lemmas' by
+        // `cover_lemma_actions`.
+        let color_table = ColorTable::build(
+            &rules,
+            &intruder_rules,
+            &crate::canon_color::guarded_action_names(&restrictions),
+        );
         let mut ctx = ProofContext {
             maude,
             maude_pool,

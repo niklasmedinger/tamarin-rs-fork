@@ -3277,6 +3277,7 @@ mod tests {
         ColorTable::build(
             &[],
             &crate::constraint::solver::context::IntrRuleCache::from(Vec::new()),
+            &std::collections::BTreeSet::new(),
         )
     }
 
@@ -3292,6 +3293,7 @@ mod tests {
         ColorTable::build(
             &protocol_rules,
             &crate::constraint::solver::context::IntrRuleCache::from(Vec::new()),
+            &std::collections::BTreeSet::new(),
         )
     }
 

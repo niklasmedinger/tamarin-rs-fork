@@ -19,8 +19,8 @@
 #
 # Files a mode cannot compare are left out up front and listed, never silently
 # dropped:
-#   - SAPIC theories when merging is on: `config_for_lemma` refuses them, the
-#     canonicalizer's color table does not cover actions generated from processes;
+#   - SAPIC theories when merging is on: merging accepts them, but the gates
+#     have not been run on them yet;
 #   - `--stop-on-trace` files in `top1`: the top-N search ignores the cut
 #     strategy, so its N = 1 run is the default Dfs search, not the one asked for;
 #   - `--diff` files in `replay`: the port has no diff-mode prover.
@@ -103,7 +103,7 @@ select_files() {
             printf '%s\tdiff mode (no diff-mode prover)\n' "$rel" >> "$WORK/skipped.tsv"; continue
         fi
         if [ "${MERGE:-1}" = 1 ] && [ -f "$CORPUS/$rel" ] && is_sapic "$rel"; then
-            printf '%s\tSAPIC (merging refuses theories with processes)\n' "$rel" >> "$WORK/skipped.tsv"; continue
+            printf '%s\tSAPIC (not yet gated with merging)\n' "$rel" >> "$WORK/skipped.tsv"; continue
         fi
         printf '%s\n' "$rel" >> "$WORK/files.txt"
     done < <(grep -v '^[[:space:]]*#' "$ALLOWLIST" | grep . | sort -u)

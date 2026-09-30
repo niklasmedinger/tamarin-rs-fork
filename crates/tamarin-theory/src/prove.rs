@@ -607,6 +607,13 @@ fn lemma_source_kind(lemma: &crate::theory::Lemma) -> SourceKind {
 /// lemma's `lemmaSourceKind`).  `pcHiddenLemmas` is populated from the
 /// PROVED lemma's own `[hide_lemma=..]` attributes (ClosedTheory.hs:97-138, see line 109),
 /// so the hidden set is computed here from `lemma_name`'s attributes.
+/// The actions the theory's lemmas mention: their formulas reach the
+/// systems, so the canonicalizer's color table must cover them
+/// ([`ProofContext::cover_lemma_actions`]).
+fn lemma_action_names(theory: &crate::theory::Theory) -> std::collections::BTreeSet<String> {
+    crate::canon_color::formula_action_names(theory.lemmas().map(|l| &l.formula))
+}
+
 /// HS uses `formulaToGuarded_` (fail-loud) on each reuse formula, so a
 /// non-guardable reuse formula propagates a `ProveError` rather than being
 /// silently dropped.
@@ -921,7 +928,7 @@ impl ProverSession {
         // base and template vars are re-freshened from `avoid sys` on
         // instantiation.
         let setup_counter_before = maude.fresh_counter_peek();
-        let template_ctx = ProofContext::new_with_restrictions_pool_forced(
+        let mut template_ctx = ProofContext::new_with_restrictions_pool_forced(
             maude.clone(),
             pool,
             rules,
@@ -929,6 +936,7 @@ impl ProverSession {
             &forced_injective_facts,
             ndc_cache.cloned(),
         );
+        template_ctx.cover_lemma_actions(lemma_action_names(&theory));
         maude.reset_counter_to(setup_counter_before);
         Ok(ProverSession {
             theory,
@@ -969,7 +977,7 @@ impl ProverSession {
         // so stamp the session's cut onto every per-lemma context.
         ctx.cut = self.cut;
         // RS-only, opt-in top-N search (`TAM_RS_TOP_METHODS`).
-        ctx.top_n = crate::constraint::solver::topn_search::config_for_lemma(theory.is_sapic);
+        ctx.top_n = crate::constraint::solver::topn_search::config_for_lemma();
         let session_in_file = &theory.in_file;
         ctx.heuristic = resolve_heuristic(
             &self.cli_heuristic,
@@ -1658,6 +1666,7 @@ pub fn build_lemma_proof_context(
         &forced_injective_facts,
         ndc_cache.cloned(),
     );
+    ctx.cover_lemma_actions(lemma_action_names(&theory));
     if trace {
         eprintln!(
             "[phase] ProofContext::new done dt={:.3}s",
@@ -1676,7 +1685,7 @@ pub fn build_lemma_proof_context(
     // `--stop-on-trace`).  Consumed once by `run_proof_search` below.
     ctx.cut = cut;
     // RS-only, opt-in top-N search (`TAM_RS_TOP_METHODS`).
-    ctx.top_n = crate::constraint::solver::topn_search::config_for_lemma(theory.is_sapic);
+    ctx.top_n = crate::constraint::solver::topn_search::config_for_lemma();
 
     // Resolve the goal-ranking heuristic.  HS `selectHeuristic prover ctx =
     // ... apDefaultHeuristic prover <|> L.get pcHeuristic ctx`

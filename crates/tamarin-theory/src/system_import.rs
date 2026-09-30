@@ -692,6 +692,7 @@ mod tests {
             &crate::constraint::solver::context::IntrRuleCache::from(
                 crate::intruder_rules::special_intruder_rules(false),
             ),
+            &std::collections::BTreeSet::new(),
         )
     }
 
@@ -729,6 +730,7 @@ mod tests {
         crate::canon_color::ColorTable::build(
             &protocol_rules,
             &crate::constraint::solver::context::IntrRuleCache::from(Vec::new()),
+            &std::collections::BTreeSet::new(),
         )
     }
 }

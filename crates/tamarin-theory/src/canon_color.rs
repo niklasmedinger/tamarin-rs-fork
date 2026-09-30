@@ -54,9 +54,12 @@
 //!    proof search can ever instantiate (see [`ColorTable::build`]'s own
 //!    doc comment for where that cache comes from), so there is nothing
 //!    left to hardcode a parallel list for.
-//! 4. One specific theory's own protocol rule names and protocol action
-//!    names — collected from the `&[OpenProtoRule]` the caller supplies,
-//!    each sorted independently (`BTreeSet`, so the source file's
+//! 4. One specific theory's own protocol rule names and action names —
+//!    collected from the `&[OpenProtoRule]` the caller supplies, plus the
+//!    action names only its restrictions and lemmas mention (a lemma can
+//!    ask for an action no rule produces, e.g. one whose rule an `#ifdef`
+//!    removed; the lemma's formula still puts it into the systems). Each
+//!    set sorted independently (`BTreeSet`, so the source file's
 //!    declaration order never leaks in), and colored in that order.
 //!
 //! Within each of blocks 3 and 4, rule names are colored before action
@@ -250,13 +253,23 @@ impl ColorTable {
     /// `ProtoRuleName::Fresh`, or an intruder rule `intruder_rules`
     /// contains — so those two arguments alone are enough (no `&Theory`
     /// needed; see the module docs' "why this table takes..." section).
+    /// Actions are the exception: a restriction or lemma can mention an
+    /// action no rule produces, and its formula still brings the action
+    /// into the systems. `formula_actions` names them
+    /// ([`guarded_action_names`], [`formula_action_names`]); names the
+    /// rules already cover, or built-in ones, may repeat there.
     ///
     /// Deterministic given `protocol_rules`' and `intruder_rules`' sets
-    /// of rule/action NAMES (resp. `IntrRuleACInfo` values) alone: the
-    /// same inputs always produce the same table, regardless of what
-    /// order the rules happen to arrive in (collected into `BTreeSet`s/
-    /// a `BTreeMap` before any color is assigned).
-    pub fn build(protocol_rules: &[OpenProtoRule], intruder_rules: &IntrRuleCache) -> Self {
+    /// of rule/action NAMES (resp. `IntrRuleACInfo` values) and
+    /// `formula_actions` alone: the same inputs always produce the same
+    /// table, regardless of what order the rules happen to arrive in
+    /// (collected into `BTreeSet`s/a `BTreeMap` before any color is
+    /// assigned).
+    pub fn build(
+        protocol_rules: &[OpenProtoRule],
+        intruder_rules: &IntrRuleCache,
+        formula_actions: &BTreeSet<String>,
+    ) -> Self {
         let builtin_actions: BTreeSet<&str> = BUILTIN_ACTION_NAMES.into_iter().collect();
 
         let mut theory_rule_names: BTreeSet<&'static str> = BTreeSet::new();
@@ -290,6 +303,7 @@ impl ColorTable {
             max_conc_count = max_conc_count.max(r.rule.conclusions.len());
             max_prem_count = max_prem_count.max(r.rule.premises.len());
         }
+        theory_action_names.extend(formula_actions.iter().cloned());
         // Actions have no structural tag distinguishing "built-in" from
         // "user-declared" (`GFact`/`LNFact` carry only a bare name
         // string — see `BUILTIN_ACTION_NAMES`'s own doc comment), so a
@@ -401,8 +415,8 @@ impl ColorTable {
         self.theory_action_colors.get(name).copied().unwrap_or_else(|| {
             panic!(
                 "ColorTable::action_color: {name:?} is neither a built-in action \
-                 name nor a protocol action name this table was built from (see \
-                 this module's completeness caveat)"
+                 name nor an action of the rules, restrictions or lemmas this \
+                 table was built from (see this module's completeness caveat)"
             )
         })
     }
@@ -494,6 +508,62 @@ fn erase_variables(t: LNTerm) -> LNTerm {
     t.map_free(&mut |v| LVar::new("_", v.sort, 0))
 }
 
+// =============================================================================
+// Action names of formulas ([`ColorTable::build`]'s `formula_actions`)
+// =============================================================================
+
+/// The action names in guarded formulas (a proof context's restrictions),
+/// guards included.
+pub fn guarded_action_names<'a>(
+    formulas: impl IntoIterator<Item = &'a crate::guarded::Guarded>,
+) -> BTreeSet<String> {
+    use crate::guarded::Guarded;
+    use crate::guarded_types::GAtom;
+    fn atom(a: &GAtom, out: &mut BTreeSet<String>) {
+        if let GAtom::Action(fact, _) = a {
+            out.insert(fact.name.clone());
+        }
+    }
+    fn walk(g: &Guarded, out: &mut BTreeSet<String>) {
+        match g {
+            Guarded::Atom(a) => atom(a, out),
+            Guarded::Disj(gs) | Guarded::Conj(gs) => gs.iter().for_each(|g| walk(g, out)),
+            Guarded::GGuarded { guards, body, .. } => {
+                guards.iter().for_each(|a| atom(a, out));
+                walk(body, out);
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    formulas.into_iter().for_each(|g| walk(g, &mut out));
+    out
+}
+
+/// The action names in parsed formulas (a theory's lemmas). Elaboration
+/// has already expanded predicates, so every action is an `Action` atom.
+pub fn formula_action_names<'a>(
+    formulas: impl IntoIterator<Item = &'a tamarin_parser::ast::Formula>,
+) -> BTreeSet<String> {
+    use tamarin_parser::ast::{Atom, Formula};
+    fn walk(f: &Formula, out: &mut BTreeSet<String>) {
+        match f {
+            Formula::False | Formula::True => {}
+            Formula::Atom(Atom::Action(fact, _)) => {
+                out.insert(fact.name.clone());
+            }
+            Formula::Atom(_) => {}
+            Formula::Not(f) | Formula::Forall(_, f) | Formula::Exists(_, f) => walk(f, out),
+            Formula::And(a, b) | Formula::Or(a, b) | Formula::Implies(a, b) | Formula::Iff(a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    formulas.into_iter().for_each(|f| walk(f, &mut out));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,7 +606,13 @@ mod tests {
             &elaborated.signature.maude_sig,
             &maude,
         ));
-        Some(ColorTable::build(&protocol_rules, &intruder_rules))
+        let formula_actions = formula_action_names(
+            elaborated
+                .lemmas()
+                .map(|l| &l.formula)
+                .chain(elaborated.restrictions().map(|r| &r.formula)),
+        );
+        Some(ColorTable::build(&protocol_rules, &intruder_rules, &formula_actions))
     }
 
     const EMPTY: &str = "theory T begin\nend";
@@ -800,6 +876,75 @@ mod tests {
         let Some(table) = table_for(COLLIDING) else { return };
         let Some(empty_table) = table_for(EMPTY) else { return };
         assert_eq!(table.action_color("Fr"), empty_table.action_color("Fr"));
+    }
+
+    // -- Actions only formulas mention ---------------------------------------
+
+    /// Like `testParser/define.spthy` under `-D=A -D=B -D=C`: no rule
+    /// produces `Asked` or `Restricted` (there, an `#ifdef` removed their
+    /// rules), but a lemma and a restriction mention them, and their
+    /// formulas bring them into the systems.
+    const FORMULA_ONLY: &str = "theory T begin\n\
+        rule R:\n  [] --[ Alpha() ]-> []\n\
+        restriction OnlyOnce:\n  \"All #i #j. Restricted() @ i & Restricted() @ j ==> #i = #j\"\n\
+        lemma L:\n  exists-trace\n  \"Ex #i. Asked() @ i\"\n\
+        end";
+
+    #[test]
+    fn actions_only_formulas_mention_get_colors_of_their_own() {
+        let Some(table) = table_for(FORMULA_ONLY) else { return };
+        let alpha = table.action_color("Alpha");
+        let asked = table.action_color("Asked");
+        let restricted = table.action_color("Restricted");
+        // One sorted set with the rules' actions, not a block of its own.
+        assert!(alpha < asked && asked < restricted);
+        assert!(BUILTIN_ACTION_NAMES
+            .iter()
+            .all(|n| ![alpha, asked, restricted].contains(&table.action_color(n))));
+    }
+
+    #[test]
+    fn formula_action_names_walks_every_connective() {
+        let lemma = theory(
+            "theory T begin\n\
+             lemma L:\n  \"All x #i. A(x) @ i ==> (Ex #j. B(x) @ j & not(Ex #k. C() @ k)) | \
+             (All #k. D() @ k ==> E() @ k)\"\n\
+             end",
+        );
+        let names = formula_action_names(lemma.lemmas().map(|l| &l.formula));
+        assert_eq!(names, ["A", "B", "C", "D", "E"].map(String::from).into());
+    }
+
+    /// The prover's path: the context constructor covers the restrictions'
+    /// actions (as guarded formulas), `cover_lemma_actions` the lemmas'.
+    #[test]
+    fn the_proof_context_colors_restriction_and_lemma_actions() {
+        let Some(path) = crate::test_maude::maude_path() else { return };
+        let elaborated = theory(FORMULA_ONLY);
+        let maude = MaudeHandle::start(&path, elaborated.signature.maude_sig.clone())
+            .unwrap_or_else(|e| panic!("maude at {path} failed to start: {e:?}"));
+        let restrictions: Vec<crate::guarded::Guarded> = elaborated
+            .restrictions()
+            .map(|r| crate::guarded::formula_to_guarded(&r.formula).expect("a guarded restriction"))
+            .collect();
+        let mut ctx = ProofContext::new_with_restrictions(
+            maude,
+            elaborated.rules().cloned().collect(),
+            restrictions,
+        );
+        ctx.color_table.action_color("Restricted");
+        ctx.cover_lemma_actions(formula_action_names(elaborated.lemmas().map(|l| &l.formula)));
+        ctx.color_table.action_color("Restricted");
+        ctx.color_table.action_color("Asked");
+    }
+
+    #[test]
+    #[should_panic(expected = "neither a built-in action name")]
+    fn an_action_nothing_mentions_still_panics() {
+        let Some(table) = table_for(FORMULA_ONLY) else {
+            panic!("neither a built-in action name"); // keep should_panic green under TAM_ALLOW_NO_MAUDE
+        };
+        table.action_color("Unknown");
     }
 
     // -- Shape refinement (`shape_colors`) ----------------------------------
