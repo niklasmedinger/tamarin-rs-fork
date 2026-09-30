@@ -38,6 +38,12 @@
 //! kept across iterations, so no method runs twice. [`SearchOrder::Bfs`] is
 //! the same engine with the shallowest entry first.
 //!
+//! The limit applies to a path's cost, not its depth: each step costs one,
+//! plus `idx * alt_cost` for the heuristic's `idx`-th method
+//! ([`TopNConfig::alt_cost`], default 0, where the cost is the depth). A
+//! positive `alt_cost` lets the heuristic's first choices run deeper than
+//! alternatives within one iteration.
+//!
 //! ## Concurrency
 //!
 //! Each step takes a batch of up to B entries and runs in three phases:
@@ -46,8 +52,9 @@
 //! the expensive part), integrate (sequential, in selection order: merge,
 //! push entries, propagate statuses). Workers never touch the graph, and each
 //! gets its own maude handle whose counter is seeded from its system
-//! ([`WorkerEnv`]), so the outcome depends on B but not on the thread count
-//! or on timing. A trace found by any worker cancels the rest of its batch.
+//! ([`WorkerEnv`]). A batch always runs to completion, also when one of its
+//! tasks finds a trace; the search stops after it. So the outcome depends on
+//! B but not on the thread count or on timing, the deadline apart.
 //!
 //! ## Output
 //!
@@ -67,11 +74,13 @@
 //! - `TAM_RS_MERGE` (presence): merge canonically equal systems (needs `bliss`);
 //! - `TAM_RS_TOPN_BATCH=B`: entries expanded per step, default the rayon
 //!   thread count; pin it for reproducible runs;
-//! - `TAM_RS_TOPN_STATS` (presence): one summary line per search on stderr.
+//! - `TAM_RS_TOPN_ALT_COST=W`: what an alternative method adds to a path's
+//!   cost against the depth limit, times its rank; default 0;
+//! - `TAM_RS_TOPN_STATS` (presence): one summary line per search on stderr,
+//!   and one per iteration.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -117,6 +126,12 @@ pub struct TopNConfig {
     pub merge: bool,
     /// Frontier entries expanded concurrently per step.
     pub batch: usize,
+    /// What a method of heuristic rank `idx` adds to a path's cost beyond its
+    /// one level: `idx * alt_cost`. [`SearchOrder::IdDfs`]'s depth limit
+    /// applies to this cost, so with `alt_cost > 0` the heuristic's first
+    /// choices reach deeper than alternatives within one iteration; `0` makes
+    /// the cost the depth.
+    pub alt_cost: u32,
 }
 
 fn parse_positive(var: &str, value: &str) -> usize {
@@ -125,6 +140,12 @@ fn parse_positive(var: &str, value: &str) -> usize {
         .ok()
         .filter(|&n| n >= 1)
         .unwrap_or_else(|| panic!("{var}={value:?}: expected a positive integer"))
+}
+
+fn parse_u32(var: &str, value: &str) -> u32 {
+    value
+        .parse::<u32>()
+        .unwrap_or_else(|_| panic!("{var}={value:?}: expected a non-negative integer"))
 }
 
 /// The configuration from the environment, read once per process; `None`
@@ -150,11 +171,17 @@ pub fn top_n_from_env() -> Option<TopNConfig> {
             Ok(v) => parse_positive("TAM_RS_TOPN_BATCH", &v),
             Err(e) => panic!("TAM_RS_TOPN_BATCH: {e}"),
         };
+        let alt_cost = match std::env::var("TAM_RS_TOPN_ALT_COST") {
+            Err(std::env::VarError::NotPresent) => 0,
+            Ok(v) => parse_u32("TAM_RS_TOPN_ALT_COST", &v),
+            Err(e) => panic!("TAM_RS_TOPN_ALT_COST: {e}"),
+        };
         Some(TopNConfig {
             n,
             order,
             merge: tamarin_utils::env_gate!("TAM_RS_MERGE"),
             batch,
+            alt_cost,
         })
     })
 }
@@ -187,7 +214,7 @@ const ROOT: ClassId = 0;
 
 /// The first depth limit of [`SearchOrder::IdDfs`], as in the greedy driver.
 const FIRST_LIMIT: u32 = 4;
-/// Depths stay far below this; it only keeps the doubling from overflowing.
+/// Depths stay far below this; it only keeps `depth + 1` from overflowing.
 const DEPTH_CAP: u32 = u32::MAX / 4;
 
 /// A final verdict about a class: a property of its constraint systems, so
@@ -232,14 +259,17 @@ struct Class {
     status: Status,
     /// The shallowest depth the class was reached at: its entries' depth.
     min_depth: u32,
+    /// The cheapest cost the class was reached at ([`TopNConfig::alt_cost`]);
+    /// tracked apart from `min_depth`, which may come from another path.
+    min_cost: u32,
     /// Applied methods, in the heuristic's order.
     ands: Vec<And>,
     /// No further method will be applied: N were, the candidates ran out,
     /// or the class is a leaf.
     closed: bool,
-    /// `(depth, rank)` of the class's one live frontier entry: `None` while
-    /// it is being expanded or has no entry. Any other entry is stale.
-    pending: Option<(u32, u32)>,
+    /// The class's one live frontier entry: `None` while it is being expanded
+    /// or has no entry. Any other entry of the class is stale.
+    pending: Option<Pending>,
     parents: Vec<(ClassId, u16)>,
     /// The edge that created the class; `None` for the root.
     first_parent: Option<(ClassId, u16)>,
@@ -284,12 +314,17 @@ impl SearchGraph {
         &mut self.classes[c as usize]
     }
 
-    fn add_class(&mut self, status: Status, depth: u32) -> ClassId {
+    fn add_class(&mut self, status: Status, depth: u32, cost: u32) -> ClassId {
         let id = ClassId::try_from(self.classes.len()).expect("more than u32::MAX classes");
-        let settled_at = if status == Status::Open { 0 } else { self.tick() };
+        let settled_at = if status == Status::Open {
+            0
+        } else {
+            self.tick()
+        };
         self.classes.push(Class {
             status,
             min_depth: depth,
+            min_cost: cost,
             ands: Vec::new(),
             closed: status != Status::Open,
             pending: None,
@@ -334,8 +369,16 @@ impl SearchGraph {
             })
     }
 
-    fn entry_is_live(&self, e: &Entry) -> bool {
-        self.class(e.class.0).pending == Some((e.depth, e.rank))
+    /// The class's [`Pending`] if `e`, popped from the frontier, is its live
+    /// entry; `None` for a stale one.
+    fn live(&self, e: &Entry) -> Option<Pending> {
+        let pending = self.class(e.class.0).pending.filter(|p| p.entry == *e)?;
+        assert!(
+            !pending.parked,
+            "top-N search: a live entry is in the frontier and parked at once (class #{})",
+            e.class.0
+        );
+        Some(pending)
     }
 
     fn and_status(&self, c: ClassId, a: u16) -> Status {
@@ -383,11 +426,13 @@ impl SearchGraph {
                 Status::Open => all_unfinishable = false,
             }
         }
-        assert!(
-            !(solved && contradictory),
-            "top-N search: two methods of class #{c} disagree, one finds a trace and \
-             another proves there is none: a false-positive merge or a solver bug"
-        );
+        if solved && contradictory {
+            panic!(
+                "top-N search: two methods of class #{c} disagree, one finds a trace and \
+                 another proves there is none: a false-positive merge or a solver bug\n{}",
+                self.describe_conflict(c)
+            );
+        }
         if solved {
             Status::Settled(Settled::Solved)
         } else if contradictory {
@@ -397,6 +442,62 @@ impl SearchGraph {
         } else {
             Status::Open
         }
+    }
+
+    /// The `method [case]` steps from the root to `c` along first-parent
+    /// edges: a proof path that reaches the class's representative system.
+    /// A parent is always created before its children, so this ends.
+    fn path_to(&self, c: ClassId) -> String {
+        let mut steps = Vec::new();
+        let mut cur = c;
+        while let Some((p, a)) = self.class(cur).first_parent {
+            let and = &self.class(p).ands[a as usize];
+            let case = and
+                .cases
+                .iter()
+                .find(|&&(_, child)| child == cur)
+                .map_or("?", |(name, _)| name.as_str());
+            steps.push(format!(
+                "{} [{case}]",
+                crate::pretty_theory::pretty_proof_method_inline(&and.method)
+            ));
+            cur = p;
+        }
+        steps.reverse();
+        if steps.is_empty() {
+            "<root>".into()
+        } else {
+            steps.join(" -> ")
+        }
+    }
+
+    /// For a class whose methods disagree: its path and, per method that
+    /// settled, its cases with how many edges reach each case's class (a
+    /// merged class, reached along several, is where a false positive hides).
+    fn describe_conflict(&self, c: ClassId) -> String {
+        let class = self.class(c);
+        let mut out = format!("  path to #{c}: {}\n", self.path_to(c));
+        for (i, and) in class.ands.iter().enumerate() {
+            if and.status == Status::Open {
+                continue;
+            }
+            out += &format!(
+                "  method {i} ({:?}): {}\n",
+                and.status,
+                crate::pretty_theory::pretty_proof_method_inline(&and.method)
+            );
+            for (name, child) in &and.cases {
+                let cl = self.class(*child);
+                out += &format!(
+                    "    case {name} -> #{child} {:?}, reached along {} edge(s), first via {}\n",
+                    cl.status,
+                    cl.parents.len(),
+                    cl.first_parent
+                        .map_or("-".into(), |(p, a)| format!("#{p} method {a}"))
+                );
+            }
+        }
+        out
     }
 
     /// Re-derives `c`'s status after one of its methods changed or it was
@@ -446,8 +547,10 @@ impl SearchGraph {
 // The frontier
 // =============================================================================
 
-/// "Apply the next method of `class`", ordered for a max-heap. The derived
-/// order compares the fields top to bottom.
+/// "Apply the next method of `class`". Its fields are exactly the frontier
+/// order, compared top to bottom by the derived `Ord` of a max-heap. The
+/// cost, which decides only whether the entry runs in this iteration, is in
+/// the class's [`Pending`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Entry {
     /// `depth` ([`SearchOrder::IdDfs`]) or `u32::MAX - depth`
@@ -457,7 +560,6 @@ struct Entry {
     rank: u32,
     /// The oldest class first among equals.
     class: Reverse<ClassId>,
-    depth: u32,
 }
 
 impl Entry {
@@ -470,9 +572,21 @@ impl Entry {
             primary,
             rank,
             class: Reverse(class),
-            depth,
         }
     }
+}
+
+/// A class's live entry, with what the order leaves out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pending {
+    entry: Entry,
+    depth: u32,
+    /// The class's cheapest cost plus `idx * alt_cost`: the entry runs in the
+    /// first iteration whose limit exceeds it.
+    cost: u32,
+    /// Whether the entry waits in [`Engine::parked`] rather than in the
+    /// frontier.
+    parked: bool,
 }
 
 // =============================================================================
@@ -530,10 +644,9 @@ enum Outcome {
         method_fp: Option<Fingerprint>,
         cases: Vec<(String, Child)>,
     },
-    /// No candidate is left that applies.
-    Exhausted,
-    /// The deadline passed or another worker found a trace; the result is
-    /// discarded.
+    /// No proof method can be applied anymore.
+    Terminal,
+    /// The deadline passed; the result is discarded.
     Aborted,
 }
 
@@ -559,6 +672,14 @@ struct WorkStats {
 /// step, so a handle shared by two threads would race; seeding each task's
 /// counter from its system also keeps the results independent of the
 /// thread that runs them.
+///
+/// The handle always talks to the lemma's own maude process, never to one
+/// from `maude_pool`: a pooled process can return an AC-equal result with
+/// its arguments in another order, and whether a task gets a pooled process
+/// depends on what the other lemmas' searches hold at that moment, so the
+/// printed proof would depend on timing. Maude calls then take turns on one
+/// process, which cost nothing measurable where tried (the solver's own work
+/// and canonicalization dominate).
 struct WorkerEnv {
     deadline: Option<Instant>,
     user_funs: CollectedUserFuns,
@@ -579,15 +700,8 @@ impl WorkerEnv {
     fn run<R>(&self, ctx: &ProofContext, avoid_next: u64, f: impl FnOnce(&ProofContext) -> R) -> R {
         let previous_deadline = search::replace_deadline(self.deadline);
         let _user_funs = crate::elaborate::set_user_funs_from_collected(&self.user_funs);
-        // Non-blocking, like the greedy fan-out: a drained pool falls back to
-        // the shared process under a counter of the task's own.
-        let pooled = ctx.maude_pool.as_ref().and_then(|pool| pool.try_acquire());
-        let maude = match &pooled {
-            Some(p) => p.handle().with_fresh_counter_next(avoid_next),
-            None => ctx.maude.with_fresh_counter_next(avoid_next),
-        };
+        let maude = ctx.maude.with_fresh_counter_next(avoid_next);
         let result = f(&ctx.with_swapped_maude(maude));
-        drop(pooled);
         search::replace_deadline(previous_deadline);
         result
     }
@@ -608,21 +722,9 @@ fn canonical_key(
 }
 
 /// Prepares one case: finished, or else keyed for merging.
-fn classify(
-    ctx: &ProofContext,
-    sys: System,
-    merge: bool,
-    found_trace: &AtomicBool,
-    work: &mut WorkStats,
-) -> Child {
+fn classify(ctx: &ProofContext, sys: System, merge: bool, work: &mut WorkStats) -> Child {
     if let Some(result) = is_finished(ctx, &sys) {
-        let settled = Settled::of(&result);
-        if settled == Settled::Solved {
-            // A solution of this system solves every system above it, so the
-            // root is Solved and the rest of the batch is moot.
-            found_trace.store(true, Ordering::Relaxed);
-        }
-        return Child::Finished(settled);
+        return Child::Finished(Settled::of(&result));
     }
     if merge {
         let (key, labelling) = canonical_key(ctx, &sys, work);
@@ -633,7 +735,7 @@ fn classify(
 }
 
 /// Applies the class's next applicable method and prepares its cases.
-fn expand_task(ctx: &ProofContext, task: Task, merge: bool, found_trace: &AtomicBool) -> Expansion {
+fn expand_task(ctx: &ProofContext, task: Task, merge: bool) -> Expansion {
     let start = Instant::now();
     let Task {
         class,
@@ -642,7 +744,7 @@ fn expand_task(ctx: &ProofContext, task: Task, merge: bool, found_trace: &Atomic
         mut stored,
     } = task;
     let mut work = WorkStats::default();
-    let stop = || search::deadline_reached() || found_trace.load(Ordering::Relaxed);
+    let stop = search::deadline_reached;
     if stored.ranked.is_none() {
         stored.ranked = Some(candidate_methods(&stored.sys, ctx, depth as usize));
     }
@@ -652,7 +754,7 @@ fn expand_task(ctx: &ProofContext, task: Task, merge: bool, found_trace: &Atomic
         }
         let ranked = stored.ranked.as_ref().expect("ranked above");
         let Some(method) = ranked.get(stored.cursor).cloned() else {
-            break Outcome::Exhausted;
+            break Outcome::Terminal;
         };
         work.execs += 1;
         let Some(mut cases) = exec_proof_method(ctx, &method, &stored.sys) else {
@@ -675,7 +777,7 @@ fn expand_task(ctx: &ProofContext, task: Task, merge: bool, found_trace: &Atomic
                 let child = if cut_children {
                     Child::Cut
                 } else {
-                    classify(ctx, sys, merge, found_trace, &mut work)
+                    classify(ctx, sys, merge, &mut work)
                 };
                 (name, child)
             })
@@ -709,6 +811,15 @@ enum End {
     Deadline,
 }
 
+/// The counters at the start of an iteration, for its report.
+struct IterationStart {
+    at: Instant,
+    classes: usize,
+    applied: u64,
+    execs: u64,
+    canons: u64,
+}
+
 #[derive(Debug, Default)]
 struct Stats {
     iterations: u32,
@@ -730,8 +841,10 @@ struct Engine<'a> {
     /// Indexed by class; see [`Stored`].
     store: Vec<Option<Stored>>,
     frontier: BinaryHeap<Entry>,
-    parked: Vec<Entry>,
-    found_trace: AtomicBool,
+    /// Classes whose live entry waits for a higher limit
+    /// ([`Pending::parked`]). A class may appear twice; it gets its entry
+    /// back once.
+    parked: Vec<ClassId>,
     /// `--bound`: no class at this depth or deeper is expanded.
     bound: u32,
     deadline: Instant,
@@ -747,23 +860,52 @@ impl<'a> Engine<'a> {
             store: Vec::new(),
             frontier: BinaryHeap::new(),
             parked: Vec::new(),
-            found_trace: AtomicBool::new(false),
             bound,
             deadline,
             stats: Stats::default(),
         }
     }
 
-    fn add_class(&mut self, status: Status, depth: u32, stored: Option<Stored>) -> ClassId {
-        let id = self.graph.add_class(status, depth);
+    fn add_class(
+        &mut self,
+        status: Status,
+        depth: u32,
+        cost: u32,
+        stored: Option<Stored>,
+    ) -> ClassId {
+        let id = self.graph.add_class(status, depth, cost);
         self.store.push(stored);
         id
     }
 
+    /// `idx * alt_cost`: what applying the heuristic's `idx`-th method adds.
+    fn alt_cost(&self, idx: u32) -> u32 {
+        idx.saturating_mul(self.config.alt_cost)
+    }
+
+    /// Makes "apply `c`'s method of rank `rank`" the class's live entry, at
+    /// its current depth and cost. The frontier gets the entry unless it
+    /// already holds this one: then only the cost changed, which is not part
+    /// of the order.
     fn push_entry(&mut self, c: ClassId, rank: u32) {
-        let depth = self.graph.class(c).min_depth;
-        self.graph.class_mut(c).pending = Some((depth, rank));
-        self.frontier.push(Entry::new(self.config.order, depth, rank, c));
+        let class = self.graph.class(c);
+        let depth = class.min_depth;
+        let cost = class
+            .min_cost
+            .saturating_add(self.alt_cost(self.config.n - rank));
+        let entry = Entry::new(self.config.order, depth, rank, c);
+        let queued = class
+            .pending
+            .is_some_and(|p| p.entry == entry && !p.parked);
+        self.graph.class_mut(c).pending = Some(Pending {
+            entry,
+            depth,
+            cost,
+            parked: false,
+        });
+        if !queued {
+            self.frontier.push(entry);
+        }
     }
 
     /// `N - idx` of `c`'s next method.
@@ -776,40 +918,40 @@ impl<'a> Engine<'a> {
         let child = if self.bound == 0 {
             Child::Cut
         } else {
-            classify(self.ctx, sys, self.config.merge, &self.found_trace, &mut work)
+            classify(self.ctx, sys, self.config.merge, &mut work)
         };
         self.stats.work.canons += work.canons;
         self.stats.work.canon_time += work.canon_time;
-        let root = self.intern(child, 0);
+        let root = self.intern(child, 0, 0);
         assert_eq!(root, ROOT, "the root is the first class");
     }
 
-    /// The class of a prepared case reached at `depth`: a new one, or with
-    /// merging an existing one reached again.
-    fn intern(&mut self, child: Child, depth: u32) -> ClassId {
+    /// The class of a prepared case reached at `depth` and `cost`: a new one,
+    /// or with merging an existing one reached again.
+    fn intern(&mut self, child: Child, depth: u32, cost: u32) -> ClassId {
         match child {
             Child::Cut => {
-                let c = self.add_class(Status::Open, depth, None);
+                let c = self.add_class(Status::Open, depth, cost, None);
                 self.graph.class_mut(c).closed = true;
                 c
             }
             Child::Finished(settled) => {
                 self.stats.leaves += 1;
-                self.add_class(Status::Settled(settled), depth, None)
+                self.add_class(Status::Settled(settled), depth, cost, None)
             }
             Child::Unkeyed(stored) => {
-                let c = self.add_class(Status::Open, depth, Some(stored));
+                let c = self.add_class(Status::Open, depth, cost, Some(stored));
                 self.push_entry(c, self.config.n);
                 c
             }
             Child::Keyed(key, stored) => {
                 if let Some(&existing) = self.graph.by_key.get(&key) {
                     self.stats.merges += 1;
-                    self.lower_depth(existing, depth);
+                    self.lower(existing, depth, cost);
                     self.requeue_if_dormant(existing);
                     return existing;
                 }
-                let c = self.add_class(Status::Open, depth, Some(stored));
+                let c = self.add_class(Status::Open, depth, cost, Some(stored));
                 self.graph.by_key.insert(key, c);
                 self.push_entry(c, self.config.n);
                 c
@@ -817,21 +959,30 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Records that `c` was reached at `depth`, and its descendants
-    /// correspondingly shallower. A live entry moves to the new depth; the
-    /// old one goes stale.
-    fn lower_depth(&mut self, c: ClassId, depth: u32) {
-        let mut work = vec![(c, depth)];
-        while let Some((c, depth)) = work.pop() {
-            if depth >= self.graph.class(c).min_depth {
+    /// Records that `c` was reached at `depth` and `cost`, and its descendants
+    /// correspondingly: each minimum is lowered on its own. A live entry
+    /// moves to the new values: a shallower one replaces it in the frontier,
+    /// leaving the old one stale; a cheaper one keeps its place, or comes
+    /// back from the parked ones, whose limit it may now be under.
+    fn lower(&mut self, c: ClassId, depth: u32, cost: u32) {
+        let mut work = vec![(c, depth, cost)];
+        while let Some((c, depth, cost)) = work.pop() {
+            let class = self.graph.class(c);
+            if depth >= class.min_depth && cost >= class.min_cost {
                 continue;
             }
-            self.graph.class_mut(c).min_depth = depth;
-            if let Some((_, rank)) = self.graph.class(c).pending {
-                self.push_entry(c, rank);
+            let (depth, cost) = (depth.min(class.min_depth), cost.min(class.min_cost));
+            let class = self.graph.class_mut(c);
+            class.min_depth = depth;
+            class.min_cost = cost;
+            if let Some(pending) = class.pending {
+                self.push_entry(c, pending.entry.rank);
             }
-            for and in &self.graph.class(c).ands {
-                work.extend(and.cases.iter().map(|&(_, child)| (child, depth + 1)));
+            for (a, and) in self.graph.class(c).ands.iter().enumerate() {
+                let step = cost
+                    .saturating_add(self.alt_cost(a as u32))
+                    .saturating_add(1);
+                work.extend(and.cases.iter().map(|&(_, child)| (child, depth + 1, step)));
             }
         }
     }
@@ -849,6 +1000,20 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Moves the parked entries back into the frontier for the next
+    /// iteration. A class listed twice gets its entry back once, and one whose
+    /// entry was replaced meanwhile ([`Self::push_entry`]) gets none.
+    fn unpark(&mut self) {
+        for c in std::mem::take(&mut self.parked) {
+            let Some(pending) = self.graph.class_mut(c).pending.as_mut().filter(|p| p.parked) else {
+                continue;
+            };
+            pending.parked = false;
+            let entry = pending.entry;
+            self.frontier.push(entry);
+        }
+    }
+
     /// Phase 1: pops up to B live, relevant entries below `limit`.
     fn select_batch(&mut self, limit: u32) -> Vec<Task> {
         let mut tasks = Vec::new();
@@ -856,9 +1021,9 @@ impl<'a> Engine<'a> {
             let Some(e) = self.frontier.pop() else {
                 break;
             };
-            if !self.graph.entry_is_live(&e) {
+            let Some(pending) = self.graph.live(&e) else {
                 continue;
-            }
+            };
             let c = e.class.0;
             if self.graph.class(c).status != Status::Open {
                 self.graph.class_mut(c).pending = None;
@@ -871,8 +1036,14 @@ impl<'a> Engine<'a> {
                 self.graph.class_mut(c).pending = None;
                 continue;
             }
-            if e.depth >= limit {
-                self.parked.push(e);
+            // Nothing is parked at the largest limit: a saturated cost must
+            // not keep an entry parked forever.
+            if pending.cost >= limit && limit < u32::MAX {
+                self.graph.class_mut(c).pending = Some(Pending {
+                    parked: true,
+                    ..pending
+                });
+                self.parked.push(c);
                 continue;
             }
             self.graph.class_mut(c).pending = None;
@@ -881,8 +1052,8 @@ impl<'a> Engine<'a> {
                 .expect("a class with a live entry keeps its system");
             tasks.push(Task {
                 class: c,
-                depth: e.depth,
-                cut_children: e.depth + 1 >= self.bound,
+                depth: pending.depth,
+                cut_children: pending.depth + 1 >= self.bound,
                 stored,
             });
         }
@@ -897,11 +1068,10 @@ impl<'a> Engine<'a> {
         let results = {
             let ctx = self.ctx;
             let merge = self.config.merge;
-            let found_trace = &self.found_trace;
             let expand = |task: Task| -> Expansion {
                 let avoid_next = avoid_fresh_state(&task.stored.sys);
                 env.run(ctx, avoid_next, |worker_ctx| {
-                    expand_task(worker_ctx, task, merge, found_trace)
+                    expand_task(worker_ctx, task, merge)
                 })
             };
             if count == 1 {
@@ -935,7 +1105,7 @@ impl<'a> Engine<'a> {
                 self.stats.aborted += 1;
                 self.store[c as usize] = Some(stored);
             }
-            Outcome::Exhausted => self.graph.close(c),
+            Outcome::Terminal => self.graph.close(c),
             Outcome::Applied {
                 method,
                 method_fp,
@@ -943,9 +1113,14 @@ impl<'a> Engine<'a> {
             } => {
                 self.stats.applied += 1;
                 let a = self.graph.add_and(c, method, method_fp);
-                let depth = self.graph.class(c).min_depth + 1;
+                let class = self.graph.class(c);
+                let depth = class.min_depth + 1;
+                let cost = class
+                    .min_cost
+                    .saturating_add(self.alt_cost(u32::from(a)))
+                    .saturating_add(1);
                 for (name, child) in cases {
-                    let child = self.intern(child, depth);
+                    let child = self.intern(child, depth, cost);
                     self.graph.add_case(c, a, name, child);
                 }
                 let applied = self.graph.class(c).ands.len() as u32;
@@ -974,6 +1149,38 @@ impl<'a> Engine<'a> {
         }
     }
 
+    fn iteration_start(&self) -> IterationStart {
+        IterationStart {
+            at: Instant::now(),
+            classes: self.graph.classes.len(),
+            applied: self.stats.applied,
+            execs: self.stats.work.execs,
+            canons: self.stats.work.canons,
+        }
+    }
+
+    /// `TAM_RS_TOPN_STATS`: one line per iteration, with what it added and the
+    /// entries it parked at the limit.
+    fn report_iteration(&self, limit: u32, start: &IterationStart) {
+        if !tamarin_utils::env_gate!("TAM_RS_TOPN_STATS") {
+            return;
+        }
+        eprintln!(
+            "[topn-iter] lemma={} iteration={} limit={} classes=+{} applied=+{} execs=+{} \
+             canons=+{} parked={} root={:?} secs={:.3}",
+            self.ctx.lemma_name,
+            self.stats.iterations,
+            limit,
+            self.graph.classes.len() - start.classes,
+            self.stats.applied - start.applied,
+            self.stats.work.execs - start.execs,
+            self.stats.work.canons - start.canons,
+            self.parked.len(),
+            self.graph.class(ROOT).status,
+            start.at.elapsed().as_secs_f64(),
+        );
+    }
+
     fn search(&mut self, env: &WorkerEnv) -> End {
         let mut limit = match self.config.order {
             SearchOrder::IdDfs => FIRST_LIMIT.min(self.bound),
@@ -981,8 +1188,10 @@ impl<'a> Engine<'a> {
         };
         loop {
             self.stats.iterations += 1;
+            let start = self.iteration_start();
             loop {
                 if let Some(end) = self.end() {
+                    self.report_iteration(limit, &start);
                     return end;
                 }
                 let tasks = self.select_batch(limit);
@@ -994,16 +1203,18 @@ impl<'a> Engine<'a> {
                     self.integrate(result);
                 }
             }
+            self.report_iteration(limit, &start);
             if let Some(end) = self.end() {
                 return end;
             }
             if self.parked.is_empty() {
                 return End::Exhausted;
             }
-            // Parked entries lie below `bound`, so `limit < bound` here.
-            limit = limit.saturating_mul(2).min(self.bound);
-            let parked = std::mem::take(&mut self.parked);
-            self.frontier.extend(parked);
+            // The limit applies to the cost and `bound` to the depth: with
+            // `alt_cost`, an entry at a depth below `bound` can cost more than
+            // `bound`, so the limit keeps doubling past it.
+            limit = limit.saturating_mul(2);
+            self.unpark();
         }
     }
 }
@@ -1077,7 +1288,8 @@ impl Materializer<'_> {
     ) -> Vec<R> {
         let run = |item: T| -> R {
             let avoid_next = avoid_fresh_state(sys_of(&item));
-            self.env.run(ctx, avoid_next, |worker_ctx| f(worker_ctx, item))
+            self.env
+                .run(ctx, avoid_next, |worker_ctx| f(worker_ctx, item))
         };
         if items.len() <= 1 {
             items.into_iter().map(run).collect()
@@ -1088,7 +1300,13 @@ impl Materializer<'_> {
 
     /// The class of `sys`, reached at `depth`. Merging off, a case's class is
     /// the graph's (`known`); merging on, it is looked up by canonical key.
-    fn resolve(&self, ctx: &ProofContext, sys: System, depth: u32, known: Option<ClassId>) -> Resolved {
+    fn resolve(
+        &self,
+        ctx: &ProofContext,
+        sys: System,
+        depth: u32,
+        known: Option<ClassId>,
+    ) -> Resolved {
         if depth >= self.bound {
             return Resolved::Cut(sys);
         }
@@ -1170,7 +1388,9 @@ impl Materializer<'_> {
                 let status = search::node_status_of(&result);
                 leaf(ProofMethod::Finished(result), sys, status)
             }
-            Resolved::Class(sys, labelling, c) => self.expand(ctx, sys, labelling, c, depth, edge, path),
+            Resolved::Class(sys, labelling, c) => {
+                self.expand(ctx, sys, labelling, c, depth, edge, path)
+            }
         }
     }
 
@@ -1281,12 +1501,15 @@ impl Materializer<'_> {
             );
             and.cases.iter().map(|&(_, child)| Some(child)).collect()
         };
-        let items: Vec<((String, System), Option<ClassId>)> = cases.into_iter().zip(known).collect();
+        let items: Vec<((String, System), Option<ClassId>)> =
+            cases.into_iter().zip(known).collect();
         let resolved: Vec<(String, Resolved)> = self.map_workers(
             ctx,
             items,
             |((_, sys), _)| sys,
-            |worker_ctx, ((name, sys), known)| (name, self.resolve(worker_ctx, sys, depth + 1, known)),
+            |worker_ctx, ((name, sys), known)| {
+                (name, self.resolve(worker_ctx, sys, depth + 1, known))
+            },
         );
         let selected: Vec<(String, Resolved)> = match class.status {
             // A trace needs one path: the first case in name order that
@@ -1317,7 +1540,12 @@ impl Materializer<'_> {
                 ctx,
                 selected,
                 |(_, r)| r.sys(),
-                |worker_ctx, (name, r)| (name, self.build(worker_ctx, r, depth + 1, Some((c, a)), &path)),
+                |worker_ctx, (name, r)| {
+                    (
+                        name,
+                        self.build(worker_ctx, r, depth + 1, Some((c, a)), &path),
+                    )
+                },
             )
             .into_iter()
             .collect();
@@ -1357,7 +1585,9 @@ pub fn run(
     deadline: Instant,
 ) -> ProofNode {
     let start = Instant::now();
-    let bound = u32::try_from(proof_bound).unwrap_or(u32::MAX).min(DEPTH_CAP);
+    let bound = u32::try_from(proof_bound)
+        .unwrap_or(u32::MAX)
+        .min(DEPTH_CAP);
     let mut engine = Engine::new(ctx, config, bound, deadline);
     engine.add_root(initial.clone());
     let end = engine.search(&WorkerEnv::capture(Some(deadline)));
@@ -1401,9 +1631,17 @@ fn print_stats(
     } else {
         0.0
     };
+    // Classes reached along two or more edges: what merging saved a second
+    // expansion of.
+    let shared = engine
+        .graph
+        .classes
+        .iter()
+        .filter(|c| c.parents.len() > 1)
+        .count();
     eprintln!(
-        "[topn] lemma={} n={} order={:?} merge={} batch={} end={:?} root={:?} \
-         classes={} leaves={} merges={} execs={} applied={} canons={} canon_s={:.3} \
+        "[topn] lemma={} n={} order={:?} merge={} batch={} alt_cost={} end={:?} root={:?} \
+         classes={} leaves={} merges={} shared={} execs={} applied={} canons={} canon_s={:.3} \
          iterations={} batches={} tasks={} aborted={} efficiency={:.2} \
          search_s={:.3} materialize_s={:.3}",
         ctx.lemma_name,
@@ -1411,11 +1649,13 @@ fn print_stats(
         config.order,
         config.merge,
         config.batch,
+        config.alt_cost,
         end,
         root.status,
         engine.graph.classes.len(),
         s.leaves,
         s.merges,
+        shared,
         s.work.execs,
         s.applied,
         s.work.canons,
@@ -1437,11 +1677,11 @@ mod tests {
     // --- The graph (no maude) --------------------------------------------
 
     fn open(g: &mut SearchGraph) -> ClassId {
-        g.add_class(Status::Open, 0)
+        g.add_class(Status::Open, 0, 0)
     }
 
     fn leaf_class(g: &mut SearchGraph, settled: Settled) -> ClassId {
-        g.add_class(Status::Settled(settled), 0)
+        g.add_class(Status::Settled(settled), 0, 0)
     }
 
     /// Adds a method to `c` with `children` as its cases and propagates.
@@ -1463,7 +1703,10 @@ mod tests {
         and(&mut g, root, &[pending, contra]);
         assert_eq!(g.class(root).status, Status::Open);
         and(&mut g, root, &[contra, contra]);
-        assert_eq!(g.class(root).status, Status::Settled(Settled::Contradictory));
+        assert_eq!(
+            g.class(root).status,
+            Status::Settled(Settled::Contradictory)
+        );
     }
 
     #[test]
@@ -1525,7 +1768,10 @@ mod tests {
         and(&mut g, b, &[contra]);
         assert_eq!(g.class(b).settled_by, Some(1));
         assert_eq!(g.class(a).settled_by, Some(0));
-        assert_eq!(g.class(b).ands[0].status, Status::Settled(Settled::Contradictory));
+        assert_eq!(
+            g.class(b).ands[0].status,
+            Status::Settled(Settled::Contradictory)
+        );
         assert!(g.class(contra).settled_at < g.class(b).settled_at);
         assert!(g.class(b).settled_at < g.class(a).settled_at);
     }
@@ -1560,7 +1806,11 @@ mod tests {
         let root = open(&mut g);
         let unfinishable = leaf_class(&mut g, Settled::Unfinishable);
         and(&mut g, root, &[unfinishable]);
-        assert_eq!(g.class(root).status, Status::Open, "another method may still close it");
+        assert_eq!(
+            g.class(root).status,
+            Status::Open,
+            "another method may still close it"
+        );
         g.close(root);
         assert_eq!(g.class(root).status, Status::Settled(Settled::Unfinishable));
     }
@@ -1585,7 +1835,7 @@ mod tests {
             Entry::new(order, 3, 3, 4),
         ]);
         let popped: Vec<(u32, u32, ClassId)> =
-            std::iter::from_fn(|| heap.pop().map(|e| (e.depth, e.rank, e.class.0))).collect();
+            std::iter::from_fn(|| heap.pop().map(|e| (e.primary, e.rank, e.class.0))).collect();
         assert_eq!(popped, vec![(3, 3, 4), (3, 3, 7), (3, 1, 9), (2, 3, 5)]);
     }
 
@@ -1607,11 +1857,80 @@ mod tests {
         let c = open(&mut g);
         let old = Entry::new(SearchOrder::IdDfs, 5, 3, c);
         let new = Entry::new(SearchOrder::IdDfs, 2, 3, c);
-        g.class_mut(c).pending = Some((2, 3));
-        assert!(!g.entry_is_live(&old));
-        assert!(g.entry_is_live(&new));
+        g.class_mut(c).pending = Some(Pending {
+            entry: new,
+            depth: 2,
+            cost: 2,
+            parked: false,
+        });
+        assert!(g.live(&old).is_none());
+        assert!(g.live(&new).is_some());
         g.class_mut(c).pending = None;
-        assert!(!g.entry_is_live(&new));
+        assert!(g.live(&new).is_none());
+    }
+
+    // --- The frontier's bookkeeping (maude only for the context) -----------
+
+    /// An engine over hand-made classes: the first one is the root, so it is
+    /// always relevant.
+    fn engine(ctx: &ProofContext, alt_cost: u32) -> Engine<'_> {
+        let config = TopNConfig {
+            alt_cost,
+            ..config(2, false, 1)
+        };
+        Engine::new(ctx, config, DEPTH_CAP, Instant::now() + Duration::from_secs(3600))
+    }
+
+    fn with_system() -> Option<Stored> {
+        Some(Stored::new(System::empty(), None))
+    }
+
+    #[test]
+    fn a_cheaper_path_changes_the_cost_but_not_the_frontier() {
+        let Some(ctx) = ctx() else {
+            return;
+        };
+        let mut engine = engine(&ctx, 4);
+        let c = engine.add_class(Status::Open, 0, 5, None);
+        engine.push_entry(c, 2);
+        engine.lower(c, 0, 1);
+        assert_eq!(engine.frontier.len(), 1, "the key did not change");
+        assert_eq!(engine.graph.class(c).pending.map(|p| p.cost), Some(1));
+    }
+
+    #[test]
+    fn a_cheaper_path_brings_a_parked_entry_back_within_the_iteration() {
+        let Some(ctx) = ctx() else {
+            return;
+        };
+        let mut engine = engine(&ctx, 4);
+        let c = engine.add_class(Status::Open, 0, 5, with_system());
+        engine.push_entry(c, 2);
+        assert!(engine.select_batch(4).is_empty(), "cost 5 waits for a higher limit");
+        assert_eq!(engine.parked, vec![c]);
+        engine.lower(c, 0, 2);
+        let tasks = engine.select_batch(4);
+        assert_eq!(tasks.iter().map(|t| t.class).collect::<Vec<_>>(), vec![c]);
+        engine.unpark();
+        assert!(engine.frontier.is_empty(), "the expanded entry is not parked any more");
+    }
+
+    #[test]
+    fn a_class_parked_twice_gets_its_entry_back_once() {
+        let Some(ctx) = ctx() else {
+            return;
+        };
+        let mut engine = engine(&ctx, 4);
+        let c = engine.add_class(Status::Open, 0, 6, with_system());
+        engine.push_entry(c, 2);
+        assert!(engine.select_batch(4).is_empty());
+        engine.lower(c, 0, 5);
+        assert!(engine.select_batch(4).is_empty(), "still above the limit");
+        assert_eq!(engine.parked, vec![c, c]);
+        engine.unpark();
+        assert_eq!(engine.frontier.len(), 1);
+        assert_eq!(engine.select_batch(8).len(), 1);
+        assert!(engine.frontier.is_empty());
     }
 
     // --- Against the greedy driver (maude) -------------------------------
@@ -1636,6 +1955,7 @@ mod tests {
             order: SearchOrder::IdDfs,
             merge,
             batch,
+            alt_cost: 0,
         }
     }
 
@@ -1655,14 +1975,30 @@ mod tests {
         };
         for &merge in merges {
             for batch in [1, 4] {
-                ctx.top_n = Some(config(1, merge, batch));
-                let top1 = run_proof_search(&ctx, make(), bound);
-                assert_eq!(pretty_proof_body(&top1), expected, "n=1 merge={merge} batch={batch}");
-                assert_eq!(top1.status, greedy.status);
+                for alt_cost in [0, 8] {
+                    // One method per system leaves no alternative to weight.
+                    ctx.top_n = Some(TopNConfig {
+                        alt_cost,
+                        ..config(1, merge, batch)
+                    });
+                    let top1 = run_proof_search(&ctx, make(), bound);
+                    assert_eq!(
+                        pretty_proof_body(&top1),
+                        expected,
+                        "n=1 merge={merge} batch={batch} alt_cost={alt_cost}"
+                    );
+                    assert_eq!(top1.status, greedy.status);
+                }
                 ctx.top_n = Some(config(3, merge, batch));
                 let top3 = run_proof_search(&ctx, make(), bound);
-                if matches!(greedy.status, NodeStatus::Solved | NodeStatus::Contradictory) {
-                    assert_eq!(top3.status, greedy.status, "n=3 merge={merge} batch={batch}");
+                if matches!(
+                    greedy.status,
+                    NodeStatus::Solved | NodeStatus::Contradictory
+                ) {
+                    assert_eq!(
+                        top3.status, greedy.status,
+                        "n=3 merge={merge} batch={batch}"
+                    );
                 }
             }
         }
@@ -1682,7 +2018,8 @@ mod tests {
             || {
                 let mut sys = System::empty();
                 past_initial(&mut sys);
-                sys.formulas_mut().push(std::sync::Arc::new(crate::guarded::gfalse()));
+                sys.formulas_mut()
+                    .push(std::sync::Arc::new(crate::guarded::gfalse()));
                 sys.add_goal(crate::constraint::constraints::Goal::Disj(
                     crate::constraint::constraints::Disj::new(Vec::new()),
                 ));
@@ -1718,8 +2055,10 @@ mod tests {
             || {
                 let mut sys = System::empty();
                 past_initial(&mut sys);
-                sys.formulas_mut().push(std::sync::Arc::new(crate::guarded::gtrue()));
-                sys.formulas_mut().push(std::sync::Arc::new(crate::guarded::gtrue()));
+                sys.formulas_mut()
+                    .push(std::sync::Arc::new(crate::guarded::gtrue()));
+                sys.formulas_mut()
+                    .push(std::sync::Arc::new(crate::guarded::gtrue()));
                 sys
             },
             5,
@@ -1751,7 +2090,8 @@ mod tests {
     }
 
     /// With `--bound 1` the greedy search's `simplify` ends in `sorry`; the
-    /// second-ranked method closes the system within the bound.
+    /// second-ranked method closes the system within the bound, also when its
+    /// cost exceeds the bound: the bound cuts by depth, not by cost.
     #[test]
     fn a_lower_ranked_method_closes_what_the_first_leaves_open() {
         let Some(mut ctx) = ctx() else {
@@ -1759,10 +2099,17 @@ mod tests {
         };
         let greedy = run_proof_search(&ctx, unproducible_action(), 1);
         assert_eq!(greedy.status, NodeStatus::Sorry);
-        for batch in [1, 4] {
-            ctx.top_n = Some(config(3, false, batch));
+        for (batch, alt_cost) in [(1, 0), (4, 0), (1, 8), (4, 8)] {
+            ctx.top_n = Some(TopNConfig {
+                alt_cost,
+                ..config(3, false, batch)
+            });
             let top3 = run_proof_search(&ctx, unproducible_action(), 1);
-            assert_eq!(top3.status, NodeStatus::Contradictory, "batch={batch}");
+            assert_eq!(
+                top3.status,
+                NodeStatus::Contradictory,
+                "batch={batch} alt_cost={alt_cost}"
+            );
             assert!(
                 matches!(top3.method, ProofMethod::SolveGoal(_)),
                 "the proof uses the second-ranked method, got {:?}",
