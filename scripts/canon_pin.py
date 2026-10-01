@@ -8,8 +8,9 @@ a tier's lemma list from a calibration run.
       (timings, memory, argv, the theory path, the nondeterministic budget
       parameters) and write the rest -- the stored graph.
 
-  canon_pin.py compare <base.json[.gz]> <branch.json[.gz]>
-      Print one line `STATUS<TAB>detail` (both sides are normalized first):
+  canon_pin.py compare <base.json[.gz]> <branch.json[.gz]> [<branch-out.json.gz>]
+      Print one line `STATUS<TAB>detail` (both sides are normalized first;
+      unless SAME, the normalized branch side is written to branch-out):
 
         SAME               identical
         FP_ONLY            identical but for per-node canonical fingerprints:
@@ -37,7 +38,8 @@ a tier's lemma list from a calibration run.
       from a calibration run's rows (relpath, lemma, status, secs, graph,
       stop_reason). Only lemmas that ran to a JSON with at least
       MIN_GRAPH nodes are candidates. `budget-secs` is the summed
-      single-job run time the list may cost.
+      single-job cost the list may have (each lemma's measured time plus
+      PER_JOB_OVERHEAD).
         fast  round-robin over feature families (SAPIC, accountability,
               -D, auto-sources, DH, xor, multiset, bilinear, natural
               numbers, loops, plain), cheapest lemma of a not-yet-picked
@@ -246,6 +248,15 @@ def dump(doc, out):
 # the root) exercises no merging, so it pins nothing.
 MIN_GRAPH = 3
 
+# What a job costs beyond the explorer itself (process start, normalizing
+# and comparing in Python), in single-job seconds. Measured: ~0.25 s per job
+# over a 938-lemma fast run.
+PER_JOB_OVERHEAD = 0.25
+
+
+def cost(r):
+    return r["secs"] + PER_JOB_OVERHEAD
+
 BUILTIN_FAMILIES = (
     ("diffie-hellman", "dh"), ("xor", "xor"), ("multiset", "multiset"),
     ("bilinear-pairing", "bilinear"), ("natural-numbers", "natural-numbers"),
@@ -302,7 +313,7 @@ def select(tier, rows, corpus, budget):
     if tier == "full":
         picked = sorted(usable, key=lambda r: r["secs"])
         dropped = []
-        while picked and sum(r["secs"] for r in picked) > budget:
+        while picked and sum(cost(r) for r in picked) > budget:
             dropped.append(picked.pop())
         if dropped:
             notes.append(f"{len(dropped)} lemma(s) dropped as over budget:")
@@ -326,11 +337,11 @@ def select(tier, rows, corpus, budget):
                 for r in by_family[fam]:
                     if r.get("picked") or per_theory.get(r["rel"], 0) != level:
                         continue
-                    if spent + r["secs"] > budget:
+                    if spent + cost(r) > budget:
                         break
                     r["picked"] = True
                     picked.append(r)
-                    spent += r["secs"]
+                    spent += cost(r)
                     per_theory[r["rel"]] = per_theory.get(r["rel"], 0) + 1
                     added = True
                     break
@@ -345,9 +356,10 @@ def select(tier, rows, corpus, budget):
 def select_main(tier, calib, corpus, budget):
     rows = read_calibration(calib)
     picked, notes = select(tier, rows, corpus, float(budget))
-    total = sum(r["secs"] for r in picked)
+    total = sum(cost(r) for r in picked)
     print(f"# {len(picked)} lemma(s) of {len({r['rel'] for r in picked})} theories, "
-          f"{total:.0f}s summed single-job run time (budget {float(budget):.0f}s)")
+          f"{total:.0f}s summed single-job cost incl. {PER_JOB_OVERHEAD}s/job overhead "
+          f"(budget {float(budget):.0f}s)")
     for n in notes:
         print(f"# {n}")
     for r in picked:
@@ -454,8 +466,15 @@ def main(argv):
     if len(argv) == 4 and argv[1] == "normalize":
         dump(normalize(load(argv[2])), argv[3])
         return 0
-    if len(argv) == 4 and argv[1] == "compare":
-        status, detail = compare(load(argv[2]), load(argv[3]))
+    if len(argv) in (4, 5) and argv[1] == "compare":
+        try:
+            branch = load(argv[3])
+        except (OSError, ValueError) as e:
+            print(f"STATUS_DIFF\tbranch JSON unreadable: {short(e, 160)}")
+            return 0
+        status, detail = compare(load(argv[2]), branch)
+        if len(argv) == 5 and status != "SAME":
+            dump(normalize(branch), argv[4])
         print(f"{status}\t{' '.join(detail.split())}")
         return 0
     if len(argv) == 6 and argv[1] == "select" and argv[2] in ("fast", "full"):

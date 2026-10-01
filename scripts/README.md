@@ -190,11 +190,44 @@ a rename-only migration.
   merges did not) is reported but passes. BASE results are cached content-keyed
   (base commit, theory + includes + flags, lemma, budget, maude, bliss), so a
   warm re-run costs only the working tree's side. `fast` (depth 4, 1000 nodes,
-  `canon_pin_fast.txt`) takes 5–15 min warm; `full` (depth 6, 10000 nodes,
-  `canon_pin_full.txt`) ~2 h. `calibrate fast|full` times every candidate
-  lemma with the working tree's explorer and regenerates the list for a
-  wall-time target (`TARGET_MIN`). `BASE=HEAD` on a clean tree is the
-  determinism check (all `SAME`). Ends in `DONE_CANON_PIN_<TIER> verdict=...`.
+  `canon_pin_fast.txt`) takes ~7 min on an empty cache, ~4 min warm; `full`
+  (depth 6, 10000 nodes, `canon_pin_full.txt`) ~2 h on an empty cache, ~1 h
+  warm. `calibrate fast|full` times every candidate lemma with the working
+  tree's explorer and regenerates the list for a wall-time target
+  (`TARGET_MIN`, the empty-cache run). `BASE=HEAD` on a clean tree is the
+  determinism check (all `SAME`). Ends in `DONE_CANON_PIN_<TIER> verdict=...`;
+  the exit status is the verdict. The BASE commit must contain this gate (its
+  explorer needs the `-D=`/`--auto-sources` interface); an older one is refused.
+
+  ```sh
+  # Small change: the fast check against the upstream branch (~7 min cold, ~4 min warm)
+  scripts/canon_pin.sh fast
+  # ... or only your uncommitted changes, against the last commit
+  BASE=HEAD scripts/canon_pin.sh fast
+
+  # Big change / before merging: the full check (~2 h cold, ~1 h warm)
+  scripts/canon_pin.sh full
+  BASE=HEAD scripts/canon_pin.sh full
+  # One-time, before the first full run: time the corpus and write
+  # canon_pin_full.txt (several hours; the timings are cached under CACHE_DIR)
+  scripts/canon_pin.sh calibrate full
+
+  # Against any other commit or branch
+  BASE=origin/cs-canon scripts/canon_pin.sh fast
+
+  # Results: one row per lemma in OUT (default /tmp/canon_pin_<tier>.tsv);
+  # every failing lemma keeps both graphs and logs in DIFF_DIR
+  # (default /tmp/canon_pin_<tier>_diffs/<theory>__<lemma>/)
+  zcat /tmp/canon_pin_fast_diffs/*/branch.json.gz | jq '.sizes'
+
+  # Re-size a list (reuses the cached timings; delete
+  # $CACHE_DIR/calibrate_<tier>_d<depth>_n<nodes>.tsv to re-time)
+  TARGET_MIN=10 scripts/canon_pin.sh calibrate fast
+  ```
+
+  Other knobs (env): `JOBS` (default min(cores/2, RAM GiB/3)), `CACHE_DIR`,
+  `DEPTH`/`NODES`/`TIMEOUT`/`LIST` (override a tier preset; a different
+  budget is a different cache key), `OUT`, `DIFF_DIR`.
 - **`pe_sweep.sh` / `module_sweep.sh` / `json_sweep.sh`** — flag-parity
   sweeps for `--partial-evaluation`, `-m/--output-module`, and
   `--output-json`/`--output-dot`. Built on `sweep_common.sh`: oracle outputs
