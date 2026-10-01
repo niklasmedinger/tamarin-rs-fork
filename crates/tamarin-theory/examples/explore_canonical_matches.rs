@@ -90,9 +90,10 @@
 //! ## Output
 //!
 //! Written to `--out` (default `explore_<theory-stem>_<lemma>.json`) as one
-//! compact JSON object, `schema_version` 3 (use `jq .` to read it), via a
+//! compact JSON object, `schema_version` 4 (use `jq .` to read it), via a
 //! temporary file and a rename (a killed run never leaves a truncated one):
-//! `theory`, `lemma`, `argv`, `params`, `stop_reason` (`exhausted`,
+//! `theory`, `lemma`, `argv`, `load` (`defines`, `auto_sources` as given,
+//! `sapic`: the theory has a process), `params`, `stop_reason` (`exhausted`,
 //! `max_nodes`, `time_budget`, `max_rss` or `panic`), `truncated` (anything but
 //! `exhausted`), `lower_bound` (some node is unexpanded or failed to
 //! canonicalize or expand, so `tree` undercounts), `timing` (`setup_secs`,
@@ -115,7 +116,9 @@
 //! candidate methods that were never applied) and `nodes`: per OR node its `depth`
 //! (min depth), `status` (`expanded`, `finished` + `result`, `depth_limit`,
 //! `unexpanded`, `canon_panic`, `exec_panic`), `canon_err` (canonicalization returned an
-//! error: expanded normally but never merged into), `first_parent`
+//! error: expanded normally but never merged into), `fingerprint` (a hex
+//! digest of the canonical form the node was created under, null when
+//! canonicalization failed), `first_parent`
 //! (`[parent, and_index, case_index]` of the occurrence that created it),
 //! `inapplicable`, `untried` (candidates skipped by `--top-methods`),
 //! `canon_secs`/`methods_secs`/`exec_secs` (canonicalizing the occurrence
@@ -123,9 +126,18 @@
 //! `and` (`method` index, `kind`, `cases` as
 //! `[name, child_id]` pairs).
 //!
-//! Usage: `cargo run --example explore_canonical_matches -- <theory.spthy> <lemma> [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--top-methods N] [--time-budget SECS] [--max-rss-gb GB] [--setup-timeout SECS] [--heartbeat SECS] [--trace]`
-//! or `... -- --list-lemmas <theory.spthy>`.
+//! Usage: `cargo run --example explore_canonical_matches -- <theory.spthy> <lemma> [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--top-methods N] [--time-budget SECS] [--max-rss-gb GB] [--setup-timeout SECS] [--heartbeat SECS] [--trace] [-D=FLAG ...] [--auto-sources]`
+//! or `... -- --list-lemmas <theory.spthy> [-D=FLAG ...] [--auto-sources]`.
 //!
+//! The theory is loaded as `tamarin-rs --prove` loads it
+//! (`common::try_load_theory_for_proving`): `-D` defines and `#include`s,
+//! `_restrict` lifting, SAPIC process and accountability translation, the
+//! NDC-checked intruder rules, and auto-sources (`--auto-sources` or the
+//! theory's `configuration:` block). SAPIC theories and accountability's
+//! generated lemmas work as they do in the prover.
+//!
+//! - `-D=FLAG` (repeatable; the value attached, as for `tamarin-rs`) and
+//!   `--auto-sources`: as for `tamarin-rs`.
 //! - `--max-depth` (default 4): don't expand nodes at this depth.
 //! - `--max-nodes` (default 2000): stop expanding once this many
 //!   occurrences have been canonicalized. Checked before each expansion, so
@@ -159,8 +171,9 @@
 //! - `--list-lemmas`: print one JSON object describing the theory instead
 //!   of exploring: `lines`, `diff` (only parses with the `diff` flag, or has
 //!   diff/equivalence lemmas; the port has no diff-mode prover),
-//!   `processes` (SAPIC), `rules`, `lemmas` (`name`, `trace_quantifier`,
-//!   `attributes`, `modulo`) and `error`.
+//!   `processes` (SAPIC), `rules` (after translation), `lemmas` (`name`,
+//!   `trace_quantifier`, `attributes`, `modulo`; accountability's generated
+//!   lemmas included) and `error`.
 //!
 //! ## Batch runs
 //!
@@ -525,6 +538,9 @@ struct OrNode {
     /// Canonicalization returned an error: the node is expanded normally
     /// but, having no fingerprint, can never be merged into.
     canon_err: bool,
+    /// [`fingerprint_hex`] of the canonical form the node was created
+    /// under; `None` when canonicalization failed.
+    fingerprint: Option<String>,
     /// `(parent, and_index, case_index)` of the occurrence that created it;
     /// `None` for the root.
     first_parent: Option<(OrId, u32, u32)>,
@@ -640,6 +656,7 @@ impl Graph {
             depth: depth as u32,
             status: Status::Unexpanded,
             canon_err: false,
+            fingerprint: None,
             first_parent,
             inapplicable: 0,
             untried: 0,
@@ -1963,6 +1980,7 @@ impl Explorer<'_> {
         let id = self.graph.add_node(depth, edge);
         let node = self.graph.node_mut(id);
         node.canon_err = fingerprint.is_none();
+        node.fingerprint = fingerprint.as_ref().map(fingerprint_hex);
         node.methods_sig = methods_sig;
         node.canon_secs = (canon_took + fingerprint_took).as_secs_f64();
         node.methods_secs = methods_took.as_secs_f64();
@@ -2438,12 +2456,22 @@ fn summarize(graph: &Graph, max_depth: usize) -> Summary {
     }
 }
 
+/// One hex digest (128 bits) of all of a canonical system's per-field
+/// fingerprints, for the JSON: what a snapshot compares to see whether the
+/// canonical FORM changed while the merges stayed the same.
+fn fingerprint_hex(fp: &CanonicalSystemFingerprint) -> String {
+    let mut h = tamarin_utils::fingerprint::FingerprintHasher::new();
+    h.tag(&format!("{fp:?}"));
+    h.finish()[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn node_json(id: usize, n: &OrNode) -> Value {
     let mut v = json!({
         "id": id,
         "depth": n.depth,
         "status": n.status.name(),
         "canon_err": n.canon_err,
+        "fingerprint": n.fingerprint,
         "first_parent": n.first_parent.map(|(p, a, c)| json!([p, a, c])),
         "inapplicable": n.inapplicable,
         "untried": n.untried,
@@ -2489,29 +2517,53 @@ struct Args {
     heartbeat: Option<f64>,
     /// `--trace`: log every expansion and every applied method.
     trace: bool,
+    /// `-D=<flag>` / `--auto-sources`: how the theory is loaded.
+    load: common::LoadOpts,
 }
 
 enum Mode {
     /// `--list-lemmas <theory>`.
-    ListLemmas(String),
+    ListLemmas(String, common::LoadOpts),
     Explore(Args),
 }
 
 const USAGE: &str = "usage: explore_canonical_matches <theory.spthy> <lemma> \
      [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--top-methods N] \
      [--time-budget SECS] [--max-rss-gb GB] [--setup-timeout SECS] [--heartbeat SECS] \
-     [--trace]\n       \
-     explore_canonical_matches --list-lemmas <theory.spthy>";
+     [--trace] [-D=FLAG ...] [--auto-sources]\n       \
+     explore_canonical_matches --list-lemmas <theory.spthy> [-D=FLAG ...] [--auto-sources]";
 
 fn usage_error(message: &str) -> ! {
     eprintln!("{message}\n{USAGE}");
     std::process::exit(EXIT_USAGE);
 }
 
+/// Takes the load flags (`-D=FLAG`, `--defines=FLAG`, `--auto-sources`) out
+/// of `raw`, leaving the rest. As in `tamarin-rs`, a define's value must be
+/// attached: a bare `-D` is refused rather than eating the next argument.
+fn take_load_opts(raw: &[String]) -> (Vec<String>, common::LoadOpts) {
+    let mut rest = Vec::new();
+    let mut load = common::LoadOpts::default();
+    for a in raw {
+        if a == "--auto-sources" {
+            load.auto_sources = true;
+        } else if let Some(flag) = a.strip_prefix("-D=").or_else(|| a.strip_prefix("--defines=")) {
+            load.defines.push(flag.to_string());
+        } else if a == "-D" || a == "--defines" {
+            usage_error("-D wants its flag attached: -D=FLAG");
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (rest, load)
+}
+
 fn parse_args(raw: &[String]) -> Mode {
+    let (raw, load) = take_load_opts(raw);
+    let raw = &raw[..];
     if raw.get(1).map(String::as_str) == Some("--list-lemmas") {
         match raw.get(2) {
-            Some(path) if raw.len() == 3 => return Mode::ListLemmas(path.clone()),
+            Some(path) if raw.len() == 3 => return Mode::ListLemmas(path.clone(), load),
             _ => usage_error("--list-lemmas wants exactly one theory path"),
         }
     }
@@ -2531,6 +2583,7 @@ fn parse_args(raw: &[String]) -> Mode {
         setup_timeout: None,
         heartbeat: None,
         trace: false,
+        load,
     };
     let mut i = 3;
     while i < raw.len() {
@@ -2606,9 +2659,9 @@ fn spawn_setup_watchdog(limit: Duration, done: Arc<AtomicBool>) {
 /// lemmas, for a batch runner to plan jobs from. `error` is non-null (and
 /// the exit code [`EXIT_SETUP_ERROR`]) if it can't be read, parsed or
 /// elaborated; the fields gathered before that are still printed.
-fn list_lemmas(theory_path: &str) -> i32 {
+fn list_lemmas(theory_path: &str, load: &common::LoadOpts) -> i32 {
     let mut out = json!({ "theory": theory_path, "error": null });
-    let code = match describe_theory(theory_path, &mut out) {
+    let code = match describe_theory(theory_path, load, &mut out) {
         Ok(()) => 0,
         Err(e) => {
             out["error"] = json!(e);
@@ -2623,15 +2676,19 @@ fn list_lemmas(theory_path: &str) -> i32 {
 /// for `--diff` mode: it only parses with the `diff` flag, or it has diff/
 /// equivalence lemmas -- the port has no diff-mode prover); `processes`
 /// (SAPIC); `rules`; and `lemmas`, exactly the names
-/// `build_lemma_proof_context` can look up.
-fn describe_theory(path: &str, out: &mut Value) -> Result<(), String> {
+/// `build_lemma_proof_context` can look up -- after SAPIC and accountability
+/// translation, so accountability's generated lemmas are listed too. `rules`
+/// counts the translated rules.
+fn describe_theory(path: &str, load: &common::LoadOpts, out: &mut Value) -> Result<(), String> {
     use tamarin_parser::ast::TheoryItem;
     use tamarin_theory::theory::TraceQuantifier;
 
     let source = std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
     out["lines"] = json!(source.lines().count());
-    let plain = tamarin_parser::parse_theory(&source, &[]);
-    let with_diff_flag = tamarin_parser::parse_theory(&source, &["diff"]);
+    let defines: Vec<&str> = load.defines.iter().map(String::as_str).collect();
+    let with_diff: Vec<&str> = defines.iter().copied().chain(["diff"]).collect();
+    let plain = tamarin_parser::parse_theory(&source, &defines);
+    let with_diff_flag = tamarin_parser::parse_theory(&source, &with_diff);
     let diff_items = with_diff_flag.as_ref().map_or(0, |t| {
         t.items
             .iter()
@@ -2649,9 +2706,9 @@ fn describe_theory(path: &str, out: &mut Value) -> Result<(), String> {
         .items
         .iter()
         .any(|i| matches!(i, TheoryItem::TopLevelProcess(_) | TheoryItem::ProcessDef(_))));
-    let elaborated = catch_unwind(AssertUnwindSafe(|| tamarin_theory::elaborate::elaborate(&parsed)))
-        .map_err(|p| format!("elaborate panicked: {}", panic_message(&*p)))?
-        .map_err(|e| format!("elaborate: {}", e.message))?;
+    let translated = catch_unwind(AssertUnwindSafe(|| common::try_load_theory_translated(path, load)))
+        .map_err(|p| format!("load panicked: {}", panic_message(&*p)))??;
+    let elaborated = &translated.elaborated;
     out["rules"] = json!(elaborated.rules().count());
     out["lemmas"] = elaborated
         .lemmas()
@@ -2670,17 +2727,31 @@ fn describe_theory(path: &str, out: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Parses and elaborates the theory, starts maude on its signature, and
-/// builds the lemma's proof context -- the same per-lemma setup
-/// `prove_lemma` uses. Errors instead of panicking, so a batch log says
-/// which step failed.
-fn setup(
-    args: &Args,
-) -> Result<(ProofContext, System, tamarin_theory::elaborate::UserFunsForTheoryGuard), String> {
-    let (parsed, elaborated, maude) = common::try_load_theory_with_maude(&args.theory_path)?;
-    log!("parsed and elaborated: {} rule(s); maude started", elaborated.rules().count());
-    let (ctx, initial_sys, _skeleton_tree, user_funs_guard) = build_lemma_proof_context(
-        &parsed,
+/// The user function-symbol guards the exploration must hold. Each restores
+/// the bundle that was installed before it on drop, so they must drop in
+/// reverse order of installation: fields drop in declaration order.
+struct UserFunsGuards {
+    _proof: tamarin_theory::elaborate::UserFunsForTheoryGuard,
+    _load: tamarin_theory::elaborate::UserFunsForTheoryGuard,
+}
+
+/// Loads the theory as `tamarin-rs --prove` does (`common::
+/// try_load_theory_for_proving`: SAPIC and accountability translation, the
+/// NDC-checked intruder cache, auto-sources) and builds the lemma's proof
+/// context -- the same per-lemma setup `prove_lemma` uses. Also returns
+/// whether the theory is a SAPIC one. Errors instead of panicking, so a
+/// batch log says which step failed.
+fn setup(args: &Args) -> Result<(ProofContext, System, UserFunsGuards, bool), String> {
+    let loaded = common::try_load_theory_for_proving(&args.theory_path, &args.load)?;
+    let common::Loaded { translated, maude, ndc_cache } = loaded;
+    let sapic = translated.elaborated.is_sapic;
+    log!(
+        "loaded: {} rule(s) after translation, sapic={sapic}, auto_sources={}; maude started",
+        translated.elaborated.rules().count(),
+        translated.auto_sources
+    );
+    let (ctx, initial_sys, _skeleton_tree, proof_guard) = build_lemma_proof_context(
+        &translated.parsed,
         &args.lemma,
         maude,
         None,
@@ -2690,10 +2761,14 @@ fn setup(
         &args.theory_path,
         &CliHeuristic::default(),
         CutStrategy::Dfs,
-        None,
+        Some(&ndc_cache),
     )
     .map_err(|e| format!("build_lemma_proof_context({}): {e:?}", args.lemma))?;
-    Ok((ctx, initial_sys, user_funs_guard))
+    let guards = UserFunsGuards {
+        _proof: proof_guard,
+        _load: translated.user_funs_guard,
+    };
+    Ok((ctx, initial_sys, guards, sapic))
 }
 
 /// Writes `doc` to `out` via a temporary file and a rename, so a run killed
@@ -2712,7 +2787,7 @@ fn main() {
     install_panic_hook();
     let argv: Vec<String> = std::env::args().collect();
     let args = match parse_args(&argv) {
-        Mode::ListLemmas(path) => std::process::exit(list_lemmas(&path)),
+        Mode::ListLemmas(path, load) => std::process::exit(list_lemmas(&path, &load)),
         Mode::Explore(args) => args,
     };
 
@@ -2740,7 +2815,7 @@ fn main() {
     }
     // `_user_funs_guard` must stay alive for the WHOLE exploration:
     // canonicalization needs the installed signature.
-    let (ctx, initial_sys, _user_funs_guard) = match catch_unwind(AssertUnwindSafe(|| setup(&args))) {
+    let (ctx, initial_sys, _user_funs_guards, sapic) = match catch_unwind(AssertUnwindSafe(|| setup(&args))) {
         Ok(Ok(setup)) => setup,
         Ok(Err(e)) => {
             log!("setup failed: {e}");
@@ -2827,10 +2902,15 @@ fn main() {
     let check = &explorer.method_check;
     let peak_rss_mib = memory_mib("VmHWM:");
     let doc = json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "theory": args.theory_path,
         "lemma": args.lemma,
         "argv": argv,
+        "load": {
+            "defines": args.load.defines,
+            "auto_sources": args.load.auto_sources,
+            "sapic": sapic,
+        },
         "params": {
             "max_depth": args.max_depth,
             "max_nodes": args.max_nodes,

@@ -21,6 +21,11 @@ serde_json = "1"
 
 [dev-dependencies]
 walkdir = "2"
+# The examples load theories the way `tamarin-rs --prove` does, SAPIC and
+# accountability translation included (examples/common). A dev-dependency
+# cycle: examples link the same tamarin-theory instance these depend on.
+tamarin-sapic = { workspace = true }
+tamarin-accountability = { workspace = true }
 mimalloc = { version = "0.1", default-features = false }
 
 [lints]

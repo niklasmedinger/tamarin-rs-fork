@@ -472,6 +472,8 @@ impl SearchGraph {
     /// For a class whose methods disagree: its path and, per method that
     /// settled, its cases with how many edges reach each case's class (a
     /// merged class, reached along several, is where a false positive hides).
+    /// A case merged into a class created elsewhere also gets that class's
+    /// path: replaying both paths gives the two systems that were merged.
     fn describe_conflict(&self, c: ClassId) -> String {
         let class = self.class(c);
         let mut out = format!("  path to #{c}: {}\n", self.path_to(c));
@@ -493,9 +495,54 @@ impl SearchGraph {
                     cl.first_parent
                         .map_or("-".into(), |(p, a)| format!("#{p} method {a}"))
                 );
+                if cl.first_parent != Some((c, i as u16)) {
+                    out += &format!("      path to #{child}: {}\n", self.path_to(*child));
+                }
+                if cl.status == Status::Settled(Settled::Solved) {
+                    out += &format!("      trace from #{child}: {}\n", self.trace_from(*child));
+                }
             }
         }
         out
+    }
+
+    /// The `method [case]` steps from the Solved class `c` down to a solved
+    /// leaf, the way the proof would take them. A step into a class created
+    /// along another edge is marked `(merged)`: there the path continues
+    /// with the representative's system, not the one this path produced.
+    fn trace_from(&self, mut c: ClassId) -> String {
+        let mut steps = Vec::new();
+        let mut seen = vec![c];
+        loop {
+            let class = self.class(c);
+            let next = class.ands.iter().enumerate().find_map(|(a, and)| {
+                if and.status != Status::Settled(Settled::Solved) {
+                    return None;
+                }
+                and.cases
+                    .iter()
+                    .find(|&&(_, d)| {
+                        self.class(d).status == Status::Settled(Settled::Solved) && !seen.contains(&d)
+                    })
+                    .map(|(name, d)| (a, and, name, *d))
+            });
+            let Some((a, and, name, d)) = next else {
+                break;
+            };
+            let merged = self.class(d).first_parent != Some((c, a as u16));
+            steps.push(format!(
+                "{} [{name}] -> #{d}{}",
+                crate::pretty_theory::pretty_proof_method_inline(&and.method),
+                if merged { " (merged)" } else { "" }
+            ));
+            seen.push(d);
+            c = d;
+        }
+        if steps.is_empty() {
+            "<a solved leaf>".into()
+        } else {
+            steps.join(" -> ")
+        }
     }
 
     /// Re-derives `c`'s status after one of its methods changed or it was
