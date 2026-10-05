@@ -83,6 +83,11 @@
 //! - `TAM_RS_MERGE` (presence): merge canonically equal systems (needs
 //!   `bliss`), shared with the top-N search;
 //! - `TAM_RS_MCGS_STATS` (presence): one summary line per search on stderr.
+//! - `TAM_RS_SEARCH_STATS=SECS`: `[search-stats]` lines on stderr, the merge
+//!   counters both graph searches share in one format: one every SECS
+//!   seconds while the search runs (`0`: none), so that a run killed at a
+//!   timeout leaves its last counts, and a last one with `final=1`
+//!   ([`search_graph::StatsReporter`]).
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -95,8 +100,8 @@ use crate::constraint::solver::proof_method::ProofMethod;
 use crate::constraint::solver::reduction::avoid_fresh_state;
 use crate::constraint::solver::search::{self, candidate_methods, ProofNode};
 use crate::constraint::solver::search_graph::{
-    self, apply_method, classify, Applied, Child, ClassId, End, Interned, Materializer, Status,
-    Stored, WorkStats, WorkerEnv, DEPTH_CAP, ROOT,
+    self, apply_method, classify, Applied, Child, ClassId, End, Interned, Materializer,
+    MergeCounts, StatsReporter, Status, Stored, WorkStats, WorkerEnv, DEPTH_CAP, ROOT,
 };
 use crate::constraint::system::System;
 
@@ -456,6 +461,7 @@ struct Engine<'a> {
     /// The lemma's BM25 query tokens.
     formula_query: Vec<String>,
     stats: Stats,
+    reporter: StatsReporter,
 }
 
 impl<'a> Engine<'a> {
@@ -474,7 +480,23 @@ impl<'a> Engine<'a> {
             deadline,
             formula_query,
             stats: Stats::default(),
+            reporter: StatsReporter::new("mcgs"),
         }
+    }
+
+    fn merge_counts(&self) -> MergeCounts {
+        MergeCounts {
+            applied: self.stats.applied,
+            leaves: self.stats.leaves,
+            merges: self.stats.merges,
+        }
+    }
+
+    /// A `[search-stats]` progress line, if one is due.
+    fn report_progress(&mut self) {
+        let counts = self.merge_counts();
+        self.reporter
+            .tick(&self.ctx.lemma_name, &self.graph, &counts, &self.stats.work);
     }
 
     fn add_root(&mut self, sys: System) {
@@ -832,6 +854,7 @@ impl<'a> Engine<'a> {
                 return End::Budget;
             }
             self.stats.steps += 1;
+            self.report_progress();
             if !self.step(env) {
                 self.stats.idle_steps += 1;
                 if self.graph.class(ROOT).status == Status::Open
@@ -885,6 +908,13 @@ pub fn run(
     engine.add_root(initial.clone());
     let end = engine.search(&WorkerEnv::capture(Some(deadline)));
     let searched = start.elapsed();
+    engine.reporter.finish(
+        &ctx.lemma_name,
+        &engine.graph,
+        &engine.merge_counts(),
+        &engine.stats.work,
+        end,
+    );
 
     // Materializing runs methods again; the deadline the search may have hit
     // must not cut that short.

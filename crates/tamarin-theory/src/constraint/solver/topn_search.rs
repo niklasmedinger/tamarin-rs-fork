@@ -68,6 +68,11 @@
 //!   cost against the depth limit, times its rank; default 0;
 //! - `TAM_RS_TOPN_STATS` (presence): one summary line per search on stderr,
 //!   and one per iteration.
+//! - `TAM_RS_SEARCH_STATS=SECS`: `[search-stats]` lines on stderr, the merge
+//!   counters both graph searches share in one format: one every SECS
+//!   seconds while the search runs (`0`: none), so that a run killed at a
+//!   timeout leaves its last counts, and a last one with `final=1`
+//!   ([`search_graph::StatsReporter`]).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -80,8 +85,8 @@ use crate::constraint::solver::context::ProofContext;
 use crate::constraint::solver::reduction::avoid_fresh_state;
 use crate::constraint::solver::search::{self, candidate_methods, ProofNode};
 use crate::constraint::solver::search_graph::{
-    self, apply_method, classify, Applied, Child, ClassId, End, Interned, Materializer, Status,
-    Stored, WorkStats, WorkerEnv, DEPTH_CAP, ROOT,
+    self, apply_method, classify, Applied, Child, ClassId, End, Interned, Materializer,
+    MergeCounts, StatsReporter, Status, Stored, WorkStats, WorkerEnv, DEPTH_CAP, ROOT,
 };
 use crate::constraint::system::System;
 
@@ -382,6 +387,7 @@ struct Engine<'a> {
     bound: u32,
     deadline: Instant,
     stats: Stats,
+    reporter: StatsReporter,
 }
 
 impl<'a> Engine<'a> {
@@ -396,7 +402,23 @@ impl<'a> Engine<'a> {
             bound,
             deadline,
             stats: Stats::default(),
+            reporter: StatsReporter::new("topn"),
         }
+    }
+
+    fn merge_counts(&self) -> MergeCounts {
+        MergeCounts {
+            applied: self.stats.applied,
+            leaves: self.stats.leaves,
+            merges: self.stats.merges,
+        }
+    }
+
+    /// A `[search-stats]` progress line, if one is due.
+    fn report_progress(&mut self) {
+        let counts = self.merge_counts();
+        self.reporter
+            .tick(&self.ctx.lemma_name, &self.graph, &counts, &self.stats.work);
     }
 
     #[cfg(test)]
@@ -740,6 +762,7 @@ impl<'a> Engine<'a> {
                 for result in results {
                     self.integrate(result);
                 }
+                self.report_progress();
             }
             self.report_iteration(limit, &start);
             if let Some(end) = self.end() {
@@ -779,6 +802,13 @@ pub fn run(
     engine.add_root(initial.clone());
     let end = engine.search(&WorkerEnv::capture(Some(deadline)));
     let searched = start.elapsed();
+    engine.reporter.finish(
+        &ctx.lemma_name,
+        &engine.graph,
+        &engine.merge_counts(),
+        &engine.stats.work,
+        end,
+    );
 
     // Materializing runs methods again; the deadline the search may have hit
     // must not cut that short.

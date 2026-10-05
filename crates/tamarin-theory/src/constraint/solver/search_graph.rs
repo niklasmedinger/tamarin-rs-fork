@@ -523,6 +523,128 @@ impl WorkStats {
     }
 }
 
+// =============================================================================
+// Merge statistics
+// =============================================================================
+
+/// `TAM_RS_SEARCH_STATS=SECS`, read once per process: `[search-stats]` lines
+/// on stderr, one when a search ends and one every SECS seconds while it
+/// runs (`0`: only the last). `None` when unset.
+pub(crate) fn search_stats_every() -> Option<Duration> {
+    static EVERY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| match std::env::var("TAM_RS_SEARCH_STATS") {
+        Err(std::env::VarError::NotPresent) => None,
+        Ok(v) => Some(Duration::from_secs(v.parse().unwrap_or_else(|_| {
+            panic!("TAM_RS_SEARCH_STATS={v:?}: expected a number of seconds")
+        }))),
+        Err(e) => panic!("TAM_RS_SEARCH_STATS: {e}"),
+    })
+}
+
+/// The counters every search over this graph keeps, for its
+/// `[search-stats]` lines.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct MergeCounts {
+    /// Methods applied: the graph's AND nodes.
+    pub(crate) applied: u64,
+    /// Cases that were already finished, never canonicalized or merged.
+    pub(crate) leaves: u64,
+    /// Cases that reached a class created before.
+    pub(crate) merges: u64,
+}
+
+/// Writes `[search-stats]` lines for one search: the same fields for every
+/// search over the graph, so a batch runner reads them alike. A progress line
+/// every `TAM_RS_SEARCH_STATS` seconds means a run killed at its timeout
+/// still leaves its last counts behind; the last line has `final=1`.
+pub(crate) struct StatsReporter {
+    search: &'static str,
+    started: Instant,
+    every: Option<Duration>,
+    last: Instant,
+}
+
+impl StatsReporter {
+    pub(crate) fn new(search: &'static str) -> Self {
+        let now = Instant::now();
+        StatsReporter {
+            search,
+            started: now,
+            every: search_stats_every(),
+            last: now,
+        }
+    }
+
+    /// A progress line, if one is due.
+    pub(crate) fn tick<X>(
+        &mut self,
+        lemma: &str,
+        graph: &SearchGraph<X>,
+        counts: &MergeCounts,
+        work: &WorkStats,
+    ) {
+        let Some(every) = self.every else {
+            return;
+        };
+        if every.is_zero() || self.last.elapsed() < every {
+            return;
+        }
+        self.last = Instant::now();
+        self.print(lemma, graph, counts, work, None);
+    }
+
+    /// The last line, with why the search ended and the root's status.
+    pub(crate) fn finish<X>(
+        &self,
+        lemma: &str,
+        graph: &SearchGraph<X>,
+        counts: &MergeCounts,
+        work: &WorkStats,
+        end: End,
+    ) {
+        if self.every.is_some() {
+            self.print(lemma, graph, counts, work, Some(end));
+        }
+    }
+
+    fn print<X>(
+        &self,
+        lemma: &str,
+        graph: &SearchGraph<X>,
+        counts: &MergeCounts,
+        work: &WorkStats,
+        end: Option<End>,
+    ) {
+        // Classes reached along two or more edges: where merging saved a
+        // second expansion.
+        let shared = graph.classes.iter().filter(|c| c.parents.len() > 1).count();
+        let root = graph
+            .classes
+            .first()
+            .map_or("none".to_string(), |c| format!("{:?}", c.status));
+        eprintln!(
+            "[search-stats] search={} lemma={} final={} end={} root={} classes={} leaves={} \
+             merges={} shared={} applied={} execs={} canons={} canon_s={:.3} busy_s={:.3} \
+             elapsed_s={:.3}",
+            self.search,
+            lemma,
+            u8::from(end.is_some()),
+            end.map_or("running".to_string(), |e| format!("{e:?}")),
+            root.replace(' ', ""),
+            graph.classes.len(),
+            counts.leaves,
+            counts.merges,
+            shared,
+            counts.applied,
+            work.execs,
+            work.canons,
+            work.canon_time.as_secs_f64(),
+            work.busy.as_secs_f64(),
+            self.started.elapsed().as_secs_f64(),
+        );
+    }
+}
+
 /// What a worker thread needs before it runs solver code for this search:
 /// the thread-locals the greedy driver's fan-out also replicates (the
 /// deadline, the user-function signature) and a maude handle of its own.
