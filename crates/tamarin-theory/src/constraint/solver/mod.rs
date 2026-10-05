@@ -10,8 +10,11 @@
 //!   solver entry point.
 //! - [`contradictions`] — port of `Solver.Contradictions`. Identifies
 //!   all reasons a `System` is contradictory.
+//! - [`bm25`] — RS-only: the BM25 lexical prior of [`mcgs_search`].
 //! - [`goals`] — port of `Solver.Goals`. Goal solving and case
 //!   distinction generation.
+//! - [`mcgs_search`] — RS-only, opt-in: Monte Carlo graph search guided
+//!   by the heuristic's rank and a BM25 prior.
 //! - [`proof_method`] — port of `Solver.ProofMethod`. The
 //!   external small-step interface to the constraint solver
 //!   (`ProofMethod`, `Result`, `is_finished`, `exec_proof_method`).
@@ -19,6 +22,8 @@
 //!   rules over a `System`.
 //! - [`rename_precise`] — precise variable renaming helpers.
 //! - [`search`] — proof-search driver over the small-step interface.
+//! - [`search_graph`] — RS-only: the AND/OR search graph, its workers and
+//!   its proof materializer, shared by [`topn_search`] and [`mcgs_search`].
 //! - [`simplify`] — port of `Solver.Simplify`. Simplification of a
 //!   `System`.
 //! - [`sources`] — port of `Solver.Sources`. Source/case-distinction
@@ -33,13 +38,16 @@
 //! of which are ported here.
 
 pub mod annotated_goals;
+pub mod bm25;
 pub mod context;
 pub mod contradictions;
 pub mod goals;
+pub mod mcgs_search;
 pub mod proof_method;
 pub mod reduction;
 pub mod rename_precise;
 pub mod search;
+pub mod search_graph;
 pub mod simplify;
 pub mod sources;
 pub mod tactic_show;

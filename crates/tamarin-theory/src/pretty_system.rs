@@ -259,6 +259,27 @@ fn pp_disj(d: &crate::tools::equation_store::EqDisj) -> Doc {
     Doc::text(format!("{}.", d.split_id.0)).beside_sp(numbered_prime(conjs))
 }
 
+/// The disjuncts of `sys`'s equation-store split `id`, one rendered
+/// substitution each, in the order a split of it emits its cases; empty if
+/// the store holds no such split. (No HS analog: the Tamarin-ML API's
+/// `toJSONGoal` renders a split goal this way.)
+pub(crate) fn pretty_split_disjuncts(
+    sys: &System,
+    id: crate::tools::equation_store::SplitId,
+) -> Vec<String> {
+    sys.eq_store
+        .conj
+        .iter()
+        .find(|d| d.split_id == id)
+        .map(|d| {
+            crate::tools::equation_store::ordered_substs(&d.substs)
+                .into_iter()
+                .map(|s| pp_subst_vfresh(s).render())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // HS `ppSubst subst = sep [ hsep (opExists : map prettyLVar (varsRangeVFresh subst)) <> opDot
 //                         , nest 2 $ fsep $ intersperse opLAnd $ map ppEq (substToListVFresh subst) ]`
 fn pp_subst_vfresh(subst: &crate::tools::equation_store::LNSubstVFresh) -> Doc {

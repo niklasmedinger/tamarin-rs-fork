@@ -978,6 +978,9 @@ impl ProverSession {
         ctx.cut = self.cut;
         // RS-only, opt-in top-N search (`TAM_RS_TOP_METHODS`).
         ctx.top_n = crate::constraint::solver::topn_search::config_for_lemma();
+        // RS-only, opt-in MCGS search (`TAM_RS_MCGS_BUDGET`).
+        ctx.mcgs = crate::constraint::solver::mcgs_search::config_for_lemma();
+        ctx.lemma_text = std::sync::Arc::from(lemma.plaintext.as_str());
         let session_in_file = &theory.in_file;
         ctx.heuristic = resolve_heuristic(
             &self.cli_heuristic,
@@ -1686,6 +1689,9 @@ pub fn build_lemma_proof_context(
     ctx.cut = cut;
     // RS-only, opt-in top-N search (`TAM_RS_TOP_METHODS`).
     ctx.top_n = crate::constraint::solver::topn_search::config_for_lemma();
+    // RS-only, opt-in MCGS search (`TAM_RS_MCGS_BUDGET`).
+    ctx.mcgs = crate::constraint::solver::mcgs_search::config_for_lemma();
+    ctx.lemma_text = std::sync::Arc::from(lemma.plaintext.as_str());
 
     // Resolve the goal-ranking heuristic.  HS `selectHeuristic prover ctx =
     // ... apDefaultHeuristic prover <|> L.get pcHeuristic ctx`

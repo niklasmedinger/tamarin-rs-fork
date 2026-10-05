@@ -533,6 +533,19 @@ pub fn run_proof_search(ctx: &ProofContext, initial: System, proof_bound: usize)
     // RS-only, opt-in (`TAM_RS_TOP_METHODS`): search the top N ranked
     // methods per system instead of the heuristic's first.  The greedy
     // strategies below never run then; `ctx.top_n` is `None` by default.
+    // RS-only, opt-in (`TAM_RS_MCGS_BUDGET`): Monte Carlo graph search.
+    if let Some(config) = ctx.mcgs {
+        let root = crate::constraint::solver::mcgs_search::run(
+            ctx,
+            initial,
+            proof_bound,
+            config,
+            deadline,
+        );
+        PROOF_BOUND.with(|b| b.set(usize::MAX));
+        clear_deadline();
+        return root;
+    }
     if let Some(config) = ctx.top_n {
         let root = crate::constraint::solver::topn_search::run(
             ctx,

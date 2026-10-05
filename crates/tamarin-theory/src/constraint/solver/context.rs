@@ -259,6 +259,16 @@ pub struct ProofContext {
     /// the nested searches of derivation checks build their own contexts
     /// and stay greedy.
     pub top_n: Option<crate::constraint::solver::topn_search::TopNConfig>,
+    /// RS-only, opt-in: Monte Carlo graph search guided by the heuristic's
+    /// rank and a BM25 prior (`TAM_RS_MCGS_BUDGET`, see
+    /// [`crate::constraint::solver::mcgs_search`]).  `None`, the default,
+    /// keeps the greedy search.  Set per lemma by `prove.rs`, like `top_n`;
+    /// the two are exclusive.
+    pub mcgs: Option<crate::constraint::solver::mcgs_search::McgsConfig>,
+    /// The lemma's source text (`Lemma::plaintext`), the formula half of the
+    /// MCGS search's BM25 query.  Empty unless set by `prove.rs`.  Shared, so
+    /// the per-task contexts of [`Self::with_swapped_maude`] do not copy it.
+    pub lemma_text: std::sync::Arc<str>,
     /// Pending typing assumptions (from `[sources]`-tagged lemmas)
     /// applied during `ensure_saturated`'s refinement step.  Set by
     /// `prove_lemma` before any source-case access; refinement is
@@ -337,6 +347,8 @@ impl Clone for ProofContext {
             is_exists_trace: self.is_exists_trace,
             cut: self.cut,
             top_n: self.top_n,
+            mcgs: self.mcgs,
+            lemma_text: std::sync::Arc::clone(&self.lemma_text),
             typing_assumptions: self.typing_assumptions.clone(),
             heuristic: self.heuristic.clone(),
             lemma_name: self.lemma_name.clone(),
@@ -443,6 +455,8 @@ impl ProofContext {
             is_exists_trace: self.is_exists_trace,
             cut: self.cut,
             top_n: self.top_n,
+            mcgs: self.mcgs,
+            lemma_text: std::sync::Arc::clone(&self.lemma_text),
             typing_assumptions: self.typing_assumptions.clone(),
             heuristic: self.heuristic.clone(),
             lemma_name: self.lemma_name.clone(),
@@ -1183,6 +1197,8 @@ impl ProofContext {
             is_exists_trace: false,
             cut: CutStrategy::Dfs,
             top_n: None,
+            mcgs: None,
+            lemma_text: std::sync::Arc::from(""),
             typing_assumptions: Vec::new(),
             heuristic: None,
             lemma_name: String::new(),
