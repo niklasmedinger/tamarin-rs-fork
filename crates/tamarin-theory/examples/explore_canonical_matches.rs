@@ -246,6 +246,12 @@
 //!   panics, prints its rule instances and non-graph part (formulas,
 //!   equation store, goals, ...) to stderr, to find which content the
 //!   graph part missed.
+//! - `DUMP_MERGES_INTO=ID[,ID...]` -- for each listed OR node id, writes
+//!   the occurrence that created it and every occurrence merged into it
+//!   (path, system, canonical labelling and canonical form) to
+//!   `<--out>.node<ID>.rep.txt` / `<--out>.node<ID>.dup<N>.txt` (`N` =
+//!   `processed`), to diff two systems a merge claims are equal. Node ids
+//!   are this run's: rerun with the same arguments to hit the same ones.
 //!
 //! Requires `bliss` on `PATH` (or `$BLISS_PATH`) -- skips (via
 //! `bliss_available()`'s panic-unless-opted-out gate) if
@@ -278,7 +284,7 @@ use tamarin_theory::canon::{
     canonicalize_constraint_system_with_labelling, canonicalize_graph_part_seeded,
     canonicalize_graph_part, canonicalize_proof_method, canonicalize_system_content_seeded_profiled,
     fact_to_term,
-    minimal_graph_part_labelings, rule_to_term, ContentStageTimes,
+    minimal_graph_part_labelings, rule_to_term, CanonicalSystem, ContentStageTimes,
 };
 use tamarin_theory::canon_color::{Color, ColorTable};
 use tamarin_theory::pretty_system::pretty_fact;
@@ -1780,6 +1786,9 @@ struct Flags {
     dump_dimacs_at: Option<(u64, String)>,
     /// `DUMP_AUTOMORPHISMS=N`: examples to print per [`GroupSizes::category`].
     dump_automorphisms: usize,
+    /// `DUMP_MERGES_INTO=ID[,ID...]`, with the `--out` path the dumps are
+    /// named after.
+    dump_merges_into: Option<(BTreeSet<OrId>, String)>,
 }
 
 struct Explorer<'a> {
@@ -1951,6 +1960,9 @@ impl Explorer<'_> {
                     fingerprint_constraint_system(&canon)
                 });
                 fingerprint_took = took;
+                if self.flags.dump_merges_into.is_some() {
+                    self.dump_merge_occurrence(&sys, &canon, &labelling, &fp, depth, edge);
+                }
                 set_activity_step("candidate_methods");
                 let start = Instant::now();
                 let methods = candidate_methods(&sys, ctx, depth);
@@ -1989,6 +2001,49 @@ impl Explorer<'_> {
         }
         self.queue.push_back((id, sys, methods));
         id
+    }
+
+    /// `DUMP_MERGES_INTO`: if this occurrence creates, or merges into, one
+    /// of the requested OR nodes, writes it -- path, system, labelling and
+    /// canonical form -- to `<out>.node<ID>.rep.txt` (the occurrence that
+    /// created the node) or `<out>.node<ID>.dup<processed>.txt` (one merged
+    /// into it), for diffing.
+    fn dump_merge_occurrence(
+        &self,
+        sys: &System,
+        canon: &CanonicalSystem,
+        labelling: &CanonLabelling,
+        fp: &CanonicalSystemFingerprint,
+        depth: usize,
+        edge: Option<(OrId, u32, u32)>,
+    ) {
+        let Some((ids, out)) = &self.flags.dump_merges_into else {
+            return;
+        };
+        let existing = if self.no_merge { None } else { self.by_fingerprint.get(fp).copied() };
+        // A new node gets the next id (`Graph::add_node`).
+        let id = existing.unwrap_or(self.graph.nodes.len() as OrId);
+        if !ids.contains(&id) {
+            return;
+        }
+        let file = match existing {
+            Some(_) => format!("{out}.node{id}.dup{}.txt", self.processed),
+            None => format!("{out}.node{id}.rep.txt"),
+        };
+        let text = format!(
+            "node {id}, occurrence {} at depth {depth}, {}\npath: {}\nfingerprint: {}\n\n\
+             === system ===\n{}\n=== labelling ===\n{labelling:#?}\n\n=== canonical form ===\n{}",
+            self.processed,
+            if existing.is_some() { "merged into it" } else { "created it" },
+            self.graph.path(edge),
+            fingerprint_hex(fp),
+            system_text(sys),
+            canonical_text(canon),
+        );
+        match std::fs::write(&file, text) {
+            Ok(()) => log!("DUMP_MERGES_INTO: wrote {file}"),
+            Err(e) => log!("DUMP_MERGES_INTO: cannot write {file}: {e}"),
+        }
     }
 
     /// Counts a canonicalization failure (`kind` "panic" or "error") and
@@ -2335,21 +2390,61 @@ fn dump_dimacs(sys: &System, colors: &ColorTable, stem: &str) {
 
 /// The rule instances and non-graph part of `sys`, for `DUMP_CANON_PANIC`.
 fn dump_system(sys: &System) {
-    eprintln!("--- rule instances ---");
+    eprintln!("{}--- end of system ---", system_text(sys));
+}
+
+/// `sys`'s rule instances, edges, `<` atoms and non-graph part, as text.
+fn system_text(sys: &System) -> String {
+    let mut out = String::from("--- rule instances ---\n");
     for (nid, ru) in sys.nodes_in_map_order() {
         let facts = |fs: &[tamarin_theory::fact::LNFact]| {
             fs.iter().map(pretty_fact).collect::<Vec<_>>().join(", ")
         };
-        eprintln!(
-            "  {nid} : {}[{}] --[{}]-> [{}]",
+        out += &format!(
+            "  {nid} : {}[{}] --[{}]-> [{}]\n",
             rule_name_string(ru),
             facts(&ru.premises),
             facts(&ru.actions),
             facts(&ru.conclusions)
         );
     }
-    eprintln!("--- non-graph part ---\n{}", tamarin_theory::pretty_system::pretty_non_graph_system(sys));
-    eprintln!("--- end of system ---");
+    out += "--- edges ---\n";
+    for e in sys.edges.iter() {
+        out += &format!("  {}:{} >-> {}:{}\n", e.src.0, e.src.1 .0, e.tgt.0, e.tgt.1 .0);
+    }
+    out += "--- less_atoms ---\n";
+    for a in sys.less_atoms.iter() {
+        out += &format!("  {} < {} ({:?})\n", a.smaller, a.larger, a.reason);
+    }
+    out += &format!("--- last_atom ---\n{:?}\n", sys.last_atom);
+    out += &format!(
+        "--- non-graph part ---\n{}\n",
+        tamarin_theory::pretty_system::pretty_non_graph_system(sys)
+    );
+    out
+}
+
+/// A [`CanonicalSystem`] as text, one entry per line.
+fn canonical_text(canon: &CanonicalSystem) -> String {
+    let guarded = |gs: &[tamarin_theory::guarded::Guarded]| {
+        gs.iter()
+            .map(|g| format!("  {}\n", tamarin_theory::pretty_formula::pretty_guarded(g)))
+            .collect::<String>()
+    };
+    format!(
+        "--- graph_part ---\n{}\n--- formulas ---\n{}--- solved_formulas ---\n{}--- lemmas ---\n{}\
+         --- eq_store ---\n{:#?}\n--- subterm_store ---\n{:#?}\n--- goals ---\n{:#?}\n\
+         --- source_kind ---\n{:?}\n--- side ---\n{:?}\n",
+        canon.graph_part,
+        guarded(&canon.formulas),
+        guarded(&canon.solved_formulas),
+        guarded(&canon.lemmas),
+        canon.eq_store,
+        canon.subterm_store,
+        canon.goals,
+        canon.source_kind,
+        canon.side,
+    )
 }
 
 fn dump_formulas(sys: &System, path: &str) {
@@ -2855,6 +2950,17 @@ fn main() {
             ),
             dump_automorphisms: std::env::var("DUMP_AUTOMORPHISMS")
                 .map_or(0, |v| v.parse().unwrap_or(3)),
+            dump_merges_into: std::env::var("DUMP_MERGES_INTO").ok().map(|v| {
+                let ids = v
+                    .split(',')
+                    .map(|s| s.trim().parse().expect("DUMP_MERGES_INTO: comma-separated node ids"))
+                    .collect();
+                let out = args
+                    .out
+                    .clone()
+                    .unwrap_or_else(|| default_out_path(&args.theory_path, &args.lemma));
+                (ids, out)
+            }),
         },
         max_depth: args.max_depth,
         no_merge: args.no_merge,
