@@ -24,11 +24,9 @@ use crate::vterm::Lit;
 pub use tamarin_utils::fingerprint::Fingerprint;
 use tamarin_utils::fingerprint::FingerprintHasher;
 
-/// Fingerprints an ALREADY-CANONICAL term — the output of
-/// [`crate::alpha_eq_ac::canonicalize_alpha_eq_ac`] (or, via
-/// `tamarin-theory::canon`, of `canonicalize_fact`/`canonicalize_rule`,
-/// which both also produce a canonical `LNTerm`). Two terms are
-/// $\alphaeqac$ iff their canonical forms' fingerprints match.
+/// Fingerprints a term, normally one in AC normal form: equal terms have
+/// equal fingerprints, so AC-equal terms in normal form do. `tamarin-theory`
+/// keys a closed subterm of a system by it (`canon_term_graph`).
 pub fn fingerprint_term(t: &LNTerm) -> Fingerprint {
     let mut h = FingerprintHasher::new();
     match t {
@@ -207,8 +205,7 @@ mod tests {
         );
     }
 
-    /// A variable and a name of the same sort must never collide — mirrors
-    /// `alpha_eq_ac.rs`'s `name_and_variable_of_same_sort_not_interchangeable`.
+    /// A variable and a name of the same sort must never collide.
     #[test]
     fn variable_and_name_of_same_sort_give_different_fingerprints() {
         let f = no_eq_sym("f", 1);

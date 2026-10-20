@@ -17,30 +17,45 @@
 //! system, so any labeling bliss picks gives the same result, and nothing
 //! has to be minimized over the automorphism group.
 //!
-//! **Soundness does not depend on the encoding.** bliss only decides the
-//! variable names (θ). The canonical form is then built from the system
-//! itself, renamed by θ ([`canonicalize_constraint_system_via_term_graph_with_labelling`]),
-//! so two systems with equal forms are equivalent whatever the graph looked
-//! like. A lossy encoding can only cost merges, never cause a false one; the
-//! generator check ([`TermGraphOptions::check_generators`]) detects it.
+//! **The canonical form is the term.** bliss only decides the variable
+//! names (θ); the form is the system term renamed by them and
+//! normalized modulo its AC and C operators (step 3,
+//! [`canonicalize_constraint_system_via_term_graph_with_labelling`]). Two
+//! claims carry the correctness argument:
+//!
+//! - (A) [`system_to_term`] is faithful: two systems are alpha-AC equal iff
+//!   their terms are. Soundness rests on (A) alone: equal forms are
+//!   alpha-AC equal terms, so the systems are equal, whatever the graph or
+//!   bliss did. A field `system_to_term` leaves out therefore merges systems
+//!   that differ in it, a false positive; the exhaustive destructurings in
+//!   `system_to_term` (and [`System::canon_fields`]) make a new field a
+//!   compile error until it is decided.
+//! - (B) [`term_to_graph`] is faithful (the reduction). Completeness rests on
+//!   (B): a lossy graph has automorphisms that are no symmetries of the term,
+//!   and different labelings then give different forms, a missed merge. The
+//!   generator check ([`TermGraphOptions::check_generators`]) detects it.
 //!
 //! # Step 1: the system as one term
 //!
 //! [`STerm`] is a term over a signature of [`Op`]s, each free (ordered
 //! arguments), AC (a multiset of arguments, nested applications flattened)
-//! or C (two unordered arguments), plus a commutative binder
+//! or C (two unordered arguments), plus commutative binders
 //! ([`STerm::Exists`]). `LNTerm` cannot hold it: it has no binders, and its
 //! AC symbols belong to the theory.
 //!
 //! ```text
-//! ∃_Root x̄. System[source_kind, side, contradictory](
+//! ∃_Root x̄. ∃_Witnesses w̄. System[source_kind, side, contradictory](
 //!     Nodes{…}, Edges{…}, LessAtoms{…}, Last(#i) | ⟨NoLast⟩,
 //!     Formulas{…}, SolvedFormulas{…}, Lemmas{…},
 //!     EqSubst{…}, EqConj{…}, Subterms{…}, SolvedSubterms{…}, NegSubterms{…}, Goals{…} )
 //! ```
 //!
 //! Each `Name{…}` is an AC section operator with one argument per entry of
-//! its field. The root binder binds every free variable of the system.
+//! its field. The root binder binds every free variable of the system, the
+//! witness binder every range variable of the equation store's
+//! alternatives, each renamed apart as a witness of its own alternative
+//! ([`Scope`] says why binding them at the top is the same as binding them
+//! in their alternative).
 //!
 //! **Collections.** A field that is a `Vec` in `System` is a multiset: an AC
 //! operator keeps duplicates as separate arguments, because the solver
@@ -57,8 +72,7 @@
 //! goals refer to their indices), arguments of free symbols, and a
 //! quantifier's binders (de Bruijn indices refer to their positions).
 //!
-//! **Field audit** (CONVENTIONS rule 3; the same verdicts as the
-//! `CanonicalSystem` built from the system):
+//! **Field audit** (CONVENTIONS rule 3; PLAN.md's field audit):
 //!
 //! | Field | Term |
 //! |---|---|
@@ -70,14 +84,15 @@
 //! | `last_atom` | `Last(#i)` or the constant `NoLast` |
 //! | `formulas`, `solved_formulas`, `lemmas` | the `ac_normalize_guarded` form, translated as below; three separate sections |
 //! | `eq_store.subst` | `EqBind(#x, t)` |
-//! | `eq_store.conj` | `EqDisj{ ∃_Alt ȳ. EqAlt{ EqBind(#x, t) … } … }`: every variable in an alternative's range is local to that alternative ([`VarRef::Local`]), so each alternative is its own commutative existential scope; `split_id` and `next_split` excluded |
+//! | `eq_store.conj` | `EqDisj{ EqAlt{ EqBind(#x, t) … } … }`: every variable in an alternative's range is that alternative's own, a witness ([`VarRef::Witness`], [`witness`]); `split_id` and `next_split` excluded |
 //! | `subterm_store` | `Sub(s, t)` in three sections; `contradictory` in `System`'s label; `old_neg_subterms`, `propagated` excluded |
 //! | `goals` | `Goal[solved](payload)`; `Split` goals (they only name an `EqDisj`), `looping` and `nr` excluded |
 //! | `source_kind`, `side` | `System`'s label |
 //! | `next_goal_nr`, `used_sources`, `sources_lemma_universals`, caches | excluded (PLAN.md's field audit) |
 //!
 //! Formulas keep their de Bruijn indices as constants, so a quantifier
-//! block's binder order stays significant, as in the `CanonicalSystem`.
+//! block's binder order stays significant: two formulas differing only in it
+//! get different forms, a missed merge.
 //! `Conj`/`Disj` and a quantifier's guards are AC, `=` is C, `em` is C, the
 //! AC binary operators of formula terms (`is_ac_binop`) are AC.
 //!
@@ -114,37 +129,56 @@
 //! A vertex's color is the RANK of its key among the keys of the graph: an
 //! isomorphism between two systems' graphs maps keys to equal keys, so both
 //! have the same key set and the same ranks.
+//!
+//! # Step 3: the names and the form
+//!
+//! bliss's canonical labeling orders the graph's vertices. The free variables
+//! and the witnesses (the two binders' variable vertices) are named per sort
+//! in that order (`mv0`, `fv0`, `tv0`, …): that is θ. The form is the system
+//! term without its two binders, renamed by θ ([`rename`]) and normalized
+//! ([`normalize`]): AC operators flattened and their arguments sorted, C
+//! arguments sorted, duplicates kept. A witness stays a `VarRef::Witness` in
+//! the form.
+//!
+//! Any other canonical labeling is this one composed with an automorphism of
+//! the graph. Under a faithful encoding every automorphism is a symmetry of
+//! the system, so the names may differ but the form does not; the generator
+//! check confirms it for each generator that moves a variable vertex.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use tamarin_term::alpha_eq_ac::{apply_renaming, rename_var, CanonLabelling};
+use tamarin_term::alpha_eq_ac::{rename_var, CanonLabelling};
 use tamarin_term::fingerprint::fingerprint_term;
 use tamarin_term::function_symbols::FunSym;
 use tamarin_term::lterm::{HasFrees, LNTerm, LSort, LVar, Name};
 use tamarin_term::term::Term;
-use tamarin_term::vterm::{var_term, Lit};
+use tamarin_term::vterm::Lit;
 use tamarin_utils::fingerprint::{Fingerprint, FingerprintHasher};
 
 use crate::bliss_proc::{run_bliss_with_stats, to_dimacs, BlissError, Color, Permutation};
 use crate::canon::{
-    canonicalize_system_content, fact_to_term, fingerprint_atom, fingerprint_gterm, graph_marker,
-    graph_tag, index_marker, rule_id, rule_identity_marker, varspec_to_lvar, CanonicalSystem,
+    fact_to_term, fingerprint_atom, fingerprint_gterm, rule_id, varspec_to_lvar, CanonicalSystem,
     RuleId,
 };
-use crate::constraint::constraints::Goal;
-use crate::constraint::system::{Side, SourceKind, System};
+use crate::constraint::constraints::{Edge, Goal, LessAtom};
+use crate::constraint::system::{CanonFields, GoalStatus, Side, SourceKind, System};
 use crate::fact::{FactTag, LNFact};
-use crate::guarded::{self, BVar, GAtom, GFact, GTerm, Guarded, Quant};
-use crate::rule::RuleACInst;
+use crate::guarded::{self, BVar, GAtom, GBinding, GFact, GTerm, Guarded, Quant};
+use crate::rule::{Rule, RuleACInst};
+use crate::tools::equation_store::EqDisj;
+use crate::tools::subterm_store::SubtermConstraint;
+use crate::tools::{EquationStore, SubtermStore};
 
 // =============================================================================
 // The term language
 // =============================================================================
 
-/// A term of the system's signature (see the module docs).
-#[derive(Debug, Clone, PartialEq)]
+/// A term of the system's signature (see the module docs). `Ord` is only a
+/// total order to sort the arguments of AC and C operators by
+/// ([`normalize`]), and `Hash` feeds [`fingerprint_sterm`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum STerm {
     App(Op, Vec<STerm>),
     Var(VarRef),
@@ -153,24 +187,49 @@ pub enum STerm {
     Exists(Scope, Vec<LVar>, Box<STerm>),
 }
 
-/// A variable occurrence. Free variables are bound by the root binder; a
-/// local one by the innermost enclosing [`STerm::Exists`] that lists it.
-/// Keeping the two apart, rather than resolving by name, means an
-/// equation-store alternative whose range happens to reuse a free
-/// variable's raw identity cannot capture it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// A variable occurrence: a free variable of the system, or a witness, a
+/// range variable of an equation-store alternative renamed apart from every
+/// other variable ([`witness`]). Both are bound at the top of the system
+/// term, by different binders ([`Scope`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VarRef {
     Free(LVar),
-    Local(LVar),
+    Witness(LVar),
 }
 
-/// Which binder an [`STerm::Exists`] is.
+/// Which binder an [`STerm::Exists`] is. Both sit at the top of the system
+/// term, the witness binder directly under the root binder.
+///
+/// A range variable of an equation-store alternative exists only in that
+/// alternative. Renamed apart ([`witness`]), it occurs only in its
+/// alternative's range terms, so binding it at the top is the same as
+/// binding it in the alternative: a renaming of the whole term maps the
+/// witnesses of one alternative onto those of another, and free variables
+/// onto free variables. A binder of their own gives the witnesses' variable
+/// vertices a label of their own, so bliss's first partition already
+/// separates them from the free variables; being a witness is part of the
+/// system, so the finer partition costs no merge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
     /// Binds every free variable of the system.
     Root,
-    /// Binds the range variables of one equation-store alternative.
-    EqAlternative,
+    /// Binds every witness of the equation store.
+    Witnesses,
+}
+
+/// The first character of a witness's name ([`witness`]). No variable of a
+/// theory or of the solver contains a NUL, so no witness can coincide with
+/// one ([`Translator::free_var`] checks it).
+const WITNESS_MARK: char = '\0';
+
+/// The witness for the `k`-th range variable `v` (in raw order) of
+/// alternative `a` of the equation store's disjunction `d`: `v`'s sort and a
+/// name determined by `(d, a, k)` alone. Distinct for every alternative and
+/// every variable in it, and the same whenever the disjunction is translated,
+/// so a disjunction translated on its own ([`canonical_eq_disj`]) gets the
+/// witnesses it has in its system's term.
+fn witness(d: usize, a: usize, k: usize, v: LVar) -> LVar {
+    LVar::new(format!("{WITNESS_MARK}w{d}.{a}"), v.sort, k as u64)
 }
 
 /// How an operator treats its arguments.
@@ -241,8 +300,7 @@ pub enum Op {
     GConj,
     GDisj,
     /// A quantifier block: existential or not, and the sort hints of its
-    /// binders in order (spelled as written, as the `CanonicalSystem` keeps
-    /// them).
+    /// binders in order (spelled as written).
     GQuant {
         ex: bool,
         sorts: Vec<String>,
@@ -319,98 +377,127 @@ pub enum ConstKey {
 // Step 1: System -> STerm
 // =============================================================================
 
-/// The whole of `sys` as one closed term (see the module docs).
-pub fn system_to_term(sys: &System) -> STerm {
-    let mut free: BTreeSet<LVar> = BTreeSet::new();
-    let mut tr = Translator { free: &mut free };
+/// The names of the arguments of the system term's `System[…]` body, in
+/// order: the sections a fingerprint and a comparison of two forms report.
+pub const SYSTEM_SECTIONS: [&str; 13] = [
+    "nodes",
+    "edges",
+    "less_atoms",
+    "last",
+    "formulas",
+    "solved_formulas",
+    "lemmas",
+    "eq_subst",
+    "eq_conj",
+    "subterms",
+    "solved_subterms",
+    "neg_subterms",
+    "goals",
+];
 
-    let nodes = sys
-        .nodes
+/// The whole of `sys` as one closed term (see the module docs).
+///
+/// Every field of the system is either translated or excluded on purpose,
+/// and the destructurings below are exhaustive (no `..`), so a new field is
+/// a compile error until it is decided: an omitted field would merge systems
+/// that differ in it.
+pub fn system_to_term(sys: &System) -> STerm {
+    let CanonFields {
+        nodes,
+        edges,
+        less_atoms,
+        last_atom,
+        formulas,
+        solved_formulas,
+        lemmas,
+        eq_store,
+        subterm_store,
+        goals,
+        source_kind,
+        side,
+    } = sys.canon_fields();
+    let EquationStore {
+        subst,
+        conj,
+        // An allocation counter for split ids.
+        next_split: _,
+    } = eq_store;
+    let SubtermStore {
+        subterms,
+        solved_subterms,
+        contradictory,
+        neg_subterms,
+        // A change-detection snapshot for one simplification pass.
+        old_neg_subterms: _,
+    } = subterm_store;
+
+    let mut free: BTreeSet<LVar> = BTreeSet::new();
+    let mut witnesses: BTreeSet<LVar> = BTreeSet::new();
+    let mut tr = Translator {
+        free: &mut free,
+        witnesses: &mut witnesses,
+    };
+
+    let nodes = nodes
         .iter()
         .map(|(nid, ru)| tr.rule_instance(*nid, ru))
         .collect();
-    let edges = sys
-        .edges
+    let edges = edges
         .iter()
-        .map(|e| {
+        .map(|Edge { src, tgt }| {
             STerm::App(
-                Op::Edge(e.src.1 .0, e.tgt.1 .0),
-                vec![tr.free_var(e.src.0), tr.free_var(e.tgt.0)],
+                Op::Edge(src.1 .0, tgt.1 .0),
+                vec![tr.free_var(src.0), tr.free_var(tgt.0)],
             )
         })
         .collect();
-    let less_atoms = sys
-        .less_atoms
+    let less_atoms = less_atoms
         .iter()
-        .map(|la| {
-            STerm::App(
-                Op::Less,
-                vec![tr.free_var(la.smaller), tr.free_var(la.larger)],
-            )
-        })
+        .map(
+            |LessAtom {
+                 smaller,
+                 larger,
+                 reason: _,
+             }| {
+                // `reason` is provenance only.
+                STerm::App(Op::Less, vec![tr.free_var(*smaller), tr.free_var(*larger)])
+            },
+        )
         .collect();
-    let last = match sys.last_atom {
+    let last = match last_atom {
         Some(nid) => STerm::App(Op::Last, vec![tr.free_var(nid)]),
         None => STerm::Const(ConstKey::NoLast),
     };
-    let formulas = sys.formulas.iter().map(|f| tr.formula(f)).collect();
-    let solved_formulas = sys.solved_formulas.iter().map(|f| tr.formula(f)).collect();
-    let lemmas = sys.lemmas.iter().map(|f| tr.formula(f)).collect();
+    let formulas = formulas.iter().map(|f| tr.formula(f)).collect();
+    let solved_formulas = solved_formulas.iter().map(|f| tr.formula(f)).collect();
+    let lemmas = lemmas.iter().map(|f| tr.formula(f)).collect();
 
-    let eq_subst = sys
-        .eq_store
-        .subst
+    let eq_subst = subst
         .iter()
-        .map(|(x, t)| STerm::App(Op::EqBind, vec![tr.free_var(*x), tr.term(t, false)]))
+        .map(|(x, t)| STerm::App(Op::EqBind, vec![tr.free_var(*x), tr.term(t, None)]))
         .collect();
-    let eq_conj = sys
-        .eq_store
-        .conj
+    let eq_conj = conj
         .iter()
-        .map(|disj| {
-            let alternatives = disj
-                .substs
-                .iter()
-                .map(|alt| {
-                    let mut locals: BTreeSet<LVar> = BTreeSet::new();
-                    for (_, t) in alt.iter() {
-                        t.for_each_free(&mut |v| {
-                            locals.insert(*v);
-                        });
-                    }
-                    let binds = alt
-                        .iter()
-                        .map(|(x, t)| {
-                            STerm::App(Op::EqBind, vec![tr.free_var(*x), tr.term(t, true)])
-                        })
-                        .collect();
-                    STerm::Exists(
-                        Scope::EqAlternative,
-                        locals.into_iter().collect(),
-                        Box::new(STerm::App(Op::EqAlt, binds)),
-                    )
-                })
-                .collect();
-            STerm::App(Op::EqDisj, alternatives)
-        })
+        .enumerate()
+        .map(|(d, disj)| tr.eq_disj(d, disj))
         .collect();
 
-    let store = &sys.subterm_store;
     let pair = |tr: &mut Translator, s: &LNTerm, t: &LNTerm| {
-        STerm::App(Op::Sub, vec![tr.term(s, false), tr.term(t, false)])
+        STerm::App(Op::Sub, vec![tr.term(s, None), tr.term(t, None)])
     };
-    let subterms = store
-        .subterms
+    // `propagated` is bookkeeping of the subterm simplification.
+    let constraint = |tr: &mut Translator,
+                      SubtermConstraint {
+                          small,
+                          big,
+                          propagated: _,
+                      }: &SubtermConstraint| pair(tr, small, big);
+    let subterms = subterms.iter().map(|c| constraint(&mut tr, c)).collect();
+    let solved_subterms = solved_subterms
         .iter()
-        .map(|c| pair(&mut tr, &c.small, &c.big))
+        .map(|c| constraint(&mut tr, c))
         .collect();
-    let solved_subterms = store
-        .solved_subterms
-        .iter()
-        .map(|c| pair(&mut tr, &c.small, &c.big))
-        .collect();
-    let neg_subterms: BTreeSet<(LNTerm, LNTerm)> = store
-        .neg_subterms
+    let neg_subterms: BTreeSet<(LNTerm, LNTerm)> = neg_subterms
         .iter()
         .map(|(s, t)| (ac_normal(s), ac_normal(t)))
         .collect();
@@ -419,27 +506,31 @@ pub fn system_to_term(sys: &System) -> STerm {
         .map(|(s, t)| pair(&mut tr, s, t))
         .collect();
 
-    let goals = sys
-        .goals
+    let goals = goals
         .iter()
-        .filter_map(|(goal, status)| {
-            tr.goal(goal).map(|payload| {
-                STerm::App(
-                    Op::Goal {
-                        solved: status.solved,
-                    },
-                    vec![payload],
-                )
-            })
-        })
+        .filter_map(
+            |(
+                goal,
+                GoalStatus {
+                    solved,
+                    // Heuristic and path-dependent bookkeeping.
+                    looping: _,
+                    nr: _,
+                },
+            )| {
+                tr.goal(goal)
+                    .map(|payload| STerm::App(Op::Goal { solved: *solved }, vec![payload]))
+            },
+        )
         .collect();
 
     let section = |s: Section, items: Vec<STerm>| STerm::App(Op::Section(s), items);
+    // In the order of `SYSTEM_SECTIONS`.
     let body = STerm::App(
         Op::System {
-            source_kind: sys.source_kind,
-            side: sys.side,
-            contradictory: store.contradictory,
+            source_kind,
+            side,
+            contradictory: *contradictory,
         },
         vec![
             section(Section::Nodes, nodes),
@@ -457,6 +548,7 @@ pub fn system_to_term(sys: &System) -> STerm {
             section(Section::Goals, goals),
         ],
     );
+    let body = STerm::Exists(Scope::Witnesses, witnesses.into_iter().collect(), Box::new(body));
     STerm::Exists(Scope::Root, free.into_iter().collect(), Box::new(body))
 }
 
@@ -469,60 +561,83 @@ fn ac_normal(t: &LNTerm) -> LNTerm {
 /// Translates the parts of one system, collecting its free variables.
 struct Translator<'a> {
     free: &'a mut BTreeSet<LVar>,
+    witnesses: &'a mut BTreeSet<LVar>,
 }
 
 impl Translator<'_> {
     fn free_var(&mut self, v: LVar) -> STerm {
+        assert!(
+            !v.name.starts_with(WITNESS_MARK),
+            "a free variable of the system is named like a witness: {v:?}"
+        );
         self.free.insert(v);
         STerm::Var(VarRef::Free(v))
     }
 
     fn rule_instance(&mut self, nid: LVar, ru: &RuleACInst) -> STerm {
+        let Rule {
+            // In the label, as `rule_id(ru)`.
+            info: _,
+            premises,
+            actions,
+            conclusions,
+            // The fresh variables' instantiations, which occur in the facts.
+            new_vars: _,
+        } = ru;
         let group = |tr: &mut Self, g: FactGroup, facts: &[LNFact]| {
             STerm::App(Op::FactGroup(g), facts.iter().map(|f| tr.fact(f)).collect())
         };
         let node = self.free_var(nid);
-        let prems = group(self, FactGroup::Prems, &ru.premises);
-        let acts = group(self, FactGroup::Acts, &ru.actions);
-        let concs = group(self, FactGroup::Concs, &ru.conclusions);
+        let prems = group(self, FactGroup::Prems, premises);
+        let acts = group(self, FactGroup::Acts, actions);
+        let concs = group(self, FactGroup::Concs, conclusions);
         STerm::App(Op::RuleInst(rule_id(ru)), vec![node, prems, acts, concs])
     }
 
     fn fact(&mut self, fact: &LNFact) -> STerm {
-        if fact.terms.iter().all(is_ground) {
+        let (tag, terms) = fact.canon_parts();
+        if terms.iter().all(is_ground) {
             let fp = fingerprint_term(&ac_normal(&fact_to_term(fact)));
             return STerm::Const(ConstKey::Closed(ClosedKind::Fact, fp));
         }
-        let args = fact.terms.iter().map(|t| self.term(t, false)).collect();
-        STerm::App(Op::Fact(fact.tag), args)
+        let args = terms.iter().map(|t| self.term(t, None)).collect();
+        STerm::App(Op::Fact(*tag), args)
     }
 
-    /// `t`, with every variable local (`local`: a range term of an
-    /// equation-store alternative) or free.
-    fn term(&mut self, t: &LNTerm, local: bool) -> STerm {
+    /// `t`, with every variable free, or, in a range term of an
+    /// equation-store alternative, its witness from `witnesses`.
+    fn term(&mut self, t: &LNTerm, witnesses: Option<&BTreeMap<LVar, LVar>>) -> STerm {
         if is_ground(t) {
             return STerm::Const(ConstKey::Closed(
                 ClosedKind::Term,
                 fingerprint_term(&ac_normal(t)),
             ));
         }
-        self.term_rec(t, local)
+        self.term_rec(t, witnesses)
     }
 
-    fn term_rec(&mut self, t: &LNTerm, local: bool) -> STerm {
+    fn term_rec(&mut self, t: &LNTerm, witnesses: Option<&BTreeMap<LVar, LVar>>) -> STerm {
         match t {
-            Term::Lit(Lit::Var(v)) if local => STerm::Var(VarRef::Local(*v)),
-            Term::Lit(Lit::Var(v)) => self.free_var(*v),
+            Term::Lit(Lit::Var(v)) => match witnesses {
+                None => self.free_var(*v),
+                Some(names) => {
+                    let w = *names.get(v).unwrap_or_else(|| {
+                        panic!("range variable {v:?} has no witness")
+                    });
+                    self.witnesses.insert(w);
+                    STerm::Var(VarRef::Witness(w))
+                }
+            },
             Term::Lit(Lit::Con(n)) => STerm::Const(ConstKey::Name(*n)),
             Term::App(sym, args) => STerm::App(
                 Op::Fun(*sym),
-                args.iter().map(|a| self.term(a, local)).collect(),
+                args.iter().map(|a| self.term(a, witnesses)).collect(),
             ),
         }
     }
 
-    /// One formula, translated in the form `ac_normalize_guarded` gives it --
-    /// the form the content stage canonicalizes.
+    /// One formula, translated in the form `ac_normalize_guarded` gives it
+    /// (deduplicated conjunctions and disjunctions, binder names erased).
     fn formula(&mut self, g: &Guarded) -> STerm {
         self.guarded(&crate::canon::ac_normalize_guarded(g))
     }
@@ -548,7 +663,12 @@ impl Translator<'_> {
             } => {
                 let op = Op::GQuant {
                     ex: matches!(qua, Quant::Ex),
-                    sorts: vars.iter().map(|b| format!("{:?}", b.sort)).collect(),
+                    // Binder names are display hints; bound occurrences
+                    // are de Bruijn indices.
+                    sorts: vars
+                        .iter()
+                        .map(|GBinding { name: _, sort }| format!("{sort:?}"))
+                        .collect(),
                 };
                 let guards = STerm::App(Op::GGuards, guards.iter().map(|a| self.atom(a)).collect());
                 STerm::App(op, vec![guards, self.guarded(body)])
@@ -580,11 +700,17 @@ impl Translator<'_> {
 
     /// A formula fact: annotations are left out (see the module docs).
     fn gfact(&mut self, fact: &GFact) -> STerm {
+        let GFact {
+            persistent,
+            name,
+            args,
+            annotations: _,
+        } = fact;
         let op = Op::GFact {
-            name: fact.name.clone(),
-            persistent: fact.persistent,
+            name: name.clone(),
+            persistent: *persistent,
         };
-        STerm::App(op, fact.args.iter().map(|t| self.gterm(t)).collect())
+        STerm::App(op, args.iter().map(|t| self.gterm(t)).collect())
     }
 
     fn gterm(&mut self, t: &GTerm) -> STerm {
@@ -635,6 +761,43 @@ impl Translator<'_> {
         }
     }
 
+    /// The equation store's disjunction number `d`. The range variables of
+    /// each alternative are its own: they become the alternative's witnesses
+    /// ([`witness`]).
+    fn eq_disj(&mut self, d: usize, disj: &EqDisj) -> STerm {
+        let EqDisj {
+            // Only names the disjunction for its `Split` goal, which is left
+            // out too.
+            split_id: _,
+            substs,
+        } = disj;
+        let alternatives = substs
+            .iter()
+            .enumerate()
+            .map(|(a, alt)| {
+                let mut range_vars: BTreeSet<LVar> = BTreeSet::new();
+                for (_, t) in alt.iter() {
+                    t.for_each_free(&mut |v| {
+                        range_vars.insert(*v);
+                    });
+                }
+                let names: BTreeMap<LVar, LVar> = range_vars
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, v)| (v, witness(d, a, k, v)))
+                    .collect();
+                let binds = alt
+                    .iter()
+                    .map(|(x, t)| {
+                        STerm::App(Op::EqBind, vec![self.free_var(*x), self.term(t, Some(&names))])
+                    })
+                    .collect();
+                STerm::App(Op::EqAlt, binds)
+            })
+            .collect();
+        STerm::App(Op::EqDisj, alternatives)
+    }
+
     /// One goal's payload; `None` for a `Split` goal (see the module docs).
     fn goal(&mut self, goal: &Goal) -> Option<STerm> {
         Some(match goal {
@@ -656,7 +819,7 @@ impl Translator<'_> {
                 disj.0.iter().map(|g| self.formula(g)).collect(),
             ),
             Goal::Subterm((small, big)) => {
-                let args = vec![self.term(small, false), self.term(big, false)];
+                let args = vec![self.term(small, None), self.term(big, None)];
                 STerm::App(Op::GoalSubterm, args)
             }
         })
@@ -741,6 +904,9 @@ pub struct TermGraph {
     pub edges: Vec<(usize, usize)>,
     /// The root binder's variable vertices: the system's free variables.
     pub free_vars: Vec<(usize, LVar)>,
+    /// The witness binder's variable vertices: the equation store's
+    /// witnesses.
+    pub witness_vars: Vec<(usize, LVar)>,
     /// Each vertex's parent in the term (a variable vertex's is its binder,
     /// an occurrence's the application it is an argument of); `None` for the
     /// root.
@@ -796,21 +962,17 @@ impl GraphBuilder {
         match t {
             STerm::Const(c) => self.vertex(Label::Const(c.clone()), pos),
             STerm::Var(r) => {
-                let (v, w) = match r {
-                    VarRef::Free(v) => {
-                        let root = self.scopes.first().filter(|(s, _)| *s == Scope::Root);
-                        (v, root.and_then(|(_, vars)| vars.get(v)).copied())
-                    }
-                    VarRef::Local(v) => (
-                        v,
-                        self.scopes
-                            .iter()
-                            .rev()
-                            .filter(|(s, _)| *s != Scope::Root)
-                            .find_map(|(_, vars)| vars.get(v))
-                            .copied(),
-                    ),
+                let (v, scope) = match r {
+                    VarRef::Free(v) => (v, Scope::Root),
+                    VarRef::Witness(v) => (v, Scope::Witnesses),
                 };
+                let w = self
+                    .scopes
+                    .iter()
+                    .rev()
+                    .find(|(s, _)| *s == scope)
+                    .and_then(|(_, vars)| vars.get(v))
+                    .copied();
                 let w = w.unwrap_or_else(|| {
                     panic!("term_to_graph: no binder binds {r:?} -- system_to_term missed {v}")
                 });
@@ -851,8 +1013,9 @@ impl GraphBuilder {
                     let w = self.vertex(Label::BoundVar(*scope, v.sort), None);
                     self.child_edge(me, w);
                     bound.insert(*v, w);
-                    if *scope == Scope::Root {
-                        self.graph.free_vars.push((w, *v));
+                    match scope {
+                        Scope::Root => self.graph.free_vars.push((w, *v)),
+                        Scope::Witnesses => self.graph.witness_vars.push((w, *v)),
                     }
                 }
                 self.scopes.push((*scope, bound));
@@ -873,6 +1036,113 @@ fn flatten<'t>(op: &Op, args: &'t [STerm], out: &mut Vec<&'t STerm>) {
             STerm::App(inner, inner_args) if inner == op => flatten(op, inner_args, out),
             _ => out.push(a),
         }
+    }
+}
+
+// =============================================================================
+// Step 3: the canonical form of a term
+// =============================================================================
+//
+// The variables of the system term renamed by the canonical renaming, then
+// the whole normalized modulo the AC and C operators: the canonical form.
+
+/// θ from a labeling that puts vertex `w` at canonical position
+/// `position(w)`: the free variables and the witnesses, named per sort
+/// (`mv0`, `fv0`, `tv0`, …) in the order of their vertices' positions.
+fn labelling_from_positions(graph: &TermGraph, position: impl Fn(usize) -> usize) -> CanonLabelling {
+    let mut vars: Vec<(usize, LVar)> = graph
+        .free_vars
+        .iter()
+        .chain(&graph.witness_vars)
+        .map(|&(w, v)| (position(w), v))
+        .collect();
+    vars.sort();
+    let mut labelling = CanonLabelling::empty();
+    for (_, v) in &vars {
+        labelling.bind_next(*v);
+    }
+    labelling
+}
+
+/// `t` with every variable, free or witness, renamed by `theta`. A variable
+/// `theta` does not cover panics ([`rename_var`]): the labelling names every
+/// variable of the system term, so a miss is a translation bug.
+pub fn rename(t: &STerm, theta: &BTreeMap<LVar, LVar>) -> STerm {
+    match t {
+        STerm::Var(VarRef::Free(v)) => STerm::Var(VarRef::Free(rename_var(theta, *v))),
+        STerm::Var(VarRef::Witness(v)) => STerm::Var(VarRef::Witness(rename_var(theta, *v))),
+        STerm::Const(_) => t.clone(),
+        STerm::App(op, args) => {
+            STerm::App(op.clone(), args.iter().map(|a| rename(a, theta)).collect())
+        }
+        STerm::Exists(scope, vars, body) => STerm::Exists(
+            *scope,
+            vars.iter().map(|v| rename_var(theta, *v)).collect(),
+            Box::new(rename(body, theta)),
+        ),
+    }
+}
+
+/// The normal form of `t` modulo the AC and C operators ([`Op::kind`]):
+/// nested applications of an AC operator are flattened into one, as
+/// [`term_to_graph`] flattens them, and the arguments of AC and C operators
+/// and a binder's variables are sorted. Duplicates stay: an AC operator is a
+/// multiset.
+pub fn normalize(t: STerm) -> STerm {
+    match t {
+        STerm::App(op, args) => {
+            let args: Vec<STerm> = args.into_iter().map(normalize).collect();
+            match op.kind() {
+                OpKind::Free => STerm::App(op, args),
+                OpKind::C => {
+                    let mut args = args;
+                    args.sort();
+                    STerm::App(op, args)
+                }
+                OpKind::Ac => {
+                    let mut flat = Vec::with_capacity(args.len());
+                    for a in args {
+                        match a {
+                            // Already normalized, hence flat and sorted.
+                            STerm::App(inner, inner_args) if inner == op => flat.extend(inner_args),
+                            a => flat.push(a),
+                        }
+                    }
+                    flat.sort();
+                    STerm::App(op, flat)
+                }
+            }
+        }
+        STerm::Exists(scope, mut vars, body) => {
+            vars.sort();
+            STerm::Exists(scope, vars, Box::new(normalize(*body)))
+        }
+        t @ (STerm::Var(_) | STerm::Const(_)) => t,
+    }
+}
+
+/// A SHA-256 fingerprint of `t`, through its derived `Hash`: the variables
+/// hash by name, sort and index, the operators and constants by content, and
+/// every variable-length part with its length, so different terms feed
+/// different byte sequences.
+pub fn fingerprint_sterm(t: &STerm) -> Fingerprint {
+    let mut h = Sha256Hasher(FingerprintHasher::new());
+    std::hash::Hash::hash(t, &mut h);
+    h.0.finish()
+}
+
+/// [`FingerprintHasher`] as a [`std::hash::Hasher`], for a derived `Hash`.
+/// Each write is length-prefixed ([`FingerprintHasher::bytes`]).
+struct Sha256Hasher(FingerprintHasher);
+
+impl std::hash::Hasher for Sha256Hasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.bytes(bytes);
+    }
+
+    /// Never read: the digest is [`fingerprint_sterm`]'s result.
+    fn finish(&self) -> u64 {
+        unreachable!("Sha256Hasher is read through FingerprintHasher::finish")
     }
 }
 
@@ -905,10 +1175,13 @@ pub struct TermGraphStats {
     pub aut_size: Option<String>,
     pub bliss_search_nodes: u64,
     pub generators: usize,
-    /// Generators that move at least one free-variable vertex. The others
-    /// only permute the inside of the term (identical AC arguments, an
-    /// alternative's local variables) and cannot change θ.
+    /// Generators that move at least one free-variable vertex.
     pub generators_moving_free_vars: usize,
+    /// Generators that move at least one variable vertex, a free variable's
+    /// or a witness's: the ones that can change θ, and so the ones the
+    /// generator check checks. The others only permute the inside of the
+    /// term (identical AC arguments).
+    pub generators_moving_vars: usize,
     /// Generators under which the canonical form changes: each one is a
     /// symmetry of the graph that is not one of the system, i.e. the
     /// encoding lost information. Counted only with
@@ -920,7 +1193,8 @@ pub struct TermGraphStats {
     pub generator_moves: BTreeMap<String, usize>,
     /// [`Self::generator_moves`] of the non-genuine generators only.
     pub non_genuine_moves: BTreeMap<String, usize>,
-    /// The `CanonicalSystem` fields a non-genuine generator changes.
+    /// The sections of the form ([`SYSTEM_SECTIONS`]) a non-genuine
+    /// generator changes.
     pub non_genuine_fields: BTreeMap<String, usize>,
     /// A hash of bliss's canonical graph: the key table, the colors in
     /// canonical order and the canonical edges. Equal for isomorphic graphs;
@@ -939,10 +1213,9 @@ pub struct TermGraphStats {
 /// measurements.
 ///
 /// The steps: the term and its graph; bliss's canonical labeling of the
-/// graph; θ names the free variables, per sort, in the order of their
-/// vertices' canonical positions; the form is `sys` renamed by θ, field by
-/// field. The equation store's alternatives are still canonicalized by the
-/// content stage's own per-alternative canonizer.
+/// graph; θ names the free variables and the witnesses, per sort, in the
+/// order of their vertices' canonical positions; the form is the term
+/// renamed by θ and normalized.
 pub fn canonicalize_constraint_system_via_term_graph_with_labelling(
     sys: &System,
     options: TermGraphOptions,
@@ -960,9 +1233,10 @@ pub fn canonicalize_constraint_system_via_term_graph_with_labelling(
     stats.free_vars = graph.free_vars.len();
     stats.time_graph = start.elapsed();
 
+    let has_vars = !graph.free_vars.is_empty() || !graph.witness_vars.is_empty();
     let mut labeling: Option<Permutation> = None;
     let mut generators: Vec<Permutation> = Vec::new();
-    if !graph.free_vars.is_empty() || options.certificate {
+    if has_vars || options.certificate {
         let start = Instant::now();
         let (result, bliss_stats) = run_bliss_with_stats(&to_dimacs(&graph.colors, &graph.edges)?)?;
         stats.time_bliss = start.elapsed();
@@ -976,66 +1250,44 @@ pub fn canonicalize_constraint_system_via_term_graph_with_labelling(
         labeling = Some(result.canonical_labeling);
         generators = result.generators;
     }
+    let position = |w: usize| {
+        labeling
+            .as_ref()
+            .expect("bliss runs whenever there is a variable")
+            .image_of(w)
+    };
 
-    let mut order: Vec<(usize, LVar)> = graph
-        .free_vars
-        .iter()
-        .map(|&(w, v)| {
-            let position = labeling
-                .as_ref()
-                .expect("bliss runs whenever there is a free variable")
-                .image_of(w);
-            (position, v)
-        })
-        .collect();
-
-    // Sort according to bliss' canonical labelling. The tuple (usize, LVar)
-    // sorts on the first entry, which is the Lvar's image, i.e., the canonical
-    // order on its vertex, under the canonical labelling.
-    order.sort();
-    let mut labelling = CanonLabelling::empty();
-    for (_, v) in &order {
-        labelling.bind_next(*v);
-    }
+    let labelling = labelling_from_positions(&graph, position);
 
     let start = Instant::now();
-    let canon = content_under(sys, &labelling);
+    let canon = content_under(&term, &labelling);
     stats.time_content = start.elapsed();
 
-    let var_of: BTreeMap<usize, LVar> = graph.free_vars.iter().copied().collect();
+    // Any other canonical labeling is the canonical one composed with an
+    // automorphism: under a symmetry of the system it names the variables
+    // differently but gives the same form.
     let start = Instant::now();
+    let variable_vertices: Vec<usize> = graph
+        .free_vars
+        .iter()
+        .chain(&graph.witness_vars)
+        .map(|&(w, _)| w)
+        .collect();
     for g in &generators {
         let moves = generator_moves(&graph, g);
         for moved in &moves {
             *stats.generator_moves.entry(moved.clone()).or_insert(0) += 1;
         }
-        let sigma: BTreeMap<LVar, LVar> = graph
-            .free_vars
-            .iter()
-            .map(|&(w, v)| {
-                let image = var_of.get(&g.image_of(w)).unwrap_or_else(|| {
-                    panic!(
-                        "an automorphism maps the variable vertex of {v} to a non-variable vertex"
-                    )
-                });
-                (v, *image)
-            })
-            .collect();
-        if sigma.iter().all(|(v, image)| v == image) {
+        if graph.free_vars.iter().any(|&(w, _)| g.image_of(w) != w) {
+            stats.generators_moving_free_vars += 1;
+        }
+        if variable_vertices.iter().all(|&w| g.image_of(w) == w) {
             continue;
         }
-        stats.generators_moving_free_vars += 1;
+        stats.generators_moving_vars += 1;
         if options.check_generators {
-            // θ∘σ, built like θ itself: `CanonLabelling::from_theta` would
-            // move the per-sort cursors, and with them the names the
-            // content stage gives an alternative's local variables.
-            let preimage: BTreeMap<LVar, LVar> =
-                sigma.iter().map(|(v, image)| (*image, *v)).collect();
-            let mut moved = CanonLabelling::empty();
-            for (_, v) in &order {
-                moved.bind_next(preimage[v]);
-            }
-            let other = content_under(sys, &moved);
+            let moved = labelling_from_positions(&graph, |w| position(g.image_of(w)));
+            let other = content_under(&term, &moved);
             if other != canon {
                 stats.non_genuine_generators += 1;
                 for moved in &moves {
@@ -1061,9 +1313,8 @@ pub fn canonicalize_constraint_system_via_term_graph_with_labelling(
 
 /// The distinct `parent > subtree` label pairs of the subtrees `g` moves
 /// whose parent it fixes: what a symmetry of the term graph swaps, e.g.
-/// `EqAlt > Binder` (two alpha-equivalent alternatives) or
-/// `Binder(EqAlternative) > BoundVar(EqAlternative, Msg)` (two local variables
-/// of one alternative).
+/// `EqDisj > EqAlt` (two alpha-equivalent alternatives) or
+/// `Binder(Witnesses) > BoundVar(Witnesses, Msg)` (two witnesses).
 pub fn generator_moves(graph: &TermGraph, g: &Permutation) -> BTreeSet<String> {
     (0..graph.keys.len())
         .filter(|&v| g.image_of(v) != v)
@@ -1103,69 +1354,47 @@ fn label_name(key: &VKey) -> String {
     }
 }
 
-/// `sys` renamed by `labelling`, which names every free variable of it: a
-/// variable `system_to_term` missed has no entry, and renaming it panics.
-fn content_under(sys: &System, labelling: &CanonLabelling) -> CanonicalSystem {
-    let graph_part = renamed_graph_part_term(sys, labelling.theta());
-    canonicalize_system_content(sys, labelling, graph_part)
+/// The canonical form of the system term `term` under `labelling`: its
+/// `System[…]` body renamed and normalized. A variable `labelling` does not
+/// name panics.
+fn content_under(term: &STerm, labelling: &CanonLabelling) -> CanonicalSystem {
+    let STerm::Exists(Scope::Root, _, witnesses) = term else {
+        panic!("system_to_term built a term without the root binder: {term}")
+    };
+    let STerm::Exists(Scope::Witnesses, _, body) = &**witnesses else {
+        panic!("system_to_term built a term without the witness binder: {term}")
+    };
+    CanonicalSystem::new(normalize(rename(body, labelling.theta())))
 }
 
-/// The graph part of `sys` renamed by `theta` and sorted: rule instances
-/// (with their rule's identity), edges, less-than atoms and `last_atom`.
-/// Formula and goal actions are not repeated here: the form keeps them in its
-/// `formulas` and `goals`.
-pub fn renamed_graph_part_term(sys: &System, theta: &BTreeMap<LVar, LVar>) -> LNTerm {
-    let node = |nid: LVar| var_term(rename_var(theta, nid));
-    let mut nodes: Vec<LNTerm> = sys
-        .nodes
-        .iter()
-        .map(|(nid, ru)| {
-            graph_tag(
-                "RuleInstanceVertexTerm",
-                vec![
-                    node(*nid),
-                    rule_identity_marker(ru),
-                    apply_renaming(theta, crate::canon::rule_to_term(ru)),
-                ],
-            )
-        })
-        .collect();
-    nodes.sort();
-    let mut edges: Vec<LNTerm> = sys
-        .edges
-        .iter()
-        .map(|e| {
-            graph_tag(
-                "EdgeTerm",
-                vec![
-                    node(e.src.0),
-                    index_marker(e.src.1 .0),
-                    node(e.tgt.0),
-                    index_marker(e.tgt.1 .0),
-                ],
-            )
-        })
-        .collect();
-    edges.sort();
-    let mut less: Vec<LNTerm> = sys
-        .less_atoms
-        .iter()
-        .map(|la| graph_tag("LessTerm", vec![node(la.smaller), node(la.larger)]))
-        .collect();
-    less.sort();
-    let last = match sys.last_atom {
-        Some(nid) => graph_tag("LastAtomTerm", vec![node(nid)]),
-        None => graph_marker("NoLastAtom"),
+/// `goal` as its system's canonical form writes it, without its solved flag:
+/// translated like a goal of the system term, renamed by `labelling` and
+/// normalized. `None` for a `Split` goal, which the form leaves out.
+pub(crate) fn canonical_goal(goal: &Goal, labelling: &CanonLabelling) -> Option<STerm> {
+    let (mut free, mut witnesses) = (BTreeSet::new(), BTreeSet::new());
+    let mut tr = Translator {
+        free: &mut free,
+        witnesses: &mut witnesses,
     };
-    graph_tag(
-        "TermGraphPartTerm",
-        vec![
-            graph_tag("NodesTerm", nodes),
-            graph_tag("EdgesTerm", edges),
-            graph_tag("LessAtomsTerm", less),
-            last,
-        ],
-    )
+    let payload = tr.goal(goal)?;
+    Some(normalize(rename(&payload, labelling.theta())))
+}
+
+/// `disj`, the equation store's disjunction number `conj_index`, as its
+/// system's canonical form writes it: translated with the witnesses it has
+/// in the system term ([`witness`]), renamed by `labelling` and normalized.
+pub(crate) fn canonical_eq_disj(
+    disj: &EqDisj,
+    conj_index: usize,
+    labelling: &CanonLabelling,
+) -> STerm {
+    let (mut free, mut witnesses) = (BTreeSet::new(), BTreeSet::new());
+    let mut tr = Translator {
+        free: &mut free,
+        witnesses: &mut witnesses,
+    };
+    let term = tr.eq_disj(conj_index, disj);
+    normalize(rename(&term, labelling.theta()))
 }
 
 /// A hash of `graph` relabeled by `labeling` (see
@@ -1206,12 +1435,16 @@ fn certificate(graph: &TermGraph, labeling: &Permutation) -> Fingerprint {
 impl fmt::Display for STerm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            STerm::Var(VarRef::Free(v)) | STerm::Var(VarRef::Local(v)) => write!(f, "{v}"),
+            STerm::Var(VarRef::Free(v)) => write!(f, "{v}"),
+            // A raw witness's name starts with a NUL.
+            STerm::Var(VarRef::Witness(v)) => {
+                write!(f, "{}", v.to_string().replace(WITNESS_MARK, "?"))
+            }
             STerm::Const(c) => write!(f, "⟨{c}⟩"),
             STerm::Exists(scope, vars, body) => {
                 write!(f, "∃_{scope:?}")?;
                 for v in vars {
-                    write!(f, " {v}")?;
+                    write!(f, " {}", v.to_string().replace(WITNESS_MARK, "?"))?;
                 }
                 write!(f, ". {body}")
             }

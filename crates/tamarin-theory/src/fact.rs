@@ -201,6 +201,23 @@ impl<T: Ord> Ord for Fact<T> {
 }
 
 impl<T> Fact<T> {
+    /// The parts of the fact that the canonical form of a constraint system
+    /// covers (`canon_term_graph::system_to_term`): its tag and its terms.
+    /// The destructuring is exhaustive (no `..`), so a new field is a compile
+    /// error here until it is covered or excluded with a reason.
+    pub(crate) fn canon_parts(&self) -> (&FactTag, &[T]) {
+        let Fact {
+            tag,
+            terms,
+            // Solver hints without semantics.
+            annotations: _,
+            // Caches over `terms`.
+            bloom: _,
+            max_var: _,
+        } = self;
+        (tag, terms)
+    }
+
     /// Generic constructor: stores `bloom = u64::MAX` (no `HasFrees` bound, so
     /// the fingerprint cannot be computed here).  For LNFact producers whose
     /// output reaches `subst_system_once`, prefer [`Fact::fresh`] so the

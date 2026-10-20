@@ -1,8 +1,8 @@
 //! Term language for the Tamarin prover (Rust port).
 //!
 //! Modules ported (mapping to Haskell):
-//! - [`alpha_eq_ac`] ← (no HS analog) canonization of terms for
-//!   $\alphaeqac$, per `work.tex`'s "Canonization of Constraint Systems"
+//! - [`alpha_eq_ac`] ← (no HS analog) canonical variable names for
+//!   canonicalization modulo $\alphaeqac$ (`CanonLabelling`, `rename_var`)
 //! - [`fingerprint`] ← (no HS analog) deterministic content fingerprinting
 //!   of an already-canonical term, so a proof search can keep a compact
 //!   stand-in instead of the full object

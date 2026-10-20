@@ -543,6 +543,81 @@ impl Clone for System {
     }
 }
 
+/// The fields of a [`System`] that its canonical form covers
+/// (`canon_term_graph::system_to_term`), and nothing else: two systems are
+/// alpha-AC equal iff these are. A field left out of the form merges systems
+/// that differ in it, so [`System::canon_fields`] decides every field
+/// explicitly.
+pub(crate) struct CanonFields<'a> {
+    pub(crate) nodes: &'a [(NodeId, RuleACInst)],
+    pub(crate) edges: &'a [Edge],
+    pub(crate) less_atoms: &'a [LessAtom],
+    pub(crate) last_atom: Option<NodeId>,
+    pub(crate) formulas: &'a [Arc<Guarded>],
+    pub(crate) solved_formulas: &'a [Arc<Guarded>],
+    pub(crate) lemmas: &'a [Arc<Guarded>],
+    pub(crate) eq_store: &'a EquationStore,
+    pub(crate) subterm_store: &'a SubtermStore,
+    pub(crate) goals: &'a [(Goal, GoalStatus)],
+    pub(crate) source_kind: Option<SourceKind>,
+    pub(crate) side: Option<Side>,
+}
+
+impl System {
+    /// [`CanonFields`] of `self`. The destructuring is exhaustive (no `..`):
+    /// a new `System` or `SystemContent` field is a compile error here until
+    /// it is either covered or excluded with a reason (and a row in PLAN.md's
+    /// field audit).
+    pub(crate) fn canon_fields(&self) -> CanonFields<'_> {
+        let System {
+            content:
+                SystemContent {
+                    nodes,
+                    edges,
+                    less_atoms,
+                    formulas,
+                    solved_formulas,
+                    lemmas,
+                    last_atom,
+                    eq_store,
+                    subterm_store,
+                    goals,
+                },
+            source_kind,
+            side,
+            // A path-dependent allocation counter.
+            next_goal_nr: _,
+            // Proof-search bookkeeping of the source-case refinement.
+            used_sources: _,
+            sources_lemma_universals: _,
+            // Caches and stamps, excluded from `System`'s `PartialEq` too.
+            max_var_idx_cache: _,
+            node_max_cache: _,
+            content_stamp: _,
+            subst_stamp: _,
+            subst_applied_marker: _,
+            formulas_stamp: _,
+            solved_formulas_stamp: _,
+            formulas_canon_cache: _,
+            solved_formulas_canon_cache: _,
+        } = self;
+        CanonFields {
+            nodes,
+            edges,
+            less_atoms,
+            last_atom: *last_atom,
+            formulas,
+            solved_formulas,
+            lemmas,
+            eq_store,
+            subterm_store,
+            goals,
+            source_kind: *source_kind,
+            side: *side,
+        }
+    }
+}
+
 // Manual `PartialEq` — ignores the cache.  Two systems with identical
 // content but different cache state (e.g. one freshly cloned, one
 // after `bounds_max` populated its cache) must compare equal — see

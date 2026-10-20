@@ -206,6 +206,7 @@
 //! generator check) and `wall_secs` (with it), the term graphs' `vertices`
 //! and `edges`, `aut` (`|Aut|` of each term graph, 1 where bliss was skipped)
 //! and `nontrivial_aut`, `generators`, `generators_moving_free_vars`,
+//! `generators_moving_vars` (free or local to an equation-store alternative),
 //! `non_genuine_generators` (generators that are not a symmetry of the
 //! system: the encoding lost information) with up to 20
 //! `non_genuine_examples`, `generator_moves` (what the generators permute),
@@ -287,7 +288,7 @@ use tamarin_theory::canon_fingerprint::{
 };
 use tamarin_theory::canon_term_graph::{
     canonicalize_constraint_system_via_term_graph_with_labelling, system_to_term, term_to_graph,
-    TermGraphOptions, TermGraphStats,
+    TermGraphOptions, TermGraphStats, SYSTEM_SECTIONS,
 };
 use tamarin_theory::constraint::solver::context::{CutStrategy, ProofContext};
 use tamarin_theory::constraint::solver::proof_method::{
@@ -963,6 +964,7 @@ struct CanonSummary {
     generators: u64,
     /// See `TermGraphStats`.
     generators_moving_free_vars: u64,
+    generators_moving_vars: u64,
     non_genuine_generators: u64,
     /// What the generators permute (`TermGraphStats::generator_moves`).
     generator_moves: BTreeMap<String, u64>,
@@ -991,6 +993,7 @@ impl CanonSummary {
         );
         self.generators += s.generators as u64;
         self.generators_moving_free_vars += s.generators_moving_free_vars as u64;
+        self.generators_moving_vars += s.generators_moving_vars as u64;
         self.non_genuine_generators += s.non_genuine_generators as u64;
         for (moved, n) in &s.generator_moves {
             *self.generator_moves.entry(moved.clone()).or_insert(0) += *n as u64;
@@ -1037,6 +1040,7 @@ impl CanonSummary {
             "nontrivial_aut": self.aut.iter().filter(|&&a| a > 1.0).count(),
             "generators": self.generators,
             "generators_moving_free_vars": self.generators_moving_free_vars,
+            "generators_moving_vars": self.generators_moving_vars,
             "non_genuine_generators": self.non_genuine_generators,
             "generator_moves": self.generator_moves,
             "non_genuine_examples": self.non_genuine_examples,
@@ -1770,27 +1774,16 @@ fn system_text(sys: &System) -> String {
     out
 }
 
-/// A [`CanonicalSystem`] as text, one entry per line.
+/// A [`CanonicalSystem`] as text: its label, then each section.
 fn canonical_text(canon: &CanonicalSystem) -> String {
-    let guarded = |gs: &[tamarin_theory::guarded::Guarded]| {
-        gs.iter()
-            .map(|g| format!("  {}\n", tamarin_theory::pretty_formula::pretty_guarded(g)))
-            .collect::<String>()
-    };
-    format!(
-        "--- graph_part ---\n{}\n--- formulas ---\n{}--- solved_formulas ---\n{}--- lemmas ---\n{}\
-         --- eq_store ---\n{:#?}\n--- subterm_store ---\n{:#?}\n--- goals ---\n{:#?}\n\
-         --- source_kind ---\n{:?}\n--- side ---\n{:?}\n",
-        canon.graph_part,
-        guarded(&canon.formulas),
-        guarded(&canon.solved_formulas),
-        guarded(&canon.lemmas),
-        canon.eq_store,
-        canon.subterm_store,
-        canon.goals,
-        canon.source_kind,
-        canon.side,
-    )
+    let (source_kind, side, contradictory) = canon.label();
+    let mut out = format!(
+        "--- label ---\nsource_kind={source_kind:?} side={side:?} contradictory={contradictory}\n"
+    );
+    for (name, section) in SYSTEM_SECTIONS.iter().zip(canon.sections()) {
+        out.push_str(&format!("--- {name} ---\n{section}\n"));
+    }
+    out
 }
 
 fn dump_formulas(sys: &System, path: &str) {

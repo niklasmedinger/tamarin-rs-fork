@@ -6,11 +6,15 @@ use tamarin_parser::ast as p;
 use tamarin_parser::parser::parse_formula_str;
 use tamarin_term::builtin::{pair, pk, union, xor};
 use tamarin_term::lterm::pub_term;
+use tamarin_term::vterm::var_term;
 
 use crate::bliss_proc::bliss_available;
 use crate::constraint::constraints::{Edge, NodeId};
 use crate::constraint::system::GoalStatus;
-use crate::fact::{ku_fact, proto_fact, proto_fact_ann, FactAnnotation, Multiplicity};
+use crate::fact::{
+    fresh_fact, in_fact, ku_fact, out_fact, proto_fact, proto_fact_ann, FactAnnotation,
+    Multiplicity,
+};
 use crate::guarded::formula_to_guarded;
 use crate::rule::{
     ConcIdx, PremIdx, ProtoRuleACInstInfo, ProtoRuleName, Rule, RuleAttributes, RuleInfo,
@@ -171,7 +175,8 @@ fn the_worked_example_has_one_automorphism_and_it_fixes_every_free_variable() {
         "Nodes{RuleInst[R1](",
         "Edges{Edge[0,0](",
         "LessAtoms{}, ⟨NoLast⟩",
-        "EqConj{EqDisj{∃_EqAlternative",
+        "∃_Witnesses ?w0.0 ?w0.1 ?w0.1.1. System",
+        "EqConj{EqDisj{EqAlt{",
     ] {
         assert!(shown.contains(part), "{part:?} not in {shown}");
     }
@@ -185,9 +190,13 @@ fn the_worked_example_has_one_automorphism_and_it_fixes_every_free_variable() {
     );
     assert_eq!(stats.generators_moving_free_vars, 0);
     assert_eq!(
+        stats.generators_moving_vars, 1,
+        "the swap moves two witnesses; the check confirms it"
+    );
+    assert_eq!(
         stats.generator_moves.keys().collect::<Vec<_>>(),
         [
-            "Binder(EqAlternative) > BoundVar(EqAlternative,Msg)",
+            "Binder(Witnesses) > BoundVar(Witnesses,Msg)",
             "Fun(Ac(Xor)) > Occ(Msg)"
         ]
     );
@@ -627,10 +636,7 @@ fn a_symmetry_of_the_system_is_a_genuine_generator() {
 /// The shape of `xor0`'s split: `~a ⊕ ~b` and `~a.1 ⊕ ~b.1`, and the
 /// disjunction `{a, a.1 ↦ u; b, b.1 ↦ v} ∨ {a, b.1 ↦ v; b, a.1 ↦ u}`.
 /// Swapping `~a` and `~b` swaps the two alternatives: a symmetry, which the
-/// check must confirm. More node variables than fresh ones make a labelling
-/// whose cursors are rebuilt from θ's image (`CanonLabelling::from_theta`)
-/// name the alternatives' local variables differently, so a check built that
-/// way reports the symmetry as not genuine.
+/// check must confirm, local variable names included.
 #[test]
 fn a_symmetry_swapping_equation_store_alternatives_is_genuine() {
     if !bliss_available() {
@@ -736,4 +742,358 @@ fn exactly_the_renamed_copies_are_equal() {
             );
         }
     }
+}
+
+// --- Step 3: the canonical form of a term --------------------------------
+
+fn free(x: LVar) -> STerm {
+    STerm::Var(VarRef::Free(x))
+}
+
+fn ac_union(args: Vec<STerm>) -> STerm {
+    STerm::App(
+        Op::Fun(tamarin_term::function_symbols::FunSym::Ac(
+            tamarin_term::function_symbols::AcSym::Union,
+        )),
+        args,
+    )
+}
+
+#[test]
+fn normalize_flattens_and_sorts_an_ac_operator() {
+    let (a, b, c) = (free(msg("a", 1)), free(msg("b", 2)), free(msg("c", 3)));
+    let nested = ac_union(vec![a.clone(), ac_union(vec![b.clone(), c.clone()])]);
+    let flat_reordered = ac_union(vec![c, b, a]);
+    assert_eq!(normalize(nested), normalize(flat_reordered));
+}
+
+#[test]
+fn normalize_keeps_duplicates_under_an_ac_operator() {
+    let (a, b) = (free(msg("a", 1)), free(msg("b", 2)));
+    let doubled = normalize(ac_union(vec![a.clone(), a.clone(), b.clone()]));
+    let single = normalize(ac_union(vec![a, b]));
+    assert_ne!(doubled, single);
+    assert_ne!(fingerprint_sterm(&doubled), fingerprint_sterm(&single));
+}
+
+#[test]
+fn normalize_sorts_c_arguments_but_not_free_ones() {
+    let (x, y) = (free(msg("x", 1)), free(msg("y", 2)));
+    let eq = |l: &STerm, r: &STerm| normalize(STerm::App(Op::GEq, vec![l.clone(), r.clone()]));
+    assert_eq!(eq(&x, &y), eq(&y, &x));
+    let edge = |l: &STerm, r: &STerm| normalize(STerm::App(Op::Edge(0, 0), vec![l.clone(), r.clone()]));
+    assert_ne!(edge(&x, &y), edge(&y, &x));
+}
+
+#[test]
+fn renaming_then_normalizing_identifies_renamed_copies() {
+    let (x, y, u, v) = (msg("x", 1), msg("y", 2), msg("u", 7), msg("v", 9));
+    let t1 = ac_union(vec![free(x), STerm::App(Op::GEq, vec![free(x), free(y)])]);
+    let t2 = ac_union(vec![STerm::App(Op::GEq, vec![free(v), free(u)]), free(u)]);
+    let theta1: BTreeMap<LVar, LVar> = [(x, msg("mv", 0)), (y, msg("mv", 1))].into();
+    let theta2: BTreeMap<LVar, LVar> = [(u, msg("mv", 0)), (v, msg("mv", 1))].into();
+    let f1 = normalize(rename(&t1, &theta1));
+    let f2 = normalize(rename(&t2, &theta2));
+    assert_eq!(f1, f2);
+    assert_eq!(fingerprint_sterm(&f1), fingerprint_sterm(&f2));
+}
+
+#[test]
+#[should_panic(expected = "not covered by the canonical renaming")]
+fn renaming_a_free_variable_the_labelling_misses_panics() {
+    rename(&free(msg("x", 1)), &BTreeMap::new());
+}
+
+// -- Facts and rule instances ---------------------------------------------
+
+/// A system with one rule instance.
+fn one_node(ru: RuleACInst) -> System {
+    let mut sys = System::empty();
+    sys.add_node(node(0), ru);
+    sys
+}
+
+/// A fact's tag counts (its name, its multiplicity, built-in or not); the
+/// names of its variables do not.
+#[test]
+fn a_facts_tag_counts_and_its_variable_names_do_not() {
+    if !bliss_available() {
+        return;
+    }
+    let with = |f: LNFact| form(&one_node(rule("R", vec![f], vec![], vec![])));
+    let (x, y) = (msg("x", 0), msg("y", 3));
+    let st = |m: Multiplicity| proto_fact(m, "St", vec![v(x)]);
+    assert_eq!(with(fact("Login", vec![v(x)])), with(fact("Login", vec![v(y)])));
+    assert_ne!(with(fact("Login", vec![v(x)])), with(fact("Logout", vec![v(x)])));
+    assert_ne!(with(st(Multiplicity::Linear)), with(st(Multiplicity::Persistent)));
+    let n = fresh("n", 0);
+    assert_ne!(
+        with(fresh_fact(v(n))),
+        with(proto_fact(Multiplicity::Linear, "Fr", vec![v(n)])),
+        "a built-in tag never collides with a protocol fact of the same name"
+    );
+}
+
+/// A rule instance counts up to renaming: which variables its facts share,
+/// and which group a fact is in, count; `new_vars`, derived from the facts,
+/// does not.
+#[test]
+fn a_rule_instance_counts_up_to_renaming() {
+    if !bliss_available() {
+        return;
+    }
+    let (x, y, u) = (msg("x", 0), msg("y", 0), msg("u", 4));
+    let forward = |a: LVar, b: LVar| one_node(rule("R", vec![in_fact(v(a))], vec![], vec![out_fact(v(b))]));
+    assert_eq!(form(&forward(x, x)), form(&forward(u, u)));
+    assert_ne!(form(&forward(x, x)), form(&forward(x, y)));
+    let f = fact("P", vec![v(x)]);
+    assert_ne!(
+        form(&one_node(rule("R", vec![f.clone()], vec![], vec![]))),
+        form(&one_node(rule("R", vec![], vec![], vec![f])))
+    );
+    let base = rule("R", vec![in_fact(v(x))], vec![], vec![]);
+    assert_eq!(
+        form(&one_node(base.clone())),
+        form(&one_node(base.with_new_vars(vec![v(fresh("n", 0))])))
+    );
+}
+
+// -- Formulas ----------------------------------------------------------------
+
+fn formula_form(f: &str) -> CanonicalSystem {
+    let mut sys = System::empty();
+    sys.formulas_mut().push(Arc::new(g(f)));
+    form(&sys)
+}
+
+/// `work.tex`'s example `z = y ∧ ∃ x i. G(x)@i`: the names of the free
+/// variables and the order of the conjuncts do not count, which variable
+/// is which does.
+#[test]
+fn a_formulas_free_variables_are_renamed_with_the_system() {
+    if !bliss_available() {
+        return;
+    }
+    let original = formula_form("z = y & Ex x #i. G(x)@i");
+    assert_eq!(original, formula_form("b.4 = a.2 & Ex x #i. G(x)@i"));
+    assert_eq!(original, formula_form("(Ex x #i. G(x)@i) & y = z"));
+    assert_ne!(original, formula_form("z = z & Ex x #i. G(x)@i"));
+}
+
+/// Bound variables are de Bruijn indices and are never permuted, so the
+/// order of the binders in one block counts: `∀ x y` and `∀ y x` over the
+/// same body give different forms. A missed merge, never a wrong one.
+#[test]
+fn the_binder_order_inside_a_block_counts() {
+    if !bliss_available() {
+        return;
+    }
+    assert_ne!(
+        formula_form("All x y #i. P(x, y) @ #i ==> F"),
+        formula_form("All y x #i. P(x, y) @ #i ==> F")
+    );
+    assert_eq!(
+        formula_form("All x y #i. P(x, y) @ #i ==> F"),
+        formula_form("All a b #j. P(a, b) @ #j ==> F")
+    );
+}
+
+// -- The equation store, continued -------------------------------------------
+
+/// Maude numbers a unifier's witnesses arbitrarily: their numbering does not
+/// count.
+#[test]
+fn an_alternatives_witness_numbering_does_not_count() {
+    if !bliss_available() {
+        return;
+    }
+    let x = msg("x", 0);
+    let system = |w: u64| {
+        let mut sys = ku_goal_system(vec![v(x)]);
+        let (w1, w2) = (msg("w", w), msg("w", w + 1));
+        set_conj(&mut sys, vec![vec![alt(vec![(x, pair(v(w1), v(w2)))])]]);
+        sys
+    };
+    assert_eq!(form(&system(100)), form(&system(500)));
+}
+
+/// One witness in two range terms of an alternative is not two witnesses.
+#[test]
+fn a_witness_shared_across_range_terms_counts() {
+    if !bliss_available() {
+        return;
+    }
+    let (p, q) = (msg("p", 0), msg("q", 0));
+    let system = |second: LVar| {
+        let w = msg("w", 9);
+        let mut sys = ku_goal_system(vec![pair(v(p), v(q))]);
+        set_conj(
+            &mut sys,
+            vec![vec![alt(vec![(p, pair(v(w), v(w))), (q, v(second))])]],
+        );
+        sys
+    };
+    assert_ne!(form(&system(msg("w", 9))), form(&system(msg("w", 10))));
+}
+
+/// `w1 ⊕ w2` alone cannot tell its witnesses apart; `pair(w, w)` for one of
+/// them can. The four alternatives are equal up to renaming, so their forms
+/// are equal whichever witness the pair uses and whatever the keys' raw
+/// indices: the tie is settled by content, not by raw variable order.
+#[test]
+fn a_tie_between_witnesses_is_settled_by_the_other_range_term() {
+    if !bliss_available() {
+        return;
+    }
+    let (w1, w2) = (msg("w", 900), msg("w", 901));
+    let mut forms = Vec::new();
+    for (p_idx, q_idx) in [(7, 8), (8, 7)] {
+        let (p, q) = (msg("p", p_idx), msg("q", q_idx));
+        for w in [w1, w2] {
+            let mut sys = ku_goal_system(vec![pair(v(p), v(q))]);
+            set_conj(
+                &mut sys,
+                vec![vec![alt(vec![(p, xor(v(w1), v(w2))), (q, pair(v(w), v(w)))])]],
+            );
+            forms.push(form(&sys));
+        }
+    }
+    assert!(forms.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+/// A witness raw-identical to an unrelated free variable is still local.
+#[test]
+fn a_witness_named_like_another_free_variable_is_still_local() {
+    if !bliss_available() {
+        return;
+    }
+    let (x, y) = (msg("x", 0), msg("y", 42));
+    let system = |w: LVar| {
+        let mut sys = ku_goal_system(vec![pair(v(x), v(y))]);
+        set_conj(&mut sys, vec![vec![alt(vec![(x, pk(v(w)))])]]);
+        sys
+    };
+    assert_eq!(form(&system(y)), form(&system(msg("u", 5))));
+}
+
+/// Alpha-equivalent alternatives of one disjunction are kept apart: the
+/// solver keeps them, and their number is proof-search state.
+#[test]
+fn alpha_equivalent_alternatives_are_not_deduplicated() {
+    if !bliss_available() {
+        return;
+    }
+    let x = msg("x", 0);
+    let system = |n: u64| {
+        let mut sys = ku_goal_system(vec![v(x)]);
+        let alts = (0..n).map(|k| alt(vec![(x, pk(v(msg("w", 100 + k))))])).collect();
+        set_conj(&mut sys, vec![alts]);
+        sys
+    };
+    assert_ne!(form(&system(1)), form(&system(2)));
+}
+
+// -- Goals -------------------------------------------------------------------
+
+/// A `Split` goal only names a disjunction the form has anyway.
+#[test]
+fn a_split_goal_is_left_out() {
+    if !bliss_available() {
+        return;
+    }
+    let x = msg("x", 0);
+    let base = || {
+        let mut sys = ku_goal_system(vec![v(x)]);
+        set_conj(
+            &mut sys,
+            vec![vec![alt(vec![(x, pk(v(msg("w", 1))))]), alt(vec![(x, v(msg("w", 2)))])]],
+        );
+        sys
+    };
+    let mut with_split = base();
+    let mut gs: Vec<(Goal, GoalStatus)> = with_split.goals.iter().cloned().collect();
+    gs.push((Goal::Split(SplitId(0)), GoalStatus::default()));
+    with_split.content_mut().goals = Arc::new(gs);
+    assert_eq!(form(&base()), form(&with_split));
+}
+
+/// Chain, premise, subterm and disjunction goals are renamed with the rest of
+/// the system; the direction of a subterm goal counts.
+#[test]
+fn goals_are_renamed_with_the_system() {
+    if !bliss_available() {
+        return;
+    }
+    let system = |a: NodeId, b: NodeId, x: LVar, y: LVar, swap: bool| {
+        let (s, t) = if swap { (v(y), v(x)) } else { (v(x), v(y)) };
+        let foo = format!("Foo({})", pretty_var(x));
+        let mut sys = System::empty();
+        goals(
+            &mut sys,
+            vec![
+                (Goal::Chain((a, ConcIdx(0)), (b, PremIdx(1))), true),
+                (Goal::Premise((b, PremIdx(2)), in_fact(v(x))), false),
+                (Goal::Subterm((s, t)), false),
+                (
+                    Goal::Disj(crate::constraint::constraints::Disj(vec![g(&foo), g(&foo)])),
+                    false,
+                ),
+            ],
+        );
+        sys
+    };
+    let (x, y) = (msg("x", 0), msg("y", 0));
+    let original = form(&system(node(0), node(1), x, y, false));
+    assert_eq!(
+        original,
+        form(&system(node(5), node(3), msg("u", 2), msg("w", 4), false))
+    );
+    assert_ne!(original, form(&system(node(0), node(1), x, y, true)));
+}
+
+/// A disjunction goal keeps duplicate alternatives.
+#[test]
+fn a_disjunction_goals_duplicate_alternatives_are_kept() {
+    if !bliss_available() {
+        return;
+    }
+    let with = |n: usize| {
+        let mut sys = System::empty();
+        let alternatives = (0..n).map(|_| g("Foo(x.0)")).collect();
+        goals(
+            &mut sys,
+            vec![(Goal::Disj(crate::constraint::constraints::Disj(alternatives)), false)],
+        );
+        form(&sys)
+    };
+    assert_ne!(with(1), with(2));
+}
+
+/// The same raw range variable in two alternatives is two witnesses: each
+/// alternative's are its own.
+#[test]
+fn witnesses_of_different_alternatives_are_independent() {
+    if !bliss_available() {
+        return;
+    }
+    let x = msg("x", 0);
+    let system = |first: LVar, second: LVar| {
+        let mut sys = ku_goal_system(vec![v(x)]);
+        set_conj(
+            &mut sys,
+            vec![vec![alt(vec![(x, pk(v(first)))]), alt(vec![(x, v(second))])]],
+        );
+        sys
+    };
+    let w = msg("w", 1);
+    assert_eq!(form(&system(w, w)), form(&system(msg("u", 3), msg("v", 8))));
+}
+
+/// A witness's name starts with a NUL, which no variable of a theory or of
+/// the solver has; a free variable that did would be confused with one.
+#[test]
+#[should_panic(expected = "named like a witness")]
+fn a_free_variable_named_like_a_witness_panics() {
+    let sys = ku_goal_system(vec![v(LVar::new("\0w0.0", LSort::Msg, 0))]);
+    system_to_term(&sys);
 }
