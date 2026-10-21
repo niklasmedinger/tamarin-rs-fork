@@ -290,7 +290,7 @@ use tamarin_theory::canon_term_graph::{
     canonicalize_constraint_system_via_term_graph_with_labelling, system_to_term, term_to_graph,
     TermGraphOptions, TermGraphStats, SYSTEM_SECTIONS,
 };
-use tamarin_theory::constraint::solver::context::{CutStrategy, ProofContext};
+use tamarin_theory::constraint::solver::context::ProofContext;
 use tamarin_theory::constraint::solver::proof_method::{
     exec_proof_method, ProofMethod, Result as FinishedResult,
 };
@@ -298,7 +298,7 @@ use tamarin_theory::constraint::solver::search::candidate_methods;
 use tamarin_theory::constraint::system::System;
 use tamarin_theory::pretty_system::pretty_fact;
 use tamarin_theory::pretty_theory::pretty_proof_method_inline;
-use tamarin_theory::prove::{build_lemma_proof_context, CliHeuristic};
+use tamarin_theory::prove::ProverSession;
 use tamarin_theory::rule::rule_name_string;
 use tamarin_utils::{env_gate, FastMap};
 
@@ -317,7 +317,10 @@ static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
 /// Seconds since the process started (the first call).
 fn elapsed_secs() -> f64 {
-    PROCESS_START.get_or_init(Instant::now).elapsed().as_secs_f64()
+    PROCESS_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_secs_f64()
 }
 
 /// `eprintln!` with the elapsed time as a prefix.
@@ -416,7 +419,11 @@ fn breadcrumb_text() -> String {
     format!(
         "phase={} node={node} activity={} path={}",
         b.phase,
-        if b.activity.is_empty() { "-" } else { &b.activity },
+        if b.activity.is_empty() {
+            "-"
+        } else {
+            &b.activity
+        },
         if b.path.is_empty() { "-" } else { &b.path }
     )
 }
@@ -473,7 +480,11 @@ fn memory_mib(field: &str) -> Option<u64> {
 /// runs) -- the part that matters when one step takes minutes.
 fn activity_for_log(activity: &str) -> String {
     match activity.rfind(" :: ") {
-        Some(at) => format!("{} ...{}", truncate_for_log(&activity[..at], 300), &activity[at..]),
+        Some(at) => format!(
+            "{} ...{}",
+            truncate_for_log(&activity[..at], 300),
+            &activity[at..]
+        ),
         None => truncate_for_log(activity, 300).to_string(),
     }
 }
@@ -739,7 +750,12 @@ impl Graph {
     fn children(&self) -> Vec<Vec<OrId>> {
         self.nodes
             .iter()
-            .map(|n| n.and.iter().flat_map(|a| a.cases.iter().map(|&(_, c)| c)).collect())
+            .map(|n| {
+                n.and
+                    .iter()
+                    .flat_map(|a| a.cases.iter().map(|&(_, c)| c))
+                    .collect()
+            })
             .collect()
     }
 }
@@ -752,7 +768,6 @@ fn method_kind(m: &ProofMethod) -> &'static str {
         ProofMethod::Induction => "induction",
         ProofMethod::Finished(_) => "finished",
         ProofMethod::Invalidated => "invalidated",
-        ProofMethod::RawSolve(_) => "raw_solve",
     }
 }
 
@@ -768,7 +783,10 @@ fn goal_nr(sys: &System, method: &ProofMethod) -> Option<u64> {
     let ProofMethod::SolveGoal(goal) = method else {
         return None;
     };
-    sys.goals.iter().find(|(g, _)| g == goal).map(|(_, status)| status.nr)
+    sys.goals
+        .iter()
+        .find(|(g, _)| g == goal)
+        .map(|(_, status)| status.nr)
 }
 
 fn result_name(r: &FinishedResult) -> &'static str {
@@ -826,7 +844,10 @@ mod sizes {
             }
             layer = next;
         }
-        TreeSizes { by_depth, distinct_at_depth }
+        TreeSizes {
+            by_depth,
+            distinct_at_depth,
+        }
     }
 
     #[cfg(test)]
@@ -1250,7 +1271,7 @@ impl Explorer<'_> {
         self.graph.processed_by_depth[depth] += 1;
 
         self.publish_progress();
-        if self.flags.progress && self.processed % 20 == 0 {
+        if self.flags.progress && self.processed.is_multiple_of(20) {
             let elapsed = self.started.elapsed().as_secs_f64();
             eprintln!(
                 "[progress] {} canonicalized in {elapsed:.1}s ({:.2}/s), depth={depth}, \
@@ -1269,16 +1290,21 @@ impl Explorer<'_> {
         // A canonicalization panic (e.g. a `theta` miss) must not end the
         // whole exploration: this tool's job is to FIND such gaps across
         // every path, not stop at the first.
-        if let Some((n, out)) = &self.flags.dump_term_graph_at {
-            if self.processed == *n {
-                dump_term_graph(&sys, &format!("{out}.occ{n}"));
-            }
+        if let Some((n, out)) = &self.flags.dump_term_graph_at
+            && self.processed == *n
+        {
+            dump_term_graph(&sys, &format!("{out}.occ{n}"));
         }
         if self.no_canon {
             // `expand` ranks the methods, so a node at the depth limit never
             // pays for it.
             let id = self.graph.add_node(depth, edge);
-            self.queue.push_back(Queued { id, sys, methods: None, sleep });
+            self.queue.push_back(Queued {
+                id,
+                sys,
+                methods: None,
+                sleep,
+            });
             return id;
         }
         set_activity_step("canonicalize");
@@ -1333,7 +1359,8 @@ impl Explorer<'_> {
                 }
                 set_activity_step("candidate_methods");
                 let start = Instant::now();
-                let methods = candidate_methods(&sys, ctx, depth);
+                let methods = candidate_methods(&sys, ctx, depth)
+                    .unwrap_or_else(|e| panic!("candidate_methods: {e}"));
                 methods_took = start.elapsed();
                 let start = Instant::now();
                 let sig = self.method_signature(&sys, &labelling, &methods, edge);
@@ -1342,19 +1369,19 @@ impl Explorer<'_> {
             }
         };
 
-        if let (Some(fp), false) = (fingerprint, self.no_merge) {
-            if let Some(&existing) = self.by_fingerprint.get(&fp) {
-                // A merged occurrence's candidate methods only feed the
-                // merge check.
-                self.timers.canonicalize_merged += canon_took;
-                self.timers.method_check += methods_took;
-                if let Some(sig) = &methods_sig {
-                    let start = Instant::now();
-                    self.check_methods(existing, sig, depth, edge);
-                    self.timers.method_check += start.elapsed();
-                }
-                return existing;
+        if let (Some(fp), false) = (fingerprint, self.no_merge)
+            && let Some(&existing) = self.by_fingerprint.get(&fp)
+        {
+            // A merged occurrence's candidate methods only feed the merge
+            // check.
+            self.timers.canonicalize_merged += canon_took;
+            self.timers.method_check += methods_took;
+            if let Some(sig) = &methods_sig {
+                let start = Instant::now();
+                self.check_methods(existing, sig, depth, edge);
+                self.timers.method_check += start.elapsed();
             }
+            return existing;
         }
         self.timers.candidate_methods += methods_took;
         let id = self.graph.add_node(depth, edge);
@@ -1367,7 +1394,12 @@ impl Explorer<'_> {
         if let (Some(fp), false) = (fingerprint, self.no_merge) {
             self.by_fingerprint.insert(fp, id);
         }
-        self.queue.push_back(Queued { id, sys, methods, sleep });
+        self.queue.push_back(Queued {
+            id,
+            sys,
+            methods,
+            sleep,
+        });
         id
     }
 
@@ -1388,7 +1420,11 @@ impl Explorer<'_> {
         let Some((ids, out)) = &self.flags.dump_merges_into else {
             return;
         };
-        let existing = if self.no_merge { None } else { self.by_fingerprint.get(fp).copied() };
+        let existing = if self.no_merge {
+            None
+        } else {
+            self.by_fingerprint.get(fp).copied()
+        };
         // A new node gets the next id (`Graph::add_node`).
         let id = existing.unwrap_or(self.graph.nodes.len() as OrId);
         if !ids.contains(&id) {
@@ -1402,7 +1438,11 @@ impl Explorer<'_> {
             "node {id}, occurrence {} at depth {depth}, {}\npath: {}\nfingerprint: {}\n\n\
              === system ===\n{}\n=== labelling ===\n{labelling:#?}\n\n=== canonical form ===\n{}",
             self.processed,
-            if existing.is_some() { "merged into it" } else { "created it" },
+            if existing.is_some() {
+                "merged into it"
+            } else {
+                "created it"
+            },
             self.graph.path(edge),
             fingerprint_hex(fp),
             system_text(sys),
@@ -1504,7 +1544,9 @@ impl Explorer<'_> {
         self.method_check.mismatches += 1;
         let (only_rep, only_dup) = multiset_difference(rep_sig, sig);
         let texts = |ids: &[u32]| -> Vec<&str> {
-            ids.iter().map(|&i| self.graph.methods[i as usize].as_str()).collect()
+            ids.iter()
+                .map(|&i| self.graph.methods[i as usize].as_str())
+                .collect()
         };
         eprintln!(
             "METHOD MISMATCH merging into #{rep} (depth {}) via {}\n  \
@@ -1564,8 +1606,14 @@ impl Explorer<'_> {
                 self.queue.push_front(queued);
                 return stop;
             }
-            let Queued { id, sys, methods, sleep } = queued;
-            let expanded = catch_unwind(AssertUnwindSafe(|| self.expand(id, &sys, methods, &sleep)));
+            let Queued {
+                id,
+                sys,
+                methods,
+                sleep,
+            } = queued;
+            let expanded =
+                catch_unwind(AssertUnwindSafe(|| self.expand(id, &sys, methods, &sleep)));
             if let Err(payload) = expanded {
                 self.record_expand_panic(id, panic_message(&*payload).to_string());
                 return StopReason::Panic;
@@ -1622,6 +1670,7 @@ impl Explorer<'_> {
             set_activity("candidate_methods".to_string());
             let (methods, took) = timed(&mut self.timers.candidate_methods, || {
                 candidate_methods(sys, ctx, depth)
+                    .unwrap_or_else(|e| panic!("candidate_methods: {e}"))
             });
             self.graph.node_mut(id).methods_secs += took.as_secs_f64();
             methods
@@ -1686,6 +1735,7 @@ impl Explorer<'_> {
             set_activity(format!("exec_proof_method {step}"));
             let (exec, took) = timed(&mut self.timers.exec_proof_method, || {
                 exec_proof_method(ctx, &method, sys)
+                    .unwrap_or_else(|e| panic!("exec_proof_method: {e}"))
             });
             self.graph.node_mut(id).exec_secs += took.as_secs_f64();
             let Some(cases) = exec else {
@@ -1720,10 +1770,10 @@ impl Explorer<'_> {
                 );
                 self.graph.node_mut(id).and[and_idx as usize].cases[case_idx as usize].1 = child;
             }
-            if self.sleep_sets {
-                if let Some(nr) = goal_nr(sys, &method) {
-                    explored.insert(nr);
-                }
+            if self.sleep_sets
+                && let Some(nr) = goal_nr(sys, &method)
+            {
+                explored.insert(nr);
             }
         }
         // The awake candidates didn't apply (typically `simplify`, ranked
@@ -1760,7 +1810,10 @@ fn system_text(sys: &System) -> String {
     }
     out += "--- edges ---\n";
     for e in sys.edges.iter() {
-        out += &format!("  {}:{} >-> {}:{}\n", e.src.0, e.src.1 .0, e.tgt.0, e.tgt.1 .0);
+        out += &format!(
+            "  {}:{} >-> {}:{}\n",
+            e.src.0, e.src.1 .0, e.tgt.0, e.tgt.1 .0
+        );
     }
     out += "--- less_atoms ---\n";
     for a in sys.less_atoms.iter() {
@@ -1789,19 +1842,31 @@ fn canonical_text(canon: &CanonicalSystem) -> String {
 fn dump_formulas(sys: &System, path: &str) {
     eprintln!("--- formulas/solved_formulas at {path} ---");
     for f in sys.formulas.iter() {
-        eprintln!("  formula: {}", tamarin_theory::pretty_formula::pretty_guarded(f));
+        eprintln!(
+            "  formula: {}",
+            tamarin_theory::pretty_formula::pretty_guarded(f)
+        );
     }
     for f in sys.solved_formulas.iter() {
-        eprintln!("  solved_formula: {}", tamarin_theory::pretty_formula::pretty_guarded(f));
+        eprintln!(
+            "  solved_formula: {}",
+            tamarin_theory::pretty_formula::pretty_guarded(f)
+        );
     }
     eprintln!(
         "  nodes: {:?}",
-        sys.nodes.iter().map(|(n, _)| n.to_string()).collect::<Vec<_>>()
+        sys.nodes
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect::<Vec<_>>()
     );
     eprintln!("  last_atom: {:?}", sys.last_atom);
     eprintln!("  goals ({} total):", sys.goals.len());
     for (goal, status) in sys.goals.iter() {
-        eprintln!("    {goal:?} solved={} looping={}", status.solved, status.looping);
+        eprintln!(
+            "    {goal:?} solved={} looping={}",
+            status.solved, status.looping
+        );
     }
 }
 
@@ -1851,7 +1916,9 @@ fn summarize(graph: &Graph, max_depth: usize) -> Summary {
     .collect();
     for n in &graph.nodes {
         graph_by_min_depth[n.depth as usize] += 1;
-        *status_counts.get_mut(n.status.name()).expect("every status is listed") += 1;
+        *status_counts
+            .get_mut(n.status.name())
+            .expect("every status is listed") += 1;
         if n.canon_err {
             *status_counts.get_mut("canon_err").expect("listed") += 1;
         }
@@ -1862,7 +1929,9 @@ fn summarize(graph: &Graph, max_depth: usize) -> Summary {
 
     let mut violations = Vec::new();
     if !(graph_size <= processed && u128::from(processed) <= tree) {
-        violations.push(format!("graph={graph_size} processed={processed} tree={tree}"));
+        violations.push(format!(
+            "graph={graph_size} processed={processed} tree={tree}"
+        ));
     }
     for (d, &p) in graph.processed_by_depth.iter().enumerate() {
         let t = tree_sizes.by_depth.get(d).copied().unwrap_or(0);
@@ -1897,7 +1966,10 @@ fn summarize(graph: &Graph, max_depth: usize) -> Summary {
 fn fingerprint_hex(fp: &CanonicalSystemFingerprint) -> String {
     let mut h = tamarin_utils::fingerprint::FingerprintHasher::new();
     h.tag(&format!("{fp:?}"));
-    h.finish()[..16].iter().map(|b| format!("{b:02x}")).collect()
+    h.finish()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn node_json(id: usize, n: &OrNode) -> Value {
@@ -1987,7 +2059,10 @@ fn take_load_opts(raw: &[String]) -> (Vec<String>, common::LoadOpts) {
     for a in raw {
         if a == "--auto-sources" {
             load.auto_sources = true;
-        } else if let Some(flag) = a.strip_prefix("-D=").or_else(|| a.strip_prefix("--defines=")) {
+        } else if let Some(flag) = a
+            .strip_prefix("-D=")
+            .or_else(|| a.strip_prefix("--defines="))
+        {
             load.defines.push(flag.to_string());
         } else if a == "-D" || a == "--defines" {
             usage_error("-D wants its flag attached: -D=FLAG");
@@ -2062,7 +2137,10 @@ fn parse_args(raw: &[String]) -> Mode {
             "--trace" => args.trace = true,
             other => usage_error(&format!("unrecognized argument: {other}")),
         }
-        i += if matches!(flag, "--no-merge" | "--no-canon" | "--sleep-sets" | "--trace") {
+        i += if matches!(
+            flag,
+            "--no-merge" | "--no-canon" | "--sleep-sets" | "--trace"
+        ) {
             1
         } else {
             2
@@ -2133,9 +2211,9 @@ fn list_lemmas(theory_path: &str, load: &common::LoadOpts) -> i32 {
 /// for `--diff` mode: it only parses with the `diff` flag, or it has diff/
 /// equivalence lemmas -- the port has no diff-mode prover); `processes`
 /// (SAPIC); `rules`; and `lemmas`, exactly the names
-/// `build_lemma_proof_context` can look up -- after SAPIC and accountability
-/// translation, so accountability's generated lemmas are listed too. `rules`
-/// counts the translated rules.
+/// `ProverSession::context_and_system_for_lemma` can look up -- after SAPIC
+/// and accountability translation, so accountability's generated lemmas are
+/// listed too. `rules` counts the translated rules.
 fn describe_theory(path: &str, load: &common::LoadOpts, out: &mut Value) -> Result<(), String> {
     use tamarin_parser::ast::TheoryItem;
     use tamarin_theory::theory::TraceQuantifier;
@@ -2152,20 +2230,24 @@ fn describe_theory(path: &str, load: &common::LoadOpts, out: &mut Value) -> Resu
             .filter(|i| {
                 matches!(
                     i,
-                    TheoryItem::DiffLemma(_) | TheoryItem::EquivLemma(..) | TheoryItem::DiffEquivLemma(_)
+                    TheoryItem::DiffLemma(_)
+                        | TheoryItem::EquivLemma(..)
+                        | TheoryItem::DiffEquivLemma(_)
                 )
             })
             .count()
     });
     out["diff"] = json!(diff_items > 0 || (plain.is_err() && with_diff_flag.is_ok()));
     let parsed = plain.map_err(|e| format!("parse: {e}"))?;
-    out["processes"] = json!(parsed
-        .items
-        .iter()
-        .any(|i| matches!(i, TheoryItem::TopLevelProcess(_) | TheoryItem::ProcessDef(_))));
-    let translated = catch_unwind(AssertUnwindSafe(|| common::try_load_theory_translated(path, load)))
-        .map_err(|p| format!("load panicked: {}", panic_message(&*p)))??;
-    let elaborated = &translated.elaborated;
+    out["processes"] = json!(parsed.items.iter().any(|i| matches!(
+        i,
+        TheoryItem::TopLevelProcess(_) | TheoryItem::ProcessDef(_)
+    )));
+    let translated = catch_unwind(AssertUnwindSafe(|| {
+        common::try_load_theory_translated(path, load)
+    }))
+    .map_err(|p| format!("load panicked: {}", panic_message(&*p)))??;
+    let elaborated = &translated.theory;
     out["rules"] = json!(elaborated.rules().count());
     out["lemmas"] = elaborated
         .lemmas()
@@ -2177,55 +2259,32 @@ fn describe_theory(path: &str, load: &common::LoadOpts, out: &mut Value) -> Resu
                     TraceQuantifier::ExistsTrace => "exists-trace",
                 },
                 "attributes": l.attributes.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>(),
-                "modulo": l.modulo,
             })
         })
         .collect();
     Ok(())
 }
 
-/// The user function-symbol guards the exploration must hold. Each restores
-/// the bundle that was installed before it on drop, so they must drop in
-/// reverse order of installation: fields drop in declaration order.
-struct UserFunsGuards {
-    _proof: tamarin_theory::elaborate::UserFunsForTheoryGuard,
-    _load: tamarin_theory::elaborate::UserFunsForTheoryGuard,
-}
-
 /// Loads the theory as `tamarin-rs --prove` does (`common::
 /// try_load_theory_for_proving`: SAPIC and accountability translation, the
-/// NDC-checked intruder cache, auto-sources) and builds the lemma's proof
-/// context -- the same per-lemma setup `prove_lemma` uses. Also returns
-/// whether the theory is a SAPIC one. Errors instead of panicking, so a
-/// batch log says which step failed.
-fn setup(args: &Args) -> Result<(ProofContext, System, UserFunsGuards, bool), String> {
+/// NDC-checked intruder cache, auto-sources, the prover session) and builds
+/// the lemma's proof context and initial system -- the per-lemma setup the
+/// prover's proof search starts from. Also returns whether the theory is a
+/// SAPIC one. Errors instead of panicking, so a batch log says which step
+/// failed.
+fn setup(args: &Args) -> Result<(ProverSession, ProofContext, System, bool), String> {
     let loaded = common::try_load_theory_for_proving(&args.theory_path, &args.load)?;
-    let common::Loaded { translated, maude, ndc_cache } = loaded;
-    let sapic = translated.elaborated.is_sapic;
     log!(
-        "loaded: {} rule(s) after translation, sapic={sapic}, auto_sources={}; maude started",
-        translated.elaborated.rules().count(),
-        translated.auto_sources
+        "loaded: {} rule(s) after translation, sapic={}, auto_sources={}; maude started",
+        loaded.translated_rules,
+        loaded.is_sapic,
+        loaded.auto_sources
     );
-    let (ctx, initial_sys, _skeleton_tree, proof_guard) = build_lemma_proof_context(
-        &translated.parsed,
-        &args.lemma,
-        maude,
-        None,
-        // The theory's path, as the CLI passes it: relative oracle paths
-        // (`heuristic: o "..."`) and the default `<theory>.oracle` resolve
-        // against its directory.
-        &args.theory_path,
-        &CliHeuristic::default(),
-        CutStrategy::Dfs,
-        Some(&ndc_cache),
-    )
-    .map_err(|e| format!("build_lemma_proof_context({}): {e:?}", args.lemma))?;
-    let guards = UserFunsGuards {
-        _proof: proof_guard,
-        _load: translated.user_funs_guard,
-    };
-    Ok((ctx, initial_sys, guards, sapic))
+    let (ctx, initial_sys) = loaded
+        .session
+        .context_and_system_for_lemma(&args.lemma)
+        .map_err(|e| format!("context_and_system_for_lemma({}): {e}", args.lemma))?;
+    Ok((loaded.session, ctx, initial_sys, loaded.is_sapic))
 }
 
 /// Writes `doc` to `out` via a temporary file and a rename, so a run killed
@@ -2270,9 +2329,10 @@ fn main() {
     if let Some(limit) = args.setup_timeout.filter(|&secs| secs > 0.0) {
         spawn_setup_watchdog(Duration::from_secs_f64(limit), Arc::clone(&setup_done));
     }
-    // `_user_funs_guard` must stay alive for the WHOLE exploration:
-    // canonicalization needs the installed signature.
-    let (ctx, initial_sys, _user_funs_guards, sapic) = match catch_unwind(AssertUnwindSafe(|| setup(&args))) {
+    // The session lives as long as the exploration, as the prover keeps its
+    // session while proving.
+    let (_session, ctx, initial_sys, sapic) = match catch_unwind(AssertUnwindSafe(|| setup(&args)))
+    {
         Ok(Ok(setup)) => setup,
         Ok(Err(e)) => {
             log!("setup failed: {e}");
@@ -2302,7 +2362,11 @@ fn main() {
             dump_merges_into: std::env::var("DUMP_MERGES_INTO").ok().map(|v| {
                 let ids = v
                     .split(',')
-                    .map(|s| s.trim().parse().expect("DUMP_MERGES_INTO: comma-separated node ids"))
+                    .map(|s| {
+                        s.trim()
+                            .parse()
+                            .expect("DUMP_MERGES_INTO: comma-separated node ids")
+                    })
                     .collect();
                 let out = args
                     .out
@@ -2344,7 +2408,9 @@ fn main() {
     };
     // The root's own visit runs outside `run`'s per-expansion panic capture;
     // with no node to attach a partial result to, a panic there only logs.
-    match catch_unwind(AssertUnwindSafe(|| explorer.visit(initial_sys, 0, None, SleepSet::new()))) {
+    match catch_unwind(AssertUnwindSafe(|| {
+        explorer.visit(initial_sys, 0, None, SleepSet::new())
+    })) {
         Ok(root) => assert_eq!(root, 0, "the root is the first OR node"),
         Err(payload) => {
             log!("visiting the root PANICKED: {}", panic_message(&*payload));
@@ -2482,13 +2548,29 @@ fn main() {
             summary.processed
         );
         for (label, d) in [
-            ("canonicalize_constraint_system (term graph):", t.canonicalize),
+            (
+                "canonicalize_constraint_system (term graph):",
+                t.canonicalize,
+            ),
             ("fingerprint + dedup lookup:", t.fingerprint),
-            ("candidate_methods (ranking, incl. is_finished):", t.candidate_methods),
-            ("exec_proof_method (solving -- maude/AC here):", t.exec_proof_method),
-            ("merge check (methods of merged + signatures):", t.method_check),
+            (
+                "candidate_methods (ranking, incl. is_finished):",
+                t.candidate_methods,
+            ),
+            (
+                "exec_proof_method (solving -- maude/AC here):",
+                t.exec_proof_method,
+            ),
+            (
+                "merge check (methods of merged + signatures):",
+                t.method_check,
+            ),
         ] {
-            println!("  {label:<47}{:>8.2}s ({:>5.1}%)", d.as_secs_f64(), pct(d, total));
+            println!(
+                "  {label:<47}{:>8.2}s ({:>5.1}%)",
+                d.as_secs_f64(),
+                pct(d, total)
+            );
         }
         println!(
             "  sum of measured stages: {:.2}s (wall clock may exceed this by parse/elaborate/setup)",

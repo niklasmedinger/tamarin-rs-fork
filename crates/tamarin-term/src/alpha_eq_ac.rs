@@ -129,7 +129,10 @@ mod tests {
         assert_eq!(labelling.bind_next(x), LVar::new("mv", LSort::Msg, 0));
         assert_eq!(labelling.bind_next(k), LVar::new("fv", LSort::Fresh, 0));
         assert_eq!(labelling.bind_next(y), LVar::new("mv", LSort::Msg, 1));
-        assert_eq!(rename_var(labelling.theta(), x), LVar::new("mv", LSort::Msg, 0));
+        assert_eq!(
+            rename_var(labelling.theta(), x),
+            LVar::new("mv", LSort::Msg, 0)
+        );
     }
 
     #[test]

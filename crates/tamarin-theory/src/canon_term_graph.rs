@@ -88,19 +88,22 @@
 //! | `subterm_store` | `Sub(s, t)` in three sections; `contradictory` in `System`'s label; `old_neg_subterms`, `propagated` excluded |
 //! | `goals` | `Goal[solved](payload)`; `Split` goals (they only name an `EqDisj`), `looping` and `nr` excluded |
 //! | `source_kind`, `side` | `System`'s label |
-//! | `next_goal_nr`, `used_sources`, `sources_lemma_universals`, caches | excluded (PLAN.md's field audit) |
+//! | `next_goal_nr`, caches | excluded (PLAN.md's field audit) |
 //!
 //! Formulas keep their de Bruijn indices as constants, so a quantifier
 //! block's binder order stays significant: two formulas differing only in it
 //! get different forms, a missed merge.
-//! `Conj`/`Disj` and a quantifier's guards are AC, `=` is C, `em` is C, the
-//! AC binary operators of formula terms (`is_ac_binop`) are AC.
+//! `Conj`/`Disj` and a quantifier's guards are AC and `=` is C. A formula's
+//! terms and facts are written like the system's (`Fun(f)`, `Fact[tag]`), with
+//! a free variable as the same variable and a bound one as its de Bruijn
+//! index.
 //!
 //! **Closed subterms** (an `LNTerm`, fact, formula, atom or formula term
 //! without a free variable) become one constant keyed by the fingerprint of
-//! their AC normal form: two of them are equal modulo AC iff their normal
-//! forms are, and no renaming touches them. This keeps lemmas and ground
-//! terms down to one vertex each.
+//! their AC normal form (for the formula parts: of their translation,
+//! normalized): two of them are equal modulo AC iff their normal forms are,
+//! and no renaming touches them. This keeps lemmas and ground terms down to
+//! one vertex each.
 //!
 //! # Step 2: the term as a colored digraph
 //!
@@ -152,20 +155,19 @@ use std::time::{Duration, Instant};
 use tamarin_term::alpha_eq_ac::{rename_var, CanonLabelling};
 use tamarin_term::fingerprint::fingerprint_term;
 use tamarin_term::function_symbols::FunSym;
-use tamarin_term::lterm::{HasFrees, LNTerm, LSort, LVar, Name};
+use tamarin_term::lterm::{BVar, HasFrees, LNTerm, LSort, LVar, Name};
 use tamarin_term::term::Term;
 use tamarin_term::vterm::Lit;
 use tamarin_utils::fingerprint::{Fingerprint, FingerprintHasher};
 
+use crate::atom::{Atom, ProtoAtom};
 use crate::bliss_proc::{run_bliss_with_stats, to_dimacs, BlissError, Color, Permutation};
-use crate::canon::{
-    fact_to_term, fingerprint_atom, fingerprint_gterm, rule_id, varspec_to_lvar, CanonicalSystem,
-    RuleId,
-};
+use crate::canon::{fact_to_term, rule_id, CanonicalSystem, RuleId};
 use crate::constraint::constraints::{Edge, Goal, LessAtom};
 use crate::constraint::system::{CanonFields, GoalStatus, Side, SourceKind, System};
-use crate::fact::{FactTag, LNFact};
-use crate::guarded::{self, BVar, GAtom, GBinding, GFact, GTerm, Guarded, Quant};
+use crate::fact::{Fact, FactTag, LNFact};
+use crate::formula::{BLNTerm, Quantifier};
+use crate::guarded::Guarded;
 use crate::rule::{Rule, RuleACInst};
 use crate::tools::equation_store::EqDisj;
 use crate::tools::subterm_store::SubtermConstraint;
@@ -267,8 +269,8 @@ pub enum FactGroup {
 }
 
 /// The operators. Structural ones are their own variants, so they can never
-/// collide with a theory symbol (which only ever appears wrapped in `Fun`,
-/// `Fact`, `GFact` or a `G…` formula-term variant).
+/// collide with a theory symbol (which only ever appears wrapped in `Fun` or
+/// `Fact`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Op {
     System {
@@ -299,36 +301,21 @@ pub enum Op {
     // Formulas (`Guarded`) ...
     GConj,
     GDisj,
-    /// A quantifier block: existential or not, and the sort hints of its
-    /// binders in order (spelled as written).
+    /// A quantifier block: existential or not, and the sorts of its binders
+    /// in order.
     GQuant {
         ex: bool,
-        sorts: Vec<String>,
+        sorts: Vec<LSort>,
     },
     GGuards,
     GEq,
     GLess,
-    GLessMset,
     GSubterm,
     GAction,
     GLast,
-    GPred,
-    GFact {
-        name: String,
-        persistent: bool,
-    },
-    // ... and their terms (`GTerm`).
-    GApp(String),
-    /// The commutative application `em(a, b)`.
-    GAppC(String),
-    GAlgApp(String),
-    GPair,
-    GDiff,
-    GPatMatch,
-    GBinOp {
-        op: String,
-        ac: bool,
-    },
+    /// The atom-level sugar placeholder (`ProtoAtom::Syntactic`), which has
+    /// no terms and which the solver skips.
+    GSyntactic,
 }
 
 impl Op {
@@ -336,8 +323,7 @@ impl Op {
         match self {
             Op::Section(_) | Op::EqDisj | Op::EqAlt | Op::GoalDisj => OpKind::Ac,
             Op::GConj | Op::GDisj | Op::GGuards => OpKind::Ac,
-            Op::GEq | Op::GAppC(_) => OpKind::C,
-            Op::GBinOp { ac: true, .. } => OpKind::Ac,
+            Op::GEq => OpKind::C,
             Op::Fun(sym) if sym.is_ac() => OpKind::Ac,
             Op::Fun(sym) if sym.is_c() => OpKind::C,
             _ => OpKind::Free,
@@ -359,14 +345,11 @@ pub enum ClosedKind {
 /// A leaf that no renaming touches.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConstKey {
-    /// A name of an `LNTerm` (`'a'`, `~'n'`, `%'n'`): names are constants.
+    /// A name (`'a'`, `~'n'`, `%'n'`), in a system term or a formula: names
+    /// are constants.
     Name(Name),
-    /// A name in a formula term: `PubLit`/`FreshLit`/`NatLit` (0/1/2).
-    FormulaName(u8, String),
-    /// A formula literal other than a name (`Number`, `1`, `%1`, `DH_neutral`).
-    FormulaLiteral(String),
     /// A de Bruijn index: a bound occurrence in a formula.
-    DeBruijn(u32),
+    DeBruijn(u64),
     NoLast,
     /// A subterm without free variables, by the fingerprint of its AC normal
     /// form (see the module docs).
@@ -548,7 +531,11 @@ pub fn system_to_term(sys: &System) -> STerm {
             section(Section::Goals, goals),
         ],
     );
-    let body = STerm::Exists(Scope::Witnesses, witnesses.into_iter().collect(), Box::new(body));
+    let body = STerm::Exists(
+        Scope::Witnesses,
+        witnesses.into_iter().collect(),
+        Box::new(body),
+    );
     STerm::Exists(Scope::Root, free.into_iter().collect(), Box::new(body))
 }
 
@@ -621,9 +608,9 @@ impl Translator<'_> {
             Term::Lit(Lit::Var(v)) => match witnesses {
                 None => self.free_var(*v),
                 Some(names) => {
-                    let w = *names.get(v).unwrap_or_else(|| {
-                        panic!("range variable {v:?} has no witness")
-                    });
+                    let w = *names
+                        .get(v)
+                        .unwrap_or_else(|| panic!("range variable {v:?} has no witness"));
                     self.witnesses.insert(w);
                     STerm::Var(VarRef::Witness(w))
                 }
@@ -643,10 +630,13 @@ impl Translator<'_> {
     }
 
     fn guarded(&mut self, g: &Guarded) -> STerm {
-        if !guarded_has_free(g) {
-            let fp = crate::canon::fingerprint_guarded(g);
-            return STerm::Const(ConstKey::Closed(ClosedKind::Formula, fp));
+        if !has_free(g) {
+            return closed(ClosedKind::Formula, self.guarded_parts(g));
         }
+        self.guarded_parts(g)
+    }
+
+    fn guarded_parts(&mut self, g: &Guarded) -> STerm {
         match g {
             Guarded::Atom(a) => self.atom(a),
             Guarded::Conj(items) => {
@@ -662,13 +652,10 @@ impl Translator<'_> {
                 body,
             } => {
                 let op = Op::GQuant {
-                    ex: matches!(qua, Quant::Ex),
+                    ex: matches!(qua, Quantifier::Ex),
                     // Binder names are display hints; bound occurrences
                     // are de Bruijn indices.
-                    sorts: vars
-                        .iter()
-                        .map(|GBinding { name: _, sort }| format!("{sort:?}"))
-                        .collect(),
+                    sorts: vars.iter().map(|(_, sort)| *sort).collect(),
                 };
                 let guards = STerm::App(Op::GGuards, guards.iter().map(|a| self.atom(a)).collect());
                 STerm::App(op, vec![guards, self.guarded(body)])
@@ -676,88 +663,59 @@ impl Translator<'_> {
         }
     }
 
-    fn atom(&mut self, a: &GAtom) -> STerm {
-        if !atom_has_free(a) {
-            return STerm::Const(ConstKey::Closed(ClosedKind::Atom, fingerprint_atom(a)));
+    fn atom(&mut self, a: &Atom<BLNTerm>) -> STerm {
+        if !has_free(a) {
+            return closed(ClosedKind::Atom, self.atom_parts(a));
         }
-        let two = |tr: &mut Self, op: Op, x: &GTerm, y: &GTerm| {
-            let args = vec![tr.gterm(x), tr.gterm(y)];
+        self.atom_parts(a)
+    }
+
+    fn atom_parts(&mut self, a: &Atom<BLNTerm>) -> STerm {
+        let two = |tr: &mut Self, op: Op, x: &BLNTerm, y: &BLNTerm| {
+            let args = vec![tr.formula_term(x), tr.formula_term(y)];
             STerm::App(op, args)
         };
         match a {
-            GAtom::Eq(x, y) => two(self, Op::GEq, x, y),
-            GAtom::Less(x, y) => two(self, Op::GLess, x, y),
-            GAtom::LessMset(x, y) => two(self, Op::GLessMset, x, y),
-            GAtom::Subterm(x, y) => two(self, Op::GSubterm, x, y),
-            GAtom::Action(fact, t) => {
-                let args = vec![self.gfact(fact), self.gterm(t)];
+            ProtoAtom::EqE(x, y) => two(self, Op::GEq, x, y),
+            ProtoAtom::Less(x, y) => two(self, Op::GLess, x, y),
+            ProtoAtom::Subterm(x, y) => two(self, Op::GSubterm, x, y),
+            ProtoAtom::Action(t, fact) => {
+                let args = vec![self.formula_fact(fact), self.formula_term(t)];
                 STerm::App(Op::GAction, args)
             }
-            GAtom::Last(t) => STerm::App(Op::GLast, vec![self.gterm(t)]),
-            GAtom::Pred(fact) => STerm::App(Op::GPred, vec![self.gfact(fact)]),
+            ProtoAtom::Last(t) => STerm::App(Op::GLast, vec![self.formula_term(t)]),
+            ProtoAtom::Syntactic(_) => STerm::App(Op::GSyntactic, Vec::new()),
         }
     }
 
-    /// A formula fact: annotations are left out (see the module docs).
-    fn gfact(&mut self, fact: &GFact) -> STerm {
-        let GFact {
-            persistent,
-            name,
-            args,
-            annotations: _,
-        } = fact;
-        let op = Op::GFact {
-            name: name.clone(),
-            persistent: *persistent,
-        };
-        STerm::App(op, args.iter().map(|t| self.gterm(t)).collect())
+    /// A fact of a formula, written like a fact of the system; annotations
+    /// are left out (see the module docs).
+    fn formula_fact(&mut self, fact: &Fact<BLNTerm>) -> STerm {
+        let (tag, terms) = fact.canon_parts();
+        STerm::App(
+            Op::Fact(*tag),
+            terms.iter().map(|t| self.formula_term(t)).collect(),
+        )
     }
 
-    fn gterm(&mut self, t: &GTerm) -> STerm {
-        if !gterm_has_free(t) {
-            return STerm::Const(ConstKey::Closed(
-                ClosedKind::FormulaTerm,
-                fingerprint_gterm(t),
-            ));
+    /// A term of a formula, written like a term of the system, with a bound
+    /// variable as its de Bruijn index.
+    fn formula_term(&mut self, t: &BLNTerm) -> STerm {
+        if matches!(t, Term::App(..)) && !has_free(t) {
+            return closed(ClosedKind::FormulaTerm, self.formula_term_parts(t));
         }
+        self.formula_term_parts(t)
+    }
+
+    fn formula_term_parts(&mut self, t: &BLNTerm) -> STerm {
         match t {
-            GTerm::Var(BVar::Free(vs)) => self.free_var(varspec_to_lvar(vs)),
-            GTerm::Var(BVar::Bound(i)) => STerm::Const(ConstKey::DeBruijn(*i)),
-            GTerm::PubLit(s) => STerm::Const(ConstKey::FormulaName(0, s.clone())),
-            GTerm::FreshLit(s) => STerm::Const(ConstKey::FormulaName(1, s.clone())),
-            GTerm::NatLit(s) => STerm::Const(ConstKey::FormulaName(2, s.clone())),
-            GTerm::Number(n) => STerm::Const(ConstKey::FormulaLiteral(format!("Number({n})"))),
-            GTerm::NumberOne => STerm::Const(ConstKey::FormulaLiteral("NumberOne".into())),
-            GTerm::NatOne => STerm::Const(ConstKey::FormulaLiteral("NatOne".into())),
-            GTerm::DhNeutral => STerm::Const(ConstKey::FormulaLiteral("DhNeutral".into())),
-            GTerm::App(n, args) if &**n == "em" && args.len() == 2 => STerm::App(
-                Op::GAppC(n.to_string()),
-                args.iter().map(|a| self.gterm(a)).collect(),
+            Term::Lit(Lit::Var(BVar::Free(v))) => self.free_var(*v),
+            Term::Lit(Lit::Var(BVar::Bound(i))) => STerm::Const(ConstKey::DeBruijn(*i)),
+            Term::Lit(Lit::Con(n)) => STerm::Const(ConstKey::Name(*n)),
+            Term::App(sym, args) => STerm::App(
+                Op::Fun(*sym),
+                args.iter().map(|a| self.formula_term(a)).collect(),
             ),
-            GTerm::App(n, args) => STerm::App(
-                Op::GApp(n.to_string()),
-                args.iter().map(|a| self.gterm(a)).collect(),
-            ),
-            GTerm::AlgApp(n, a, b) => {
-                let args = vec![self.gterm(a), self.gterm(b)];
-                STerm::App(Op::GAlgApp(n.to_string()), args)
-            }
-            GTerm::Pair(items) => {
-                STerm::App(Op::GPair, items.iter().map(|a| self.gterm(a)).collect())
-            }
-            GTerm::Diff(a, b) => {
-                let args = vec![self.gterm(a), self.gterm(b)];
-                STerm::App(Op::GDiff, args)
-            }
-            GTerm::PatMatch(x) => STerm::App(Op::GPatMatch, vec![self.gterm(x)]),
-            GTerm::BinOp(op, a, b) => {
-                let op_key = Op::GBinOp {
-                    op: format!("{op:?}"),
-                    ac: guarded::is_ac_binop(op),
-                };
-                let args = vec![self.gterm(a), self.gterm(b)];
-                STerm::App(op_key, args)
-            }
         }
     }
 
@@ -789,7 +747,10 @@ impl Translator<'_> {
                 let binds = alt
                     .iter()
                     .map(|(x, t)| {
-                        STerm::App(Op::EqBind, vec![self.free_var(*x), self.term(t, Some(&names))])
+                        STerm::App(
+                            Op::EqBind,
+                            vec![self.free_var(*x), self.term(t, Some(&names))],
+                        )
                     })
                     .collect();
                 STerm::App(Op::EqAlt, binds)
@@ -834,44 +795,17 @@ fn is_ground(t: &LNTerm) -> bool {
     }
 }
 
-fn gterm_has_free(t: &GTerm) -> bool {
-    match t {
-        GTerm::Var(BVar::Free(_)) => true,
-        GTerm::Var(BVar::Bound(_))
-        | GTerm::PubLit(_)
-        | GTerm::FreshLit(_)
-        | GTerm::NatLit(_)
-        | GTerm::Number(_)
-        | GTerm::NumberOne
-        | GTerm::NatOne
-        | GTerm::DhNeutral => false,
-        GTerm::App(_, args) | GTerm::Pair(args) => args.iter().any(gterm_has_free),
-        GTerm::AlgApp(_, a, b) | GTerm::Diff(a, b) | GTerm::BinOp(_, a, b) => {
-            gterm_has_free(a) || gterm_has_free(b)
-        }
-        GTerm::PatMatch(x) => gterm_has_free(x),
-    }
+/// Whether `x` (a formula, atom or formula term) has a free variable.
+fn has_free<T: HasFrees>(x: &T) -> bool {
+    let mut any = false;
+    x.for_each_free(&mut |_| any = true);
+    any
 }
 
-fn atom_has_free(a: &GAtom) -> bool {
-    match a {
-        GAtom::Eq(x, y) | GAtom::Less(x, y) | GAtom::LessMset(x, y) | GAtom::Subterm(x, y) => {
-            gterm_has_free(x) || gterm_has_free(y)
-        }
-        GAtom::Action(fact, t) => fact.args.iter().any(gterm_has_free) || gterm_has_free(t),
-        GAtom::Last(t) => gterm_has_free(t),
-        GAtom::Pred(fact) => fact.args.iter().any(gterm_has_free),
-    }
-}
-
-fn guarded_has_free(g: &Guarded) -> bool {
-    match g {
-        Guarded::Atom(a) => atom_has_free(a),
-        Guarded::Conj(items) | Guarded::Disj(items) => items.iter().any(guarded_has_free),
-        Guarded::GGuarded { guards, body, .. } => {
-            guards.iter().any(atom_has_free) || guarded_has_free(body)
-        }
-    }
+/// The constant for a subterm without free variables: the fingerprint of its
+/// translation, normalized (see the module docs).
+fn closed(kind: ClosedKind, t: STerm) -> STerm {
+    STerm::Const(ConstKey::Closed(kind, fingerprint_sterm(&normalize(t))))
 }
 
 // =============================================================================
@@ -1049,7 +983,10 @@ fn flatten<'t>(op: &Op, args: &'t [STerm], out: &mut Vec<&'t STerm>) {
 /// θ from a labeling that puts vertex `w` at canonical position
 /// `position(w)`: the free variables and the witnesses, named per sort
 /// (`mv0`, `fv0`, `tv0`, …) in the order of their vertices' positions.
-fn labelling_from_positions(graph: &TermGraph, position: impl Fn(usize) -> usize) -> CanonLabelling {
+fn labelling_from_positions(
+    graph: &TermGraph,
+    position: impl Fn(usize) -> usize,
+) -> CanonLabelling {
     let mut vars: Vec<(usize, LVar)> = graph
         .free_vars
         .iter()
@@ -1337,7 +1274,6 @@ fn label_name(key: &VKey) -> String {
         Label::Op(op) => match op {
             Op::Fun(sym) => format!("Fun({})", fun_sym_name(sym)),
             Op::Fact(tag) => format!("Fact({})", crate::fact::fact_tag_name(tag)),
-            Op::GFact { name, .. } => format!("GFact({name})"),
             Op::RuleInst(_) => "RuleInst".into(),
             other => {
                 let shown = format!("{other}");
@@ -1488,13 +1424,9 @@ impl fmt::Display for Op {
             Op::GoalPremise(p) => write!(f, "PremiseG[{p}]"),
             Op::Goal { solved } => write!(f, "Goal[{}]", if *solved { "solved" } else { "open" }),
             Op::GQuant { ex, sorts } => {
+                let sorts: Vec<String> = sorts.iter().map(|s| format!("{s:?}")).collect();
                 write!(f, "{}[{}]", if *ex { "Ex" } else { "All" }, sorts.join(","))
             }
-            Op::GFact { name, persistent } => {
-                write!(f, "{}{name}", if *persistent { "!" } else { "" })
-            }
-            Op::GApp(n) | Op::GAppC(n) | Op::GAlgApp(n) => write!(f, "{n}"),
-            Op::GBinOp { op, .. } => write!(f, "{op}"),
             other => write!(f, "{other:?}"),
         }
     }
@@ -1504,7 +1436,6 @@ impl fmt::Display for ConstKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConstKey::Name(n) => write!(f, "{}", LNTerm::Lit(Lit::Con(*n))),
-            ConstKey::FormulaName(_, s) | ConstKey::FormulaLiteral(s) => write!(f, "{s}"),
             ConstKey::DeBruijn(i) => write!(f, "db{i}"),
             ConstKey::NoLast => write!(f, "NoLast"),
             ConstKey::Closed(kind, fp) => {

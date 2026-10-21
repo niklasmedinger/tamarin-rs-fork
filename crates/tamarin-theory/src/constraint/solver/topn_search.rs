@@ -117,6 +117,7 @@ use crate::constraint::solver::search_graph::{
     MergeCounts, StatsReporter, Status, Stored, WorkStats, WorkerEnv, DEPTH_CAP, ROOT,
 };
 use crate::constraint::system::System;
+use crate::prove::ProveError;
 
 // =============================================================================
 // Configuration
@@ -360,6 +361,8 @@ enum Outcome {
     Terminal,
     /// The deadline passed; the result is discarded.
     Aborted,
+    /// Ranking or applying a method failed; the search fails with it.
+    Failed(ProveError),
 }
 
 struct Expansion {
@@ -386,7 +389,18 @@ fn expand_task(ctx: &ProofContext, task: Task, merge: bool) -> Expansion {
     let mut skipped_asleep = 0;
     let stop = search::deadline_reached;
     if stored.ranked.is_none() {
-        stored.ranked = Some(candidate_methods(&stored.sys, ctx, depth as usize));
+        match candidate_methods(&stored.sys, ctx, depth as usize) {
+            Ok(ranked) => stored.ranked = Some(ranked),
+            Err(e) => {
+                return Expansion {
+                    class,
+                    stored,
+                    outcome: Outcome::Failed(e),
+                    work,
+                    skipped_asleep,
+                };
+            }
+        }
     }
     let outcome = loop {
         if stop() {
@@ -402,8 +416,11 @@ fn expand_task(ctx: &ProofContext, task: Task, merge: bool) -> Expansion {
             continue;
         }
         let method = method.clone();
-        let Some(applied) = apply_method(ctx, &stored, &method, cut_children, merge, &mut work)
-        else {
+        let applied = match apply_method(ctx, &stored, &method, cut_children, merge, &mut work) {
+            Ok(applied) => applied,
+            Err(e) => break Outcome::Failed(e),
+        };
+        let Some(applied) = applied else {
             if stop() {
                 break Outcome::Aborted;
             }
@@ -737,7 +754,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Phase 3: adds one expansion to the graph.
-    fn integrate(&mut self, expansion: Expansion) {
+    fn integrate(&mut self, expansion: Expansion) -> Result<(), ProveError> {
         let Expansion {
             class: c,
             stored,
@@ -748,6 +765,7 @@ impl<'a> Engine<'a> {
         self.stats.work.add(&work);
         self.stats.skipped_asleep += skipped_asleep;
         match outcome {
+            Outcome::Failed(e) => return Err(e),
             Outcome::Aborted => {
                 // The search stops after this batch; keep the system anyway
                 // so the graph stays consistent.
@@ -807,6 +825,7 @@ impl<'a> Engine<'a> {
                 self.graph.propagate(parents);
             }
         }
+        Ok(())
     }
 
     fn end(&self) -> Option<End> {
@@ -851,7 +870,9 @@ impl<'a> Engine<'a> {
         );
     }
 
-    fn search(&mut self, env: &WorkerEnv) -> End {
+    /// Fails with the first error in batch order, so which error a search
+    /// reports does not depend on which worker met one first.
+    fn search(&mut self, env: &WorkerEnv) -> Result<End, ProveError> {
         let mut limit = match self.config.order {
             SearchOrder::IdDfs => FIRST_LIMIT.min(self.bound),
             SearchOrder::Bfs => self.bound,
@@ -862,7 +883,7 @@ impl<'a> Engine<'a> {
             loop {
                 if let Some(end) = self.end() {
                     self.report_iteration(limit, &start);
-                    return end;
+                    return Ok(end);
                 }
                 let tasks = self.select_batch(limit);
                 if tasks.is_empty() {
@@ -870,16 +891,16 @@ impl<'a> Engine<'a> {
                 }
                 let results = self.expand_batch(env, tasks);
                 for result in results {
-                    self.integrate(result);
+                    self.integrate(result)?;
                 }
                 self.report_progress();
             }
             self.report_iteration(limit, &start);
             if let Some(end) = self.end() {
-                return end;
+                return Ok(end);
             }
             if self.parked.is_empty() {
-                return End::Exhausted;
+                return Ok(End::Exhausted);
             }
             // The limit applies to the cost and `bound` to the depth: with
             // `alt_cost`, an entry at a depth below `bound` can cost more than
@@ -903,14 +924,14 @@ pub fn run(
     proof_bound: usize,
     config: TopNConfig,
     deadline: Instant,
-) -> ProofNode {
+) -> Result<ProofNode, ProveError> {
     let start = Instant::now();
     let bound = u32::try_from(proof_bound)
         .unwrap_or(u32::MAX)
         .min(DEPTH_CAP);
     let mut engine = Engine::new(ctx, config, bound, deadline);
     engine.add_root(initial.clone());
-    let end = engine.search(&WorkerEnv::capture(Some(deadline)));
+    let end = engine.search(&WorkerEnv::capture(Some(deadline)))?;
     let searched = start.elapsed();
     engine.reporter.finish(
         &ctx.lemma_name,
@@ -922,7 +943,7 @@ pub fn run(
 
     // Materializing runs methods again; the deadline the search may have hit
     // must not cut that short.
-    let previous_deadline = search::replace_deadline(None);
+    let no_deadline = search::capture_search_tls(None);
     let materialize_start = Instant::now();
     let materializer = Materializer {
         graph: &engine.graph,
@@ -932,14 +953,16 @@ pub fn run(
         env: WorkerEnv::capture(None),
         label: "top-N",
     };
-    let root = materializer.root(ctx, initial);
+    let root = {
+        let _tls = search::SearchTlsGuard::install(no_deadline);
+        materializer.root(ctx, initial)?
+    };
     let materialized = materialize_start.elapsed();
-    search::replace_deadline(previous_deadline);
 
     if tamarin_utils::env_gate!("TAM_RS_TOPN_STATS") {
         print_stats(ctx, &config, &engine, end, &root, searched, materialized);
     }
-    root
+    Ok(root)
 }
 
 fn print_stats(
@@ -1192,8 +1215,12 @@ mod tests {
             stored.cursor = cursor;
             stored
         };
-        engine.integrate(expansion(root, at(1), applied(&g, sys.clone())));
-        engine.integrate(expansion(root, at(2), applied(&h, sys.clone())));
+        engine
+            .integrate(expansion(root, at(1), applied(&g, sys.clone())))
+            .expect("integrate");
+        engine
+            .integrate(expansion(root, at(2), applied(&h, sys.clone())))
+            .expect("integrate");
 
         let ands = &engine.graph.class(ROOT).ands;
         let (after_g, after_h) = (ands[0].cases[0].1, ands[1].cases[0].1);
@@ -1212,7 +1239,7 @@ mod tests {
         let result = expand_task(&ctx, task, false);
         assert!(matches!(result.outcome, Outcome::Terminal));
         assert_eq!(result.skipped_asleep, 1);
-        engine.integrate(result);
+        engine.integrate(result).expect("integrate");
         assert_eq!(engine.stats.asleep, 1);
         let class = engine.graph.class(after_h);
         assert!(class.closed && class.ands.is_empty());
@@ -1248,7 +1275,7 @@ mod tests {
         let Some(mut ctx) = ctx() else {
             return;
         };
-        let greedy = run_proof_search(&ctx, make(), bound);
+        let greedy = run_proof_search(&ctx, make(), bound).expect("proof search");
         let expected = pretty_proof_body(&greedy);
         // (merge, sleep_sets)
         let mut settings = vec![(false, false), (false, true)];
@@ -1264,7 +1291,7 @@ mod tests {
                         sleep_sets,
                         ..config(1, merge, batch)
                     });
-                    let top1 = run_proof_search(&ctx, make(), bound);
+                    let top1 = run_proof_search(&ctx, make(), bound).expect("proof search");
                     assert_eq!(
                         pretty_proof_body(&top1),
                         expected,
@@ -1277,7 +1304,7 @@ mod tests {
                     sleep_sets,
                     ..config(3, merge, batch)
                 });
-                let top3 = run_proof_search(&ctx, make(), bound);
+                let top3 = run_proof_search(&ctx, make(), bound).expect("proof search");
                 if matches!(
                     greedy.status,
                     NodeStatus::Solved | NodeStatus::Contradictory
@@ -1319,14 +1346,14 @@ mod tests {
         let Some(mut ctx) = ctx() else {
             return;
         };
-        let greedy = run_proof_search(&ctx, unproducible_action(), 1);
+        let greedy = run_proof_search(&ctx, unproducible_action(), 1).expect("proof search");
         assert_eq!(greedy.status, NodeStatus::Sorry);
         for (batch, alt_cost) in [(1, 0), (4, 0), (1, 8), (4, 8)] {
             ctx.top_n = Some(TopNConfig {
                 alt_cost,
                 ..config(3, false, batch)
             });
-            let top3 = run_proof_search(&ctx, unproducible_action(), 1);
+            let top3 = run_proof_search(&ctx, unproducible_action(), 1).expect("proof search");
             assert_eq!(
                 top3.status,
                 NodeStatus::Contradictory,

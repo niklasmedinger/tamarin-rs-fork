@@ -33,7 +33,6 @@ use std::path::PathBuf;
 use tamarin_theory::bliss_proc::bliss_available;
 use tamarin_theory::canon::canonicalize_constraint_system;
 use tamarin_theory::canon_fingerprint::{compare_fingerprints, fingerprint_constraint_system};
-use tamarin_theory::elaborate::set_user_funs_for_theory;
 use tamarin_theory::system_import::system_from_json;
 
 mod common;
@@ -44,12 +43,15 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn load_system(fixture_name: &str) -> tamarin_theory::constraint::system::System {
+fn load_system(
+    fixture_name: &str,
+    sig: &tamarin_term::maude_sig::MaudeSig,
+) -> tamarin_theory::constraint::system::System {
     let text = std::fs::read_to_string(fixture(fixture_name))
         .unwrap_or_else(|e| panic!("read {fixture_name}: {e}"));
     let json: serde_json::Value =
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {fixture_name} as JSON: {e}"));
-    system_from_json(&json).unwrap_or_else(|e| panic!("system_from_json({fixture_name}): {e}"))
+    system_from_json(&json, sig).unwrap_or_else(|e| panic!("system_from_json({fixture_name}): {e}"))
 }
 
 #[test]
@@ -60,11 +62,10 @@ fn tutorial_khu_client_and_client_khu_systems_canonicalize_identically_as_whole_
 
     // Reconstructing and canonicalizing the systems needs Tutorial.spthy's
     // signature (`h`/`aenc`/`adec`/`pk`) installed.
-    let parsed = common::parse_theory(&common::tutorial_theory_path());
-    let _guard = set_user_funs_for_theory(&parsed);
+    let sig = common::theory_signature(&common::tutorial_theory_path());
 
-    let sys_a = load_system("tutorial_khu_client_system.json");
-    let sys_b = load_system("tutorial_client_khu_system.json");
+    let sys_a = load_system("tutorial_khu_client_system.json", &sig);
+    let sys_b = load_system("tutorial_client_khu_system.json", &sig);
 
     let canon_a = canonicalize_constraint_system(&sys_a)
         .unwrap_or_else(|e| panic!("canonicalize_constraint_system(a): {e:?}"));
@@ -102,15 +103,17 @@ fn tutorial_systems_have_equal_certificates_and_only_genuine_generators() {
     if !bliss_available() {
         return;
     }
-    let parsed = common::parse_theory(&common::tutorial_theory_path());
-    let _guard = set_user_funs_for_theory(&parsed);
+    let sig = common::theory_signature(&common::tutorial_theory_path());
     let options = TermGraphOptions {
         check_generators: true,
         certificate: true,
     };
     let canon = |name: &str| {
-        canonicalize_constraint_system_via_term_graph_with_labelling(&load_system(name), options)
-            .unwrap_or_else(|e| panic!("term-graph canonicalization of {name}: {e:?}"))
+        canonicalize_constraint_system_via_term_graph_with_labelling(
+            &load_system(name, &sig),
+            options,
+        )
+        .unwrap_or_else(|e| panic!("term-graph canonicalization of {name}: {e:?}"))
     };
     let (form_a, _, stats_a) = canon("tutorial_khu_client_system.json");
     let (form_b, _, stats_b) = canon("tutorial_client_khu_system.json");

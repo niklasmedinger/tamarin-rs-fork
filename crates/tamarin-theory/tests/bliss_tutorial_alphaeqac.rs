@@ -28,7 +28,6 @@ use std::path::PathBuf;
 
 use tamarin_theory::bliss_proc::{bliss_available, run_bliss, to_dimacs};
 use tamarin_theory::canon_term_graph::{system_to_term, term_to_graph, TermGraph, VKey};
-use tamarin_theory::elaborate::set_user_funs_for_theory;
 use tamarin_theory::system_import::system_from_json;
 
 mod common;
@@ -39,12 +38,15 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn load_system(fixture_name: &str) -> tamarin_theory::constraint::system::System {
+fn load_system(
+    fixture_name: &str,
+    sig: &tamarin_term::maude_sig::MaudeSig,
+) -> tamarin_theory::constraint::system::System {
     let text = std::fs::read_to_string(fixture(fixture_name))
         .unwrap_or_else(|e| panic!("read {fixture_name}: {e}"));
     let json: serde_json::Value =
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {fixture_name} as JSON: {e}"));
-    system_from_json(&json).unwrap_or_else(|e| panic!("system_from_json({fixture_name}): {e}"))
+    system_from_json(&json, sig).unwrap_or_else(|e| panic!("system_from_json({fixture_name}): {e}"))
 }
 
 /// `graph` relabeled by its own bliss canonical labeling: the vertex keys in
@@ -77,14 +79,15 @@ fn tutorial_khu_client_and_client_khu_systems_have_isomorphic_term_graphs() {
     }
     // Reconstructing the systems' terms needs Tutorial.spthy's signature
     // (`h`/`aenc`/`adec`/`pk`) installed.
-    let parsed = common::parse_theory(&common::tutorial_theory_path());
-    let _guard = set_user_funs_for_theory(&parsed);
+    let sig = common::theory_signature(&common::tutorial_theory_path());
 
     let graph_a = term_to_graph(&system_to_term(&load_system(
         "tutorial_khu_client_system.json",
+        &sig,
     )));
     let graph_b = term_to_graph(&system_to_term(&load_system(
         "tutorial_client_khu_system.json",
+        &sig,
     )));
 
     // Sanity check before asking bliss anything: graphs of different sizes

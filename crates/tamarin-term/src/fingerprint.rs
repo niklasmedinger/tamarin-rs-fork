@@ -221,8 +221,14 @@ mod tests {
     fn changing_a_nested_argument_changes_the_fingerprint() {
         let g = no_eq_sym("g", 2);
         let f = no_eq_sym("f", 1);
-        let t1 = f_app_no_eq(f, vec![f_app_no_eq(g, vec![v("a", LSort::Msg), v("b", LSort::Msg)])]);
-        let t2 = f_app_no_eq(f, vec![f_app_no_eq(g, vec![v("a", LSort::Msg), v("c", LSort::Msg)])]);
+        let t1 = f_app_no_eq(
+            f,
+            vec![f_app_no_eq(g, vec![v("a", LSort::Msg), v("b", LSort::Msg)])],
+        );
+        let t2 = f_app_no_eq(
+            f,
+            vec![f_app_no_eq(g, vec![v("a", LSort::Msg), v("c", LSort::Msg)])],
+        );
         assert_ne!(fingerprint_term(&t1), fingerprint_term(&t2));
     }
 

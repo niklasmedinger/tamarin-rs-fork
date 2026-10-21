@@ -148,7 +148,7 @@ pub fn compare_fingerprints(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canon_term_graph::{Op, Section, STerm, VarRef};
+    use crate::canon_term_graph::{Op, STerm, Section, VarRef};
     use tamarin_term::lterm::{LSort, LVar};
 
     const SECTIONS: [Section; 12] = [
@@ -168,10 +168,7 @@ mod tests {
 
     /// A canonical form with every section empty, `last` absent, and the
     /// given label.
-    fn form_with(
-        contradictory: bool,
-        change: impl Fn(&str, STerm) -> STerm,
-    ) -> CanonicalSystem {
+    fn form_with(contradictory: bool, change: impl Fn(&str, STerm) -> STerm) -> CanonicalSystem {
         let mut sections: Vec<STerm> = SECTIONS
             .iter()
             .map(|s| STerm::App(Op::Section(*s), Vec::new()))

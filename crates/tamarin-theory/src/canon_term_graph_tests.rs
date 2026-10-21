@@ -2,20 +2,18 @@ use super::*;
 
 use std::sync::Arc;
 
-use tamarin_parser::ast as p;
 use tamarin_parser::parser::parse_formula_str;
 use tamarin_term::builtin::{pair, pk, union, xor};
 use tamarin_term::lterm::pub_term;
+use tamarin_term::maude_sig::pair_maude_sig;
 use tamarin_term::vterm::var_term;
 
 use crate::bliss_proc::bliss_available;
 use crate::constraint::constraints::{Edge, NodeId};
 use crate::constraint::system::GoalStatus;
 use crate::fact::{
-    fresh_fact, in_fact, ku_fact, out_fact, proto_fact, proto_fact_ann, FactAnnotation,
-    Multiplicity,
+    fresh_fact, in_fact, ku_fact, out_fact, proto_fact, FactAnnotation, Multiplicity,
 };
-use crate::guarded::formula_to_guarded;
 use crate::rule::{
     ConcIdx, PremIdx, ProtoRuleACInstInfo, ProtoRuleName, Rule, RuleAttributes, RuleInfo,
 };
@@ -60,8 +58,10 @@ fn rule(
 }
 
 fn g(s: &str) -> Guarded {
-    let f = parse_formula_str(s).unwrap_or_else(|e| panic!("parse {s:?}: {e}"));
-    formula_to_guarded(&f).unwrap_or_else(|e| panic!("formula_to_guarded {s:?}: {e}"))
+    let sig = pair_maude_sig();
+    let f = parse_formula_str(s, &sig).unwrap_or_else(|e| panic!("parse {s:?}: {e}"));
+    crate::elaborate::formula_to_guarded_parsed(&f, &sig)
+        .unwrap_or_else(|e| panic!("formula_to_guarded {s:?}: {e:?}"))
 }
 
 fn alt(entries: Vec<(LVar, LNTerm)>) -> LNSubstVFresh {
@@ -360,25 +360,23 @@ fn fact_annotations_do_not_count() {
             Default::default()
         };
         let mut sys = System::empty();
-        let st = proto_fact_ann(Multiplicity::Linear, "St", anns, vec![v(msg("x", 0))]);
+        let st =
+            proto_fact(Multiplicity::Linear, "St", vec![v(msg("x", 0))]).with_annotations(anns);
         sys.add_node(node(0), rule("R", vec![st], vec![], vec![]));
-        let formula_fact = GFact {
-            persistent: false,
-            name: "P".into(),
-            args: Arc::from([GTerm::Var(BVar::Free(p::VarSpec {
-                name: "x".into(),
-                idx: 0,
-                sort: p::SortHint::Msg,
-                typ: None,
-            }))]),
-            annotations: if ann {
-                vec![p::FactAnnotation::SolveFirst]
-            } else {
-                Vec::new()
-            },
-        };
+        let formula_fact = Fact::new(
+            FactTag::Proto(Multiplicity::Linear, "P", 1),
+            vec![var_term(BVar::Free(msg("x", 0)))],
+        )
+        .with_annotations(if ann {
+            [FactAnnotation::SolveFirst].into_iter().collect()
+        } else {
+            Default::default()
+        });
         sys.formulas_mut().push(Arc::new(Guarded::Disj(Arc::from([
-            Guarded::Atom(GAtom::Pred(formula_fact)),
+            Guarded::Atom(ProtoAtom::Action(
+                var_term(BVar::Free(node(1))),
+                formula_fact,
+            )),
             crate::guarded::gfalse(),
         ]))));
         sys
@@ -536,22 +534,14 @@ fn a_free_node_variable_only_in_a_formula_is_named() {
     if !bliss_available() {
         return;
     }
-    let vs = p::VarSpec {
-        name: "v".into(),
-        idx: 3,
-        sort: p::SortHint::Node,
-        typ: None,
-    };
+    let v3 = LVar::new("v", LSort::Node, 3);
     let mut sys = System::empty();
     sys.formulas_mut()
-        .push(Arc::new(Guarded::Atom(GAtom::Last(GTerm::Var(
-            BVar::Free(vs.clone()),
+        .push(Arc::new(Guarded::Atom(ProtoAtom::Last(var_term(
+            BVar::Free(v3),
         )))));
     let (_, labelling, _) = canon(&sys);
-    assert_eq!(
-        labelling.theta()[&varspec_to_lvar(&vs)],
-        LVar::new("tv", LSort::Node, 0)
-    );
+    assert_eq!(labelling.theta()[&v3], LVar::new("tv", LSort::Node, 0));
 }
 
 // -- Ties that only part of the system breaks --------------------------------
@@ -781,7 +771,8 @@ fn normalize_sorts_c_arguments_but_not_free_ones() {
     let (x, y) = (free(msg("x", 1)), free(msg("y", 2)));
     let eq = |l: &STerm, r: &STerm| normalize(STerm::App(Op::GEq, vec![l.clone(), r.clone()]));
     assert_eq!(eq(&x, &y), eq(&y, &x));
-    let edge = |l: &STerm, r: &STerm| normalize(STerm::App(Op::Edge(0, 0), vec![l.clone(), r.clone()]));
+    let edge =
+        |l: &STerm, r: &STerm| normalize(STerm::App(Op::Edge(0, 0), vec![l.clone(), r.clone()]));
     assert_ne!(edge(&x, &y), edge(&y, &x));
 }
 
@@ -823,9 +814,18 @@ fn a_facts_tag_counts_and_its_variable_names_do_not() {
     let with = |f: LNFact| form(&one_node(rule("R", vec![f], vec![], vec![])));
     let (x, y) = (msg("x", 0), msg("y", 3));
     let st = |m: Multiplicity| proto_fact(m, "St", vec![v(x)]);
-    assert_eq!(with(fact("Login", vec![v(x)])), with(fact("Login", vec![v(y)])));
-    assert_ne!(with(fact("Login", vec![v(x)])), with(fact("Logout", vec![v(x)])));
-    assert_ne!(with(st(Multiplicity::Linear)), with(st(Multiplicity::Persistent)));
+    assert_eq!(
+        with(fact("Login", vec![v(x)])),
+        with(fact("Login", vec![v(y)]))
+    );
+    assert_ne!(
+        with(fact("Login", vec![v(x)])),
+        with(fact("Logout", vec![v(x)]))
+    );
+    assert_ne!(
+        with(st(Multiplicity::Linear)),
+        with(st(Multiplicity::Persistent))
+    );
     let n = fresh("n", 0);
     assert_ne!(
         with(fresh_fact(v(n))),
@@ -843,7 +843,8 @@ fn a_rule_instance_counts_up_to_renaming() {
         return;
     }
     let (x, y, u) = (msg("x", 0), msg("y", 0), msg("u", 4));
-    let forward = |a: LVar, b: LVar| one_node(rule("R", vec![in_fact(v(a))], vec![], vec![out_fact(v(b))]));
+    let forward =
+        |a: LVar, b: LVar| one_node(rule("R", vec![in_fact(v(a))], vec![], vec![out_fact(v(b))]));
     assert_eq!(form(&forward(x, x)), form(&forward(u, u)));
     assert_ne!(form(&forward(x, x)), form(&forward(x, y)));
     let f = fact("P", vec![v(x)]);
@@ -953,7 +954,10 @@ fn a_tie_between_witnesses_is_settled_by_the_other_range_term() {
             let mut sys = ku_goal_system(vec![pair(v(p), v(q))]);
             set_conj(
                 &mut sys,
-                vec![vec![alt(vec![(p, xor(v(w1), v(w2))), (q, pair(v(w), v(w)))])]],
+                vec![vec![alt(vec![
+                    (p, xor(v(w1), v(w2))),
+                    (q, pair(v(w), v(w))),
+                ])]],
             );
             forms.push(form(&sys));
         }
@@ -986,7 +990,9 @@ fn alpha_equivalent_alternatives_are_not_deduplicated() {
     let x = msg("x", 0);
     let system = |n: u64| {
         let mut sys = ku_goal_system(vec![v(x)]);
-        let alts = (0..n).map(|k| alt(vec![(x, pk(v(msg("w", 100 + k))))])).collect();
+        let alts = (0..n)
+            .map(|k| alt(vec![(x, pk(v(msg("w", 100 + k))))]))
+            .collect();
         set_conj(&mut sys, vec![alts]);
         sys
     };
@@ -1006,7 +1012,10 @@ fn a_split_goal_is_left_out() {
         let mut sys = ku_goal_system(vec![v(x)]);
         set_conj(
             &mut sys,
-            vec![vec![alt(vec![(x, pk(v(msg("w", 1))))]), alt(vec![(x, v(msg("w", 2)))])]],
+            vec![vec![
+                alt(vec![(x, pk(v(msg("w", 1))))]),
+                alt(vec![(x, v(msg("w", 2)))]),
+            ]],
         );
         sys
     };
@@ -1026,7 +1035,7 @@ fn goals_are_renamed_with_the_system() {
     }
     let system = |a: NodeId, b: NodeId, x: LVar, y: LVar, swap: bool| {
         let (s, t) = if swap { (v(y), v(x)) } else { (v(x), v(y)) };
-        let foo = format!("Foo({})", pretty_var(x));
+        let foo = format!("Foo({}) @ #j", pretty_var(x));
         let mut sys = System::empty();
         goals(
             &mut sys,
@@ -1059,10 +1068,13 @@ fn a_disjunction_goals_duplicate_alternatives_are_kept() {
     }
     let with = |n: usize| {
         let mut sys = System::empty();
-        let alternatives = (0..n).map(|_| g("Foo(x.0)")).collect();
+        let alternatives = (0..n).map(|_| g("Foo(x.0) @ #i.1")).collect();
         goals(
             &mut sys,
-            vec![(Goal::Disj(crate::constraint::constraints::Disj(alternatives)), false)],
+            vec![(
+                Goal::Disj(crate::constraint::constraints::Disj(alternatives)),
+                false,
+            )],
         );
         form(&sys)
     };
@@ -1081,7 +1093,10 @@ fn witnesses_of_different_alternatives_are_independent() {
         let mut sys = ku_goal_system(vec![v(x)]);
         set_conj(
             &mut sys,
-            vec![vec![alt(vec![(x, pk(v(first)))]), alt(vec![(x, v(second))])]],
+            vec![vec![
+                alt(vec![(x, pk(v(first)))]),
+                alt(vec![(x, v(second))]),
+            ]],
         );
         sys
     };

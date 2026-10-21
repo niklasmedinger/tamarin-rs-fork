@@ -104,6 +104,7 @@ use crate::constraint::solver::search_graph::{
     MergeCounts, StatsReporter, Status, Stored, WorkStats, WorkerEnv, DEPTH_CAP, ROOT,
 };
 use crate::constraint::system::System;
+use crate::prove::ProveError;
 
 // =============================================================================
 // Configuration
@@ -395,7 +396,7 @@ fn pick_case(g: &SearchGraph, c: ClassId, a: u16, on_path: &[ClassId]) -> Option
             continue;
         }
         let s = score(total, visits[k], prior, 1.0);
-        if best.map_or(true, |(b, _)| s > b) {
+        if best.is_none_or(|(b, _)| s > b) {
             best = Some((s, k));
         }
     }
@@ -609,8 +610,14 @@ impl<'a> Engine<'a> {
     }
 
     /// Ranks `c`'s candidates, computes their priors from `path`, and
-    /// applies the best `top_n` concurrently.
-    fn expand(&mut self, env: &WorkerEnv, c: ClassId, path: &[(ClassId, u16)]) {
+    /// applies the best `top_n` concurrently. Fails with the first error in
+    /// the order the methods are picked, whichever worker meets one first.
+    fn expand(
+        &mut self,
+        env: &WorkerEnv,
+        c: ClassId,
+        path: &[(ClassId, u16)],
+    ) -> Result<(), ProveError> {
         self.stats.expansions += 1;
         let depth = self.graph.class(c).min_depth;
         let cut = self.cut_children(c);
@@ -620,7 +627,7 @@ impl<'a> Engine<'a> {
             .as_ref()
             .expect("an unexpanded open class keeps its system");
         let (ranked, docs) = env.run(self.ctx, avoid_fresh_state(&stored.sys), |worker_ctx| {
-            let ranked = candidate_methods(&stored.sys, worker_ctx, depth as usize);
+            let ranked = candidate_methods(&stored.sys, worker_ctx, depth as usize)?;
             let docs: Vec<Vec<String>> = if use_bm25 {
                 ranked
                     .iter()
@@ -629,8 +636,8 @@ impl<'a> Engine<'a> {
             } else {
                 Vec::new()
             };
-            (ranked, docs)
-        });
+            Ok::<_, ProveError>((ranked, docs))
+        })?;
         let priors = priors(&self.config, &docs, ranked.len(), &self.query(path));
         let actions: Vec<Action> = priors
             .into_iter()
@@ -652,7 +659,7 @@ impl<'a> Engine<'a> {
         ext.actions = actions;
         ext.path_len = path.len() as u32;
 
-        let results: Vec<(usize, Option<Applied>, WorkStats)> = {
+        let results: Vec<(usize, Result<Option<Applied>, ProveError>, WorkStats)> = {
             let ctx = self.ctx;
             let stored = self.store[c as usize].as_ref().expect("kept above");
             if tasks.len() <= 1 {
@@ -681,6 +688,7 @@ impl<'a> Engine<'a> {
         };
         for (rank, applied, work) in results {
             self.stats.work.add(&work);
+            let applied = applied?;
             if self.graph.class(c).status != Status::Open {
                 // Settled by an earlier method: the rest stay virtual and
                 // are never picked.
@@ -695,10 +703,16 @@ impl<'a> Engine<'a> {
             }
         }
         self.tidy(c);
+        Ok(())
     }
 
     /// Applies `c`'s virtual method `rank`.
-    fn materialize(&mut self, env: &WorkerEnv, c: ClassId, rank: usize) -> Materialized {
+    fn materialize(
+        &mut self,
+        env: &WorkerEnv,
+        c: ClassId,
+        rank: usize,
+    ) -> Result<Materialized, ProveError> {
         self.stats.materializations += 1;
         let cut = self.cut_children(c);
         let method = self.graph.class(c).ext.ranked[rank].clone();
@@ -707,16 +721,16 @@ impl<'a> Engine<'a> {
             .expect("a class with a virtual method keeps its system");
         let (applied, work) = run_method(self.ctx, env, stored, &method, cut, self.config.merge);
         self.stats.work.add(&work);
-        let outcome = match applied {
+        let outcome = match applied? {
             Some(applied) => Materialized::Applied(self.integrate(c, rank, applied)),
-            None if Instant::now() >= self.deadline => return Materialized::Aborted,
+            None if Instant::now() >= self.deadline => return Ok(Materialized::Aborted),
             None => {
                 self.drop_action(c, rank);
                 Materialized::NotApplicable
             }
         };
         self.tidy(c);
-        outcome
+        Ok(outcome)
     }
 
     /// TamRL's `maybe_repath`: recomputes `c`'s priors when `path` reaches
@@ -748,18 +762,21 @@ impl<'a> Engine<'a> {
         c: ClassId,
         on_path: &[ClassId],
         progress: &mut bool,
-    ) -> Option<u16> {
+    ) -> Result<Option<u16>, ProveError> {
         loop {
-            let a = match *ranked_picks(&self.graph, c, on_path).first()? {
+            let Some(&pick) = ranked_picks(&self.graph, c, on_path).first() else {
+                return Ok(None);
+            };
+            let a = match pick {
                 Pick::Method(a) => a,
                 Pick::Virtual(rank) => {
                     *progress = true;
-                    match self.materialize(env, c, rank) {
-                        Materialized::Aborted => return None,
+                    match self.materialize(env, c, rank)? {
+                        Materialized::Aborted => return Ok(None),
                         Materialized::NotApplicable => continue,
                         Materialized::Applied(a) => {
                             if self.graph.class(c).status != Status::Open {
-                                return None;
+                                return Ok(None);
                             }
                             if !method_selectable(&self.graph, c, a as usize, on_path) {
                                 continue;
@@ -770,12 +787,12 @@ impl<'a> Engine<'a> {
                 }
             };
             self.graph.class_mut(c).ext.and_visits[a as usize] += 1;
-            return Some(a);
+            return Ok(Some(a));
         }
     }
 
     /// One traversal from the root; whether it expanded or applied anything.
-    fn step(&mut self, env: &WorkerEnv) -> bool {
+    fn step(&mut self, env: &WorkerEnv) -> Result<bool, ProveError> {
         let mut path: Vec<(ClassId, u16)> = Vec::new();
         let mut on_path = vec![ROOT];
         let mut c = ROOT;
@@ -783,13 +800,13 @@ impl<'a> Engine<'a> {
         while self.graph.class(c).status == Status::Open {
             if !self.graph.class(c).ext.expanded {
                 if self.store[c as usize].is_some() {
-                    self.expand(env, c, &path);
+                    self.expand(env, c, &path)?;
                     progress = true;
                 }
                 break;
             }
             self.maybe_repath(c, &path);
-            let Some(a) = self.pick_method(env, c, &on_path, &mut progress) else {
+            let Some(a) = self.pick_method(env, c, &on_path, &mut progress)? else {
                 break;
             };
             let k = if self.graph.class(c).ands[a as usize].cases.len() == 1 {
@@ -804,7 +821,7 @@ impl<'a> Engine<'a> {
             c = self.graph.class(c).ands[a as usize].cases[k].1;
             on_path.push(c);
         }
-        progress
+        Ok(progress)
     }
 
     /// Marks every open class that reaches nothing to expand as dead, and
@@ -845,26 +862,26 @@ impl<'a> Engine<'a> {
         alive[ROOT as usize]
     }
 
-    fn search(&mut self, env: &WorkerEnv) -> End {
+    fn search(&mut self, env: &WorkerEnv) -> Result<End, ProveError> {
         loop {
             if self.graph.class(ROOT).status != Status::Open {
-                return End::Settled;
+                return Ok(End::Settled);
             }
             if Instant::now() >= self.deadline {
-                return End::Deadline;
+                return Ok(End::Deadline);
             }
             if self.config.budget > 0 && self.stats.steps >= self.config.budget {
-                return End::Budget;
+                return Ok(End::Budget);
             }
             self.stats.steps += 1;
             self.report_progress();
-            if !self.step(env) {
+            if !self.step(env)? {
                 self.stats.idle_steps += 1;
                 if self.graph.class(ROOT).status == Status::Open
                     && Instant::now() < self.deadline
                     && !self.sweep()
                 {
-                    return End::Exhausted;
+                    return Ok(End::Exhausted);
                 }
             }
         }
@@ -879,7 +896,7 @@ fn run_method(
     method: &ProofMethod,
     cut: bool,
     merge: bool,
-) -> (Option<Applied>, WorkStats) {
+) -> (Result<Option<Applied>, ProveError>, WorkStats) {
     let start = Instant::now();
     let mut work = WorkStats::default();
     let applied = env.run(ctx, avoid_fresh_state(&stored.sys), |worker_ctx| {
@@ -902,14 +919,14 @@ pub fn run(
     proof_bound: usize,
     config: McgsConfig,
     deadline: Instant,
-) -> ProofNode {
+) -> Result<ProofNode, ProveError> {
     let start = Instant::now();
     let bound = u32::try_from(proof_bound)
         .unwrap_or(u32::MAX)
         .min(DEPTH_CAP);
     let mut engine = Engine::new(ctx, config, bound, deadline);
     engine.add_root(initial.clone());
-    let end = engine.search(&WorkerEnv::capture(Some(deadline)));
+    let end = engine.search(&WorkerEnv::capture(Some(deadline)))?;
     let searched = start.elapsed();
     engine.reporter.finish(
         &ctx.lemma_name,
@@ -921,7 +938,7 @@ pub fn run(
 
     // Materializing runs methods again; the deadline the search may have hit
     // must not cut that short.
-    let previous_deadline = search::replace_deadline(None);
+    let no_deadline = search::capture_search_tls(None);
     let materialize_start = Instant::now();
     let materializer = Materializer {
         graph: &engine.graph,
@@ -931,14 +948,16 @@ pub fn run(
         env: WorkerEnv::capture(None),
         label: "MCGS",
     };
-    let root = materializer.root(ctx, initial);
+    let root = {
+        let _tls = search::SearchTlsGuard::install(no_deadline);
+        materializer.root(ctx, initial)?
+    };
     let materialized = materialize_start.elapsed();
-    search::replace_deadline(previous_deadline);
 
     if tamarin_utils::env_gate!("TAM_RS_MCGS_STATS") {
         print_stats(ctx, &config, &engine, end, &root, searched, materialized);
     }
-    root
+    Ok(root)
 }
 
 fn print_stats(
@@ -1213,7 +1232,7 @@ mod tests {
             return;
         };
         ctx.lemma_text = std::sync::Arc::from("lemma l: \"All x #i. Out(x) @ #i ==> F\"");
-        let greedy = run_proof_search(&ctx, make(), bound);
+        let greedy = run_proof_search(&ctx, make(), bound).expect("proof search");
         let merges: &[bool] = if crate::bliss_proc::bliss_available() {
             &[false, true]
         } else {
@@ -1222,14 +1241,14 @@ mod tests {
         for &merge in merges {
             for top_n in [1, 0] {
                 ctx.mcgs = Some(mcgs(top_n, merge));
-                let first = run_proof_search(&ctx, make(), bound);
+                let first = run_proof_search(&ctx, make(), bound).expect("proof search");
                 if matches!(
                     greedy.status,
                     NodeStatus::Solved | NodeStatus::Contradictory
                 ) {
                     assert_eq!(first.status, greedy.status, "top_n={top_n} merge={merge}");
                 }
-                let second = run_proof_search(&ctx, make(), bound);
+                let second = run_proof_search(&ctx, make(), bound).expect("proof search");
                 assert_eq!(
                     pretty_proof_body(&first),
                     pretty_proof_body(&second),
@@ -1262,11 +1281,11 @@ mod tests {
         let Some(mut ctx) = ctx() else {
             return;
         };
-        let greedy = run_proof_search(&ctx, unproducible_action(), 1);
+        let greedy = run_proof_search(&ctx, unproducible_action(), 1).expect("proof search");
         assert_eq!(greedy.status, NodeStatus::Sorry);
         for top_n in [1, 0] {
             ctx.mcgs = Some(mcgs(top_n, false));
-            let proof = run_proof_search(&ctx, unproducible_action(), 1);
+            let proof = run_proof_search(&ctx, unproducible_action(), 1).expect("proof search");
             assert_eq!(proof.status, NodeStatus::Contradictory, "top_n={top_n}");
             assert!(
                 matches!(proof.method, ProofMethod::SolveGoal(_)),
@@ -1286,7 +1305,7 @@ mod tests {
             top_n: 1,
             ..McgsConfig::with_budget(1)
         });
-        let proof = run_proof_search(&ctx, unproducible_action(), 10);
+        let proof = run_proof_search(&ctx, unproducible_action(), 10).expect("proof search");
         assert!(
             matches!(proof.method, ProofMethod::Simplify),
             "one step applies the best-ranked method only, got {:?}",

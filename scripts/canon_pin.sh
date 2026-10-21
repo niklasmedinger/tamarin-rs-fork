@@ -18,15 +18,16 @@
 #      is resolved to a commit and its explorer built in a reusable detached
 #      worktree under CACHE_DIR (its own target dir, so the working tree's
 #      build is never touched); the binary is kept per commit.
-#   2. The working tree's explorer is built (`cargo build --release
-#      --example explore_canonical_matches`), uncommitted changes included.
+#   2. The working tree's explorer and prover are built (`cargo build
+#      --release --example explore_canonical_matches --bin tamarin-rs`),
+#      uncommitted changes included; the prover lists the theories' inputs.
 #   3. The tier's list is expanded to (theory, lemma) jobs. A row without
 #      lemmas means every lemma `--list-lemmas` reports on BOTH builds; a
 #      theory whose lemma set differs between them is a LEMMA_SET_DIFF.
 #   4. Phase A runs the BASE explorer for every job not yet in the cache and
 #      stores its normalized JSON (the "stored graph", see canon_pin.py
 #      normalize). The cache key covers the base commit, the theory (+
-#      includes + flags), the lemma, the budget, maude, bliss and the rayon
+#      includes, oracles + flags), the lemma, the budget, maude, bliss and the rayon
 #      thread count, so a stale hit is impossible and a warm cache makes a
 #      re-run cost only the branch side.
 #   5. Phase B runs the working tree's explorer and compares (canon_pin.py
@@ -141,10 +142,14 @@ EXAMPLE=explore_canonical_matches
 
 # --- builds ------------------------------------------------------------------------
 build_branch() {
-    echo "canon_pin: building the working tree's explorer" >&2
-    ( cd "$ROOT" && cargo build --release --example "$EXAMPLE" 2>&1 | tail -3 ) >&2
+    echo "canon_pin: building the working tree's explorer and prover" >&2
+    ( cd "$ROOT" && cargo build --release --example "$EXAMPLE" --bin tamarin-rs 2>&1 | tail -3 ) >&2
     BRANCH_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/release/examples/$EXAMPLE"
     [ -x "$BRANCH_BIN" ] || { echo "canon_pin: working-tree build failed ($BRANCH_BIN missing)" >&2; exit 2; }
+    # `ikey` reads a theory's includes and oracles from the prover's
+    # `input-manifest`.
+    export INPUT_MANIFEST_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/release/tamarin-rs"
+    [ -x "$INPUT_MANIFEST_BIN" ] || { echo "canon_pin: working-tree build failed ($INPUT_MANIFEST_BIN missing)" >&2; exit 2; }
 }
 
 # build_base: sets BASE_SHA and BASE_BIN, building BASE's explorer unless a
@@ -213,14 +218,9 @@ explorer_args() {
     echo "${out# }"
 }
 
-# ikey <rel> <file>: theory sha + include shas + flags (rs_ref_check.sh's ikey).
-ikey() {
-    local h fl inc; h=$(sha256sum "$2" | cut -d' ' -f1); fl=$(flags_for "$1")
-    inc=$(include_shas "$2")
-    if [ -n "$inc" ]; then h="${h}__i$(printf '%s' "$inc" | sha256sum | cut -c1-12)"; fi
-    if [ -n "$fl" ]; then h="${h}__f$(printf '%s' "$fl" | sha256sum | cut -c1-12)"; fi
-    printf '%s' "$h"
-}
+# ikey <rel> <file>: the theory's input identity, includes, oracles and flags
+# (rs_ref_check.sh's ikey).
+ikey() { input_content_key "$2" "$(flags_for "$1")"; }
 
 # run_explorer <bin> <rel> <lemma> <out.json> <log> <extra args...>: one
 # explorer run from the right directory with the right flags, no debug env.
@@ -268,7 +268,9 @@ elif d.get("error"):
 else:
     print("OK " + " ".join(l["name"] for l in d.get("lemmas", [])))'
 }
-export -f run_explorer explorer_args flags_for lemmas_of ikey include_shas
+export -f run_explorer explorer_args flags_for lemmas_of ikey file_sha256 parser_input_manifest \
+    manifest_encode manifest_normalize manifest_decode_into input_manifest \
+    _include_shas_from_manifest _oracle_shas_from_manifest input_content_key
 
 # job_key <rel> <lemma>: the cache key of the BASE result. The path is part
 # of it: the corpus has byte-identical copies in different directories, whose

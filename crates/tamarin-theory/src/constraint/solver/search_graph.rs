@@ -38,7 +38,7 @@ use crate::constraint::solver::proof_method::{
 use crate::constraint::solver::reduction::avoid_fresh_state;
 use crate::constraint::solver::search::{self, candidate_methods, NodeStatus, ProofNode};
 use crate::constraint::system::System;
-use crate::elaborate::CollectedUserFuns;
+use crate::prove::ProveError;
 
 // =============================================================================
 // The AND/OR graph
@@ -535,7 +535,11 @@ impl WorkStats {
     }
 
     fn record_canon(&mut self, took: Duration) {
-        self.canon_min = if self.canons == 0 { took } else { self.canon_min.min(took) };
+        self.canon_min = if self.canons == 0 {
+            took
+        } else {
+            self.canon_min.min(took)
+        };
         self.canon_max = self.canon_max.max(took);
         self.canons += 1;
         self.canon_time += took;
@@ -675,8 +679,9 @@ impl StatsReporter {
 }
 
 /// What a worker thread needs before it runs solver code for this search:
-/// the thread-locals the greedy driver's fan-out also replicates (the
-/// deadline, the user-function signature) and a maude handle of its own.
+/// the search thread-locals the greedy driver's fan-out also replicates (the
+/// deadline, the proof bound, the ranking depth offset) and a maude handle of
+/// its own.
 /// `exec_proof_method` resets its handle's fresh-variable counter at every
 /// step, so a handle shared by two threads would race; seeding each task's
 /// counter from its system also keeps the results independent of the
@@ -690,34 +695,31 @@ impl StatsReporter {
 /// process, which cost nothing measurable where tried (the solver's own work
 /// and canonicalization dominate).
 pub(crate) struct WorkerEnv {
-    deadline: Option<Instant>,
-    user_funs: CollectedUserFuns,
+    tls: search::SearchTlsState,
 }
 
 impl WorkerEnv {
+    /// The calling thread's search thread-locals, with `deadline` in place of
+    /// its deadline.
     pub(crate) fn capture(deadline: Option<Instant>) -> Self {
         WorkerEnv {
-            deadline,
-            user_funs: crate::elaborate::snapshot_user_funs(),
+            tls: search::capture_search_tls(deadline),
         }
     }
 
     /// Runs `f` with this search's thread-locals installed and a maude handle
-    /// seeded at `avoid_next`. Restores the calling thread's deadline after:
-    /// rayon runs part of a parallel map on the calling thread when that is a
-    /// pool thread itself.
+    /// seeded at `avoid_next`. Restores the calling thread's thread-locals
+    /// after: rayon runs part of a parallel map on the calling thread when
+    /// that is a pool thread itself.
     pub(crate) fn run<R>(
         &self,
         ctx: &ProofContext,
         avoid_next: u64,
         f: impl FnOnce(&ProofContext) -> R,
     ) -> R {
-        let previous_deadline = search::replace_deadline(self.deadline);
-        let _user_funs = crate::elaborate::set_user_funs_from_collected(&self.user_funs);
+        let _tls = search::SearchTlsGuard::install(self.tls);
         let maude = ctx.maude.with_fresh_counter_next(avoid_next);
-        let result = f(&ctx.with_swapped_maude(maude));
-        search::replace_deadline(previous_deadline);
-        result
+        f(&ctx.with_swapped_maude(maude))
     }
 }
 
@@ -761,9 +763,11 @@ pub(crate) fn apply_method(
     cut_children: bool,
     merge: bool,
     work: &mut WorkStats,
-) -> Option<Applied> {
+) -> Result<Option<Applied>, ProveError> {
     work.execs += 1;
-    let mut cases = exec_proof_method(ctx, method, &stored.sys)?;
+    let Some(mut cases) = exec_proof_method(ctx, method, &stored.sys)? else {
+        return Ok(None);
+    };
     cases.sort_by(|a, b| a.0.cmp(&b.0));
     let method_fp = stored.labelling.as_ref().map(|labelling| {
         fingerprint_proof_method(&canonicalize_proof_method(method, &stored.sys, labelling))
@@ -779,11 +783,11 @@ pub(crate) fn apply_method(
             (name, child)
         })
         .collect();
-    Some(Applied {
+    Ok(Some(Applied {
         method: method.clone(),
         method_fp,
         cases,
-    })
+    }))
 }
 
 // =============================================================================
@@ -831,29 +835,37 @@ pub(crate) struct Materializer<'g, X> {
     pub(crate) label: &'static str,
 }
 
-fn retain(mut node: ProofNode) -> ProofNode {
-    if search::drop_sys_after_expand(&node, search::sys_retention()) {
+fn retain(ctx: &ProofContext, mut node: ProofNode) -> ProofNode {
+    if search::drop_sys_after_expand(&node, ctx.sys_retention) {
         node.sys = System::default();
     }
     node
 }
 
-fn leaf(method: ProofMethod, sys: System, status: NodeStatus) -> ProofNode {
-    retain(ProofNode {
-        method,
-        sys,
-        children: BTreeMap::new(),
-        status,
-        annotated: true,
-    })
+fn leaf(ctx: &ProofContext, method: ProofMethod, sys: System, status: NodeStatus) -> ProofNode {
+    retain(
+        ctx,
+        ProofNode {
+            method,
+            sys,
+            children: BTreeMap::new(),
+            status,
+            annotated: true,
+        },
+    )
 }
 
-fn sorry(sys: System, message: String) -> ProofNode {
-    leaf(ProofMethod::Sorry(Some(message)), sys, NodeStatus::Sorry)
+fn sorry(ctx: &ProofContext, sys: System, message: String) -> ProofNode {
+    leaf(
+        ctx,
+        ProofMethod::Sorry(Some(message)),
+        sys,
+        NodeStatus::Sorry,
+    )
 }
 
 impl<X: Default + Sync> Materializer<'_, X> {
-    pub(crate) fn root(&self, ctx: &ProofContext, sys: System) -> ProofNode {
+    pub(crate) fn root(&self, ctx: &ProofContext, sys: System) -> Result<ProofNode, ProveError> {
         let resolved = self.resolve(ctx, sys, 0, Some(ROOT));
         self.build(ctx, resolved, 0, None, &[])
     }
@@ -962,12 +974,12 @@ impl<X: Default + Sync> Materializer<'_, X> {
         depth: u32,
         edge: Option<(ClassId, u16)>,
         path: &[ClassId],
-    ) -> ProofNode {
+    ) -> Result<ProofNode, ProveError> {
         match resolved {
-            Resolved::Cut(sys) => sorry(sys, format!("bound {} hit", self.bound)),
+            Resolved::Cut(sys) => Ok(sorry(ctx, sys, format!("bound {} hit", self.bound))),
             Resolved::Finished(sys, result) => {
                 let status = search::node_status_of(&result);
-                leaf(ProofMethod::Finished(result), sys, status)
+                Ok(leaf(ctx, ProofMethod::Finished(result), sys, status))
             }
             Resolved::Class(sys, labelling, c) => {
                 self.expand(ctx, sys, labelling, c, depth, edge, path)
@@ -1024,8 +1036,8 @@ impl<X: Default + Sync> Materializer<'_, X> {
         fp: Fingerprint,
         depth: u32,
         c: ClassId,
-    ) -> ProofMethod {
-        candidate_methods(sys, ctx, depth as usize)
+    ) -> Result<ProofMethod, ProveError> {
+        Ok(candidate_methods(sys, ctx, depth as usize)?
             .into_iter()
             .find(|m| fingerprint_proof_method(&canonicalize_proof_method(m, sys, labelling)) == fp)
             .unwrap_or_else(|| {
@@ -1034,7 +1046,7 @@ impl<X: Default + Sync> Materializer<'_, X> {
                      matches the method applied to the class: canonically equal systems \
                      offer different methods"
                 )
-            })
+            }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1047,27 +1059,33 @@ impl<X: Default + Sync> Materializer<'_, X> {
         depth: u32,
         edge: Option<(ClassId, u16)>,
         path: &[ClassId],
-    ) -> ProofNode {
+    ) -> Result<ProofNode, ProveError> {
         let class = self.graph.class(c);
         if path.contains(&c) {
-            return sorry(sys, format!("{}: cycle", self.label));
+            return Ok(sorry(ctx, sys, format!("{}: cycle", self.label)));
         }
         if class.status == Status::Open && edge.is_some() && edge != class.first_parent {
             // An undecided class is shown once, below the edge that created
             // it; unfolding it everywhere can take exponential space.
-            return sorry(sys, format!("{}: undecided, shown elsewhere", self.label));
+            return Ok(sorry(
+                ctx,
+                sys,
+                format!("{}: undecided, shown elsewhere", self.label),
+            ));
         }
         let mut path = path.to_vec();
         path.push(c);
         let Some(a) = self.choose(c, &path) else {
-            return sorry(sys, self.open_message(c));
+            return Ok(sorry(ctx, sys, self.open_message(c)));
         };
         let and = &class.ands[a];
         let method = match (&labelling, and.method_fp) {
-            (Some(labelling), Some(fp)) => self.matching_method(ctx, &sys, labelling, fp, depth, c),
+            (Some(labelling), Some(fp)) => {
+                self.matching_method(ctx, &sys, labelling, fp, depth, c)?
+            }
             _ => and.method.clone(),
         };
-        let mut cases = exec_proof_method(ctx, &method, &sys).unwrap_or_else(|| {
+        let mut cases = exec_proof_method(ctx, &method, &sys)?.unwrap_or_else(|| {
             panic!("materializing the proof: a method applied during the search no longer applies (class #{c})")
         });
         cases.sort_by(|x, y| x.0.cmp(&y.0));
@@ -1116,20 +1134,19 @@ impl<X: Default + Sync> Materializer<'_, X> {
             _ => resolved,
         };
         let a = a as u16;
+        // The first error in case-name order, whichever worker meets one first.
         let children: BTreeMap<String, ProofNode> = self
             .map_workers(
                 ctx,
                 selected,
                 |(_, r)| r.sys(),
                 |worker_ctx, (name, r)| {
-                    (
-                        name,
-                        self.build(worker_ctx, r, depth + 1, Some((c, a)), &path),
-                    )
+                    self.build(worker_ctx, r, depth + 1, Some((c, a)), &path)
+                        .map(|node| (name, node))
                 },
             )
             .into_iter()
-            .collect();
+            .collect::<Result<_, _>>()?;
         let status = if children.is_empty() {
             // Zero cases close the branch, except under a `sorry` method; as
             // in the greedy driver.
@@ -1139,15 +1156,18 @@ impl<X: Default + Sync> Materializer<'_, X> {
                 NodeStatus::Contradictory
             }
         } else {
-            search::rollup_from_children(&children)
+            search::rollup_status(&children)
         };
-        retain(ProofNode {
-            method,
-            sys,
-            children,
-            status,
-            annotated: true,
-        })
+        Ok(retain(
+            ctx,
+            ProofNode {
+                method,
+                sys,
+                children,
+                status,
+                annotated: true,
+            },
+        ))
     }
 }
 
@@ -1158,15 +1178,15 @@ pub(crate) mod test_support {
     use crate::constraint::constraints::{Disj, Goal, LessAtom, Reason};
     use crate::constraint::solver::context::ProofContext;
     use crate::constraint::system::System;
-    use crate::test_maude::maude_path;
     use std::sync::Arc;
     use tamarin_term::lterm::{LNTerm, LSort, LVar};
     use tamarin_term::maude_sig::pair_maude_sig;
+    use tamarin_test_support::require_maude_path;
 
     /// `None` only when no maude resolves (`TAM_ALLOW_NO_MAUDE`); a maude
     /// that resolves but does not start panics, as in `search`'s tests.
     pub(crate) fn ctx() -> Option<ProofContext> {
-        let path = maude_path()?;
+        let path = require_maude_path()?;
         let h = tamarin_term::maude_proc::MaudeHandle::start(&path, pair_maude_sig())
             .unwrap_or_else(|e| panic!("maude at {path} failed to start: {e:?}"));
         Some(ProofContext::new(h, Vec::new()))

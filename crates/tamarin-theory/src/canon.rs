@@ -9,8 +9,7 @@
 //!   ranking (oracles, tactics). SAPIC produces such pairs
 //!   (`sapic/fast/basic/channels1`'s `incx_1_121` and `incx_3_121`). A
 //!   rule's `new_vars` are left out: they are derived from its facts;
-//! - guarded formulas in AC normal form ([`ac_normalize_guarded`]) and their
-//!   fingerprints ([`fingerprint_guarded`]);
+//! - guarded formulas in AC normal form ([`ac_normalize_guarded`]);
 //! - [`CanonicalSystem`], the entry points
 //!   [`canonicalize_constraint_system`] and
 //!   [`canonicalize_constraint_system_with_labelling`], and proof methods
@@ -96,480 +95,103 @@ pub fn rule_id(ru: &RuleACInst) -> RuleId {
 // A formula enters the system term in AC normal form
 // ([`ac_normalize_guarded`]): conjunctions and disjunctions flattened,
 // deduplicated (`gconj`/`gdisj`) and sorted, the sides of `=` ordered, a
-// quantifier's guards sorted, AC operands inside terms sorted, `em`'s
-// arguments sorted, binder display names and fact annotations erased. Bound
-// variables are de Bruijn indices, so only their position counts, and the
-// order inside a binder block stays significant. A formula without free
-// variables becomes one constant of the system term, keyed by
-// [`fingerprint_guarded`]; the free variables of the others are renamed with
-// the rest of the system term, which sorts the AC parts again afterwards.
+// quantifier's guards sorted, terms rebuilt by the smart constructors (AC
+// operands flattened and sorted, `em`'s arguments sorted), binder display
+// names and fact annotations erased. Bound variables are de Bruijn indices, so
+// only their position counts, and the order inside a binder block stays
+// significant. A formula without free variables becomes one constant of the
+// system term; the free variables of the others are renamed with the rest of
+// the system term, which sorts the AC parts again afterwards.
 
-use crate::guarded::{
-    self, cmp_atom, cmp_guarded, cmp_term, ga, gall, gex, BVar, GAtom,
-    GBinding, GFact, GTerm, Guarded, Quant,
-};
-use tamarin_parser::ast as p;
-use tamarin_term::lterm::LSort;
-use tamarin_utils::fingerprint::{Fingerprint, FingerprintHasher};
+use crate::atom::{Atom, ProtoAtom};
+use crate::fact::Fact;
+use crate::formula::{BLNTerm, Quantifier};
+use crate::guarded::{self, Guarded};
 
-/// `p::SortHint` to `LSort`. `Untagged` (a bare, sigil-less name) resolves
-/// to `Msg`, matching the parser's own default for that position; every
-/// other hint (including the `:msg|:pub|...` suffix spelling) maps to its
-/// named sort. Small, self-contained duplicate of the same conversion this
-/// crate already carries at several call sites (e.g.
-/// `constraint::solver::sources::varspec_sort_to_lsort`,
-/// `elaborate::lnterm_to_term`) — kept local rather than imported across a
-/// module boundary that has no other reason to depend on this one.
-fn sort_hint_to_lsort(s: p::SortHint) -> LSort {
-    use p::{SortHint as S, SuffixSort as SS};
-    match s {
-        S::Msg | S::Untagged | S::Suffix(SS::Msg) => LSort::Msg,
-        S::Pub | S::Suffix(SS::Pub) => LSort::Pub,
-        S::Fresh | S::Suffix(SS::Fresh) => LSort::Fresh,
-        S::Node | S::Suffix(SS::Node) => LSort::Node,
-        S::Nat | S::Suffix(SS::Nat) => LSort::Nat,
-    }
+/// `t` rebuilt by the smart constructors, which flatten and sort the
+/// arguments of AC symbols and sort those of C symbols (`em`).
+fn ac_normalize_term(t: &BLNTerm) -> BLNTerm {
+    tamarin_term::term::map_lits(t, &mut |l| l.clone())
 }
 
-/// A parser-AST variable spec as the `LVar` it denotes.
-pub(crate) fn varspec_to_lvar(v: &p::VarSpec) -> tamarin_term::lterm::LVar {
-    tamarin_term::lterm::LVar::new(v.name.as_str(), sort_hint_to_lsort(v.sort), v.idx)
-}
-
-/// Canonically orders an atom's operands where doing so is sound: `=` is
-/// symmetric (`s = t` and `t = s` are the same atom), so its two sides are
-/// reordered smaller-first by [`cmp_term`]. Every other `GAtom` variant is
-/// directional (`Less`/`Subterm`, or simply not binary) and is returned
-/// unchanged.
-///
-/// A fact's annotations are dropped: they are hints to the solver's goal
-/// ranking with no meaning of their own, and [`fact_to_term`] leaves them out
-/// of rule and goal facts too.
-fn normalize_atom(a: &GAtom) -> GAtom {
+/// An atom with its terms in AC normal form and the sides of `=` ordered:
+/// `=` is symmetric, every other atom is directional. A fact's annotations
+/// are dropped: they are hints to the solver's goal ranking with no meaning
+/// of their own, and [`fact_to_term`] leaves them out of rule and goal facts
+/// too.
+fn normalize_atom(a: &Atom<BLNTerm>) -> Atom<BLNTerm> {
     let t = ac_normalize_term;
-    let f = |fact: &GFact| GFact {
-        persistent: fact.persistent,
-        name: fact.name.clone(),
-        args: fact.args.iter().map(ac_normalize_term).collect(),
-        annotations: Vec::new(),
-    };
     match a {
-        GAtom::Eq(x, y) => {
+        ProtoAtom::EqE(x, y) => {
+            // Ordered after normalizing: `xor(b, a) = c` and `c = xor(a, b)`
+            // settle on the same orientation only once both `xor`s are sorted.
             let (x, y) = (t(x), t(y));
-            // Compare the AC-NORMALIZED sides: swapping has to be decided
-            // after flattening/sorting any AC operator each side carries,
-            // not before — e.g. `xor(b,a) = c` and `c = xor(a,b)` must
-            // settle on the same orientation, which only holds once both
-            // `xor`s are already in their sorted form.
-            if cmp_term(&x, &y) == std::cmp::Ordering::Greater {
-                GAtom::Eq(y, x)
+            if x <= y {
+                ProtoAtom::EqE(x, y)
             } else {
-                GAtom::Eq(x, y)
+                ProtoAtom::EqE(y, x)
             }
         }
-        GAtom::Less(x, y) => GAtom::Less(t(x), t(y)),
-        GAtom::LessMset(x, y) => GAtom::LessMset(t(x), t(y)),
-        GAtom::Subterm(x, y) => GAtom::Subterm(t(x), t(y)),
-        GAtom::Action(fact, time) => GAtom::Action(f(fact), t(time)),
-        GAtom::Last(x) => GAtom::Last(t(x)),
-        GAtom::Pred(fact) => GAtom::Pred(f(fact)),
+        ProtoAtom::Subterm(x, y) => ProtoAtom::Subterm(t(x), t(y)),
+        ProtoAtom::Less(x, y) => ProtoAtom::Less(t(x), t(y)),
+        ProtoAtom::Last(x) => ProtoAtom::Last(t(x)),
+        ProtoAtom::Action(time, fact) => {
+            let (tag, terms) = fact.canon_parts();
+            ProtoAtom::Action(t(time), Fact::new(*tag, terms.iter().map(t).collect()))
+        }
+        ProtoAtom::Syntactic(sugar) => ProtoAtom::Syntactic(*sugar),
     }
 }
 
-/// Brings a term reachable from a guarded formula's atoms into `CAN_AC`
-/// normal form: recursively normalizes every subterm bottom-up, then at
-/// each AC operator (`xor`/`union`/`mult`/`tplus`/a user `[AC]` symbol,
-/// i.e. [`crate::guarded::is_ac_binop`]) flattens the (now-normalized)
-/// chain and sorts the flattened operands by [`cmp_term`] before rebuilding
-/// — the same flatten-then-sort `CAN_AC` already applies to `LNTerm` via
-/// `f_app_ac` (`tamarin_term::term`), just rebuilt here as a right-nested
-/// `GTerm::BinOp` chain since `GTerm` (unlike `Term`) has no n-ary AC
-/// application node to flatten INTO.
-///
-/// The bilinear-pairing C symbol `em` — commutative but not associative,
-/// parsed as `GTerm::App("em", [_, _])` (see
-/// [`crate::guarded::funsym_key`]'s special case) — gets the same
-/// treatment minus the flattening: its two (normalized) arguments are
-/// sorted, never merged with a nested `em`.
-fn ac_normalize_term(t: &GTerm) -> GTerm {
-    match t {
-        GTerm::BinOp(op, a, b) if guarded::is_ac_binop(op) => {
-            let combined = GTerm::BinOp(*op, ga(ac_normalize_term(a)), ga(ac_normalize_term(b)));
-            let mut leaves = Vec::new();
-            guarded::flatten_ac_binop(op, &combined, &mut leaves);
-            let mut sorted: Vec<GTerm> = leaves.into_iter().cloned().collect();
-            sorted.sort_by(cmp_term);
-            rebuild_ac_chain(*op, sorted)
-        }
-        GTerm::BinOp(op, a, b) => {
-            GTerm::BinOp(*op, ga(ac_normalize_term(a)), ga(ac_normalize_term(b)))
-        }
-        GTerm::App(n, args) if &**n == "em" && args.len() == 2 => {
-            let mut sorted: Vec<GTerm> = args.iter().map(ac_normalize_term).collect();
-            sorted.sort_by(cmp_term);
-            GTerm::App(n.clone(), sorted.into())
-        }
-        GTerm::App(n, args) => GTerm::App(n.clone(), args.iter().map(ac_normalize_term).collect()),
-        GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
-            n.clone(),
-            ga(ac_normalize_term(a)),
-            ga(ac_normalize_term(b)),
-        ),
-        GTerm::Pair(items) => GTerm::Pair(items.iter().map(ac_normalize_term).collect()),
-        GTerm::Diff(a, b) => GTerm::Diff(ga(ac_normalize_term(a)), ga(ac_normalize_term(b))),
-        GTerm::PatMatch(x) => GTerm::PatMatch(ga(ac_normalize_term(x))),
-        GTerm::Var(_)
-        | GTerm::PubLit(_)
-        | GTerm::FreshLit(_)
-        | GTerm::NatLit(_)
-        | GTerm::Number(_)
-        | GTerm::NumberOne
-        | GTerm::NatOne
-        | GTerm::DhNeutral => t.clone(),
+/// The items of a conjunction or disjunction sorted; any other formula
+/// unchanged.
+fn sort_items(g: Guarded) -> Guarded {
+    let sorted = |items: &[Guarded]| {
+        let mut items = items.to_vec();
+        items.sort();
+        items.into()
+    };
+    match g {
+        Guarded::Conj(items) => Guarded::Conj(sorted(&items)),
+        Guarded::Disj(items) => Guarded::Disj(sorted(&items)),
+        g => g,
     }
 }
 
-/// Rebuilds a flattened, sorted (>= 2 elements — an actual `BinOp` node
-/// always flattens to at least its own two leaves) AC operand list as a
-/// right-nested `BinOp` chain, preserving the sorted left-to-right order:
-/// `[s0, s1, s2]` becomes `BinOp(op, s0, BinOp(op, s1, s2))`.
-fn rebuild_ac_chain(op: p::BinOp, sorted: Vec<GTerm>) -> GTerm {
-    let mut rev = sorted.into_iter().rev();
-    let mut acc = rev
-        .next()
-        .expect("an AC BinOp always flattens to at least two leaves");
-    for x in rev {
-        acc = GTerm::BinOp(op, ga(x), ga(acc));
-    }
-    acc
-}
-
-/// Brings `g` into `CAN_AC` normal form: recursively normalizes every
-/// subformula bottom-up, then at each level — symmetric `=` operands
-/// reordered, a quantifier's guard atoms sorted, and `Conj`/`Disj` children
-/// flattened, deduplicated (via [`crate::guarded::gconj`] /
-/// [`crate::guarded::gdisj`]), and sorted — all by the total orders
-/// [`cmp_term`]/[`cmp_atom`]/[`cmp_guarded`] already established in
-/// `guarded.rs`. Every quantifier's binder list also has its (purely
-/// cosmetic) display names erased, since only each binder's De-Bruijn
-/// POSITION is semantically meaningful — see the module docs.
+/// Brings `g` into AC normal form, bottom-up: atoms by [`normalize_atom`],
+/// a quantifier's guards sorted, and `Conj`/`Disj` children flattened,
+/// deduplicated ([`guarded::gconj`]/[`guarded::gdisj`]) and sorted, all by
+/// the derived (Haskell) order on formulas. Every quantifier's binder list
+/// also has its display names erased: only a binder's de Bruijn position
+/// means anything (see the section docs).
 pub fn ac_normalize_guarded(g: &Guarded) -> Guarded {
     match g {
         Guarded::Atom(a) => Guarded::Atom(normalize_atom(a)),
-        Guarded::Disj(items) => {
-            let mut normalized: Vec<Guarded> = items.iter().map(ac_normalize_guarded).collect();
-            normalized.sort_by(cmp_guarded);
-            guarded::gdisj(normalized)
-        }
-        Guarded::Conj(items) => {
-            let mut normalized: Vec<Guarded> = items.iter().map(ac_normalize_guarded).collect();
-            normalized.sort_by(cmp_guarded);
-            guarded::gconj(normalized)
-        }
+        Guarded::Disj(items) => sort_items(guarded::gdisj(
+            items.iter().map(ac_normalize_guarded).collect(),
+        )),
+        Guarded::Conj(items) => sort_items(guarded::gconj(
+            items.iter().map(ac_normalize_guarded).collect(),
+        )),
         Guarded::GGuarded {
             qua,
             vars,
             guards,
             body,
         } => {
-            let anonymous_vars: Vec<GBinding> = vars
+            let anonymous_vars: Vec<(String, tamarin_term::lterm::LSort)> = vars
                 .iter()
-                .map(|b| GBinding {
-                    name: String::new(),
-                    sort: b.sort,
-                })
+                .map(|(_, sort)| (String::new(), *sort))
                 .collect();
-            let mut sorted_guards: Vec<GAtom> = guards.iter().map(normalize_atom).collect();
-            sorted_guards.sort_by(cmp_atom);
+            let mut sorted_guards: Vec<Atom<BLNTerm>> = guards.iter().map(normalize_atom).collect();
+            sorted_guards.sort();
             let normalized_body = ac_normalize_guarded(body);
             match qua {
-                Quant::All => gall(anonymous_vars, sorted_guards, normalized_body),
-                Quant::Ex => gex(anonymous_vars, sorted_guards, normalized_body),
+                Quantifier::All => guarded::gall(anonymous_vars, sorted_guards, normalized_body),
+                Quantifier::Ex => guarded::gex(anonymous_vars, sorted_guards, normalized_body),
             }
         }
     }
-}
-
-/// Fingerprints a guarded formula, normally one in AC normal form
-/// ([`ac_normalize_guarded`]). Shares its digest type with
-/// [`tamarin_term::fingerprint::fingerprint_term`].
-///
-/// A Merkle hash, exactly like `fingerprint_term`: a compound node's
-/// fingerprint is built from the fingerprints of its already-fingerprinted
-/// children (the "subhash" composition), not their raw content, so a
-/// `Guarded`'s `Conj`/`Disj`/`GGuarded` fingerprint is a function of its
-/// subformulas' fingerprints, and (once a constraint-system-level
-/// canonizer exists) a system's fingerprint can be built the same way from
-/// its rules'/formulas' fingerprints in turn. Only a genuine leaf (a
-/// literal, a name, a bare De-Bruijn index) ever hashes its own fields
-/// directly — there's nothing further to recurse into.
-pub fn fingerprint_guarded(g: &Guarded) -> Fingerprint {
-    let mut h = FingerprintHasher::new();
-    match g {
-        Guarded::Atom(a) => {
-            h.tag("Atom");
-            h.digest(&fingerprint_atom(a));
-        }
-        Guarded::Disj(items) => {
-            h.tag("Disj");
-            h.u64(items.len() as u64);
-            for it in items.iter() {
-                h.digest(&fingerprint_guarded(it));
-            }
-        }
-        Guarded::Conj(items) => {
-            h.tag("Conj");
-            h.u64(items.len() as u64);
-            for it in items.iter() {
-                h.digest(&fingerprint_guarded(it));
-            }
-        }
-        Guarded::GGuarded {
-            qua,
-            vars,
-            guards,
-            body,
-        } => {
-            h.tag("GGuarded");
-            hash_quant(&mut h, *qua);
-            h.u64(vars.len() as u64);
-            for v in vars.iter() {
-                hash_binding(&mut h, v);
-            }
-            h.u64(guards.len() as u64);
-            for a in guards.iter() {
-                h.digest(&fingerprint_atom(a));
-            }
-            h.digest(&fingerprint_guarded(body));
-        }
-    }
-    h.finish()
-}
-
-fn hash_quant(h: &mut FingerprintHasher, q: Quant) {
-    h.u8(match q {
-        Quant::All => 0,
-        Quant::Ex => 1,
-    });
-}
-
-fn hash_binding(h: &mut FingerprintHasher, b: &GBinding) {
-    // `name` is purely cosmetic (erased to `""` by `ac_normalize_guarded`)
-    // but still hashed for totality — a value that skipped normalization
-    // would then also produce a different fingerprint, rather than
-    // silently colliding with a properly-normalized one.
-    h.bytes(b.name.as_bytes());
-    hash_sort_hint(h, b.sort);
-}
-
-pub(crate) fn fingerprint_atom(a: &GAtom) -> Fingerprint {
-    let mut h = FingerprintHasher::new();
-    match a {
-        GAtom::Eq(x, y) => {
-            h.tag("Eq");
-            h.digest(&fingerprint_gterm(x));
-            h.digest(&fingerprint_gterm(y));
-        }
-        GAtom::Less(x, y) => {
-            h.tag("Less");
-            h.digest(&fingerprint_gterm(x));
-            h.digest(&fingerprint_gterm(y));
-        }
-        GAtom::LessMset(x, y) => {
-            h.tag("LessMset");
-            h.digest(&fingerprint_gterm(x));
-            h.digest(&fingerprint_gterm(y));
-        }
-        GAtom::Subterm(x, y) => {
-            h.tag("Subterm");
-            h.digest(&fingerprint_gterm(x));
-            h.digest(&fingerprint_gterm(y));
-        }
-        GAtom::Action(fact, time) => {
-            h.tag("Action");
-            h.digest(&fingerprint_fact(fact));
-            h.digest(&fingerprint_gterm(time));
-        }
-        GAtom::Last(x) => {
-            h.tag("Last");
-            h.digest(&fingerprint_gterm(x));
-        }
-        GAtom::Pred(fact) => {
-            h.tag("Pred");
-            h.digest(&fingerprint_fact(fact));
-        }
-    }
-    h.finish()
-}
-
-fn fingerprint_fact(f: &GFact) -> Fingerprint {
-    let mut h = FingerprintHasher::new();
-    h.tag("GFact");
-    h.u8(u8::from(f.persistent));
-    h.bytes(f.name.as_bytes());
-    h.u64(f.args.len() as u64);
-    for a in f.args.iter() {
-        h.digest(&fingerprint_gterm(a));
-    }
-    h.u64(f.annotations.len() as u64);
-    for ann in f.annotations.iter() {
-        h.u8(fact_annotation_byte(ann));
-    }
-    h.finish()
-}
-
-fn fact_annotation_byte(a: &p::FactAnnotation) -> u8 {
-    match a {
-        p::FactAnnotation::SolveFirst => 0,
-        p::FactAnnotation::SolveLast => 1,
-        p::FactAnnotation::NoSources => 2,
-    }
-}
-
-pub(crate) fn fingerprint_gterm(t: &GTerm) -> Fingerprint {
-    let mut h = FingerprintHasher::new();
-    match t {
-        GTerm::Var(v) => {
-            h.tag("Var");
-            hash_bvar(&mut h, v);
-        }
-        GTerm::PubLit(s) => {
-            h.tag("PubLit");
-            h.bytes(s.as_bytes());
-        }
-        GTerm::FreshLit(s) => {
-            h.tag("FreshLit");
-            h.bytes(s.as_bytes());
-        }
-        GTerm::NatLit(s) => {
-            h.tag("NatLit");
-            h.bytes(s.as_bytes());
-        }
-        GTerm::Number(n) => {
-            h.tag("Number");
-            h.u64(*n);
-        }
-        GTerm::NumberOne => {
-            h.tag("NumberOne");
-        }
-        GTerm::NatOne => {
-            h.tag("NatOne");
-        }
-        GTerm::DhNeutral => {
-            h.tag("DhNeutral");
-        }
-        GTerm::App(n, args) => {
-            h.tag("App");
-            h.bytes(n.as_bytes());
-            h.u64(args.len() as u64);
-            for a in args.iter() {
-                h.digest(&fingerprint_gterm(a));
-            }
-        }
-        GTerm::AlgApp(n, a, b) => {
-            h.tag("AlgApp");
-            h.bytes(n.as_bytes());
-            h.digest(&fingerprint_gterm(a));
-            h.digest(&fingerprint_gterm(b));
-        }
-        GTerm::Pair(items) => {
-            h.tag("Pair");
-            h.u64(items.len() as u64);
-            for it in items.iter() {
-                h.digest(&fingerprint_gterm(it));
-            }
-        }
-        GTerm::Diff(a, b) => {
-            h.tag("Diff");
-            h.digest(&fingerprint_gterm(a));
-            h.digest(&fingerprint_gterm(b));
-        }
-        GTerm::BinOp(op, a, b) => {
-            h.tag("BinOp");
-            hash_binop(&mut h, op);
-            h.digest(&fingerprint_gterm(a));
-            h.digest(&fingerprint_gterm(b));
-        }
-        GTerm::PatMatch(x) => {
-            h.tag("PatMatch");
-            h.digest(&fingerprint_gterm(x));
-        }
-    }
-    h.finish()
-}
-
-fn hash_binop(h: &mut FingerprintHasher, op: &p::BinOp) {
-    match op {
-        p::BinOp::Exp => {
-            h.tag("Exp");
-        }
-        p::BinOp::Mult => {
-            h.tag("Mult");
-        }
-        p::BinOp::Union => {
-            h.tag("Union");
-        }
-        p::BinOp::Xor => {
-            h.tag("Xor");
-        }
-        p::BinOp::NatPlus => {
-            h.tag("NatPlus");
-        }
-        p::BinOp::AcFct(name) => {
-            h.tag("AcFct");
-            h.bytes(name.as_bytes());
-        }
-    }
-}
-
-fn hash_bvar(h: &mut FingerprintHasher, v: &BVar) {
-    match v {
-        BVar::Bound(n) => {
-            h.tag("Bound");
-            h.u64(*n as u64);
-        }
-        BVar::Free(vs) => {
-            h.tag("Free");
-            hash_varspec(h, vs);
-        }
-    }
-}
-
-fn hash_varspec(h: &mut FingerprintHasher, v: &p::VarSpec) {
-    h.bytes(v.name.as_bytes());
-    h.u64(v.idx);
-    hash_sort_hint(h, v.sort);
-    match &v.typ {
-        Some(t) => {
-            h.tag("Some");
-            h.bytes(t.as_bytes());
-        }
-        None => {
-            h.tag("None");
-        }
-    }
-}
-
-fn hash_sort_hint(h: &mut FingerprintHasher, s: p::SortHint) {
-    use p::{SortHint as S, SuffixSort as SS};
-    let b = match s {
-        S::Msg => 0,
-        S::Pub => 1,
-        S::Fresh => 2,
-        S::Node => 3,
-        S::Nat => 4,
-        S::Suffix(SS::Msg) => 5,
-        S::Suffix(SS::Pub) => 6,
-        S::Suffix(SS::Fresh) => 7,
-        S::Suffix(SS::Node) => 8,
-        S::Suffix(SS::Nat) => 9,
-        // Should never occur in an ALREADY-CANONICAL formula (`subst_via_
-        // theta_guarded`'s successful-lookup path always produces a
-        // resolved `SortHint` via `lvar_to_varspec`), but still given a
-        // distinct tag rather than panicking or aliasing a resolved sort.
-        S::Untagged => 10,
-    };
-    h.u8(b);
 }
 
 // =============================================================================
@@ -577,9 +199,7 @@ fn hash_sort_hint(h: &mut FingerprintHasher, s: p::SortHint) {
 // =============================================================================
 
 use crate::bliss_proc::BlissError;
-use crate::canon_term_graph::{
-    canonical_eq_disj, canonical_goal, Op, STerm, SYSTEM_SECTIONS,
-};
+use crate::canon_term_graph::{canonical_eq_disj, canonical_goal, Op, STerm, SYSTEM_SECTIONS};
 use crate::constraint::constraints::Goal;
 use crate::constraint::solver::proof_method::{ProofMethod, Result as FinishedResult};
 use crate::constraint::solver::Contradiction;
@@ -708,8 +328,8 @@ pub enum CanonicalProofMethod {
 /// `labelling`, `sys`'s canonical labelling from
 /// [`canonicalize_constraint_system_with_labelling`]. Panics on a variable
 /// `labelling` doesn't name, on a split goal naming no `EqDisj` in
-/// `sys.eq_store.conj`, and on the display-only `Invalidated`/`RawSolve`,
-/// which `candidate_methods` never produces.
+/// `sys.eq_store().conj`, and on the display-only `Invalidated`, which
+/// `candidate_methods` never produces.
 pub fn canonicalize_proof_method(
     method: &ProofMethod,
     sys: &System,
@@ -734,13 +354,13 @@ pub fn canonicalize_proof_method(
         }
         ProofMethod::SolveGoal(Goal::Split(id)) => {
             let index = sys
-                .eq_store
+                .eq_store()
                 .conj
                 .iter()
                 .position(|d| d.split_id == *id)
                 .unwrap_or_else(|| panic!("split goal {id:?} names no EqDisj in eq_store.conj"));
             CanonicalProofMethod::SolveSplit(canonical_eq_disj(
-                &sys.eq_store.conj[index],
+                &sys.eq_store().conj[index],
                 index,
                 labelling,
             ))
@@ -749,7 +369,7 @@ pub fn canonicalize_proof_method(
             canonical_goal(goal, labelling)
                 .expect("only Goal::Split has no goal term, handled above"),
         ),
-        ProofMethod::Invalidated | ProofMethod::RawSolve(_) => {
+        ProofMethod::Invalidated => {
             panic!("{method:?} is display-only and never a candidate proof method")
         }
     }
@@ -784,10 +404,12 @@ mod tests {
     use crate::canon_term_graph::canonicalize_constraint_system_via_term_graph_with_labelling;
     use crate::constraint::system::GoalStatus;
     use crate::fact::{in_fact, proto_fact, Multiplicity};
-    use crate::guarded::formula_to_guarded;
     use crate::rule::{PremIdx, Rule};
     use crate::tools::equation_store::{EqDisj, LNSubstVFresh, SplitId};
     use tamarin_parser::parser::parse_formula_str;
+    use tamarin_term::maude_sig::{bp_maude_sig, pair_maude_sig, xor_maude_sig, MaudeSig};
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
 
     fn v(name: &str, sort: LSort) -> LNTerm {
         var_term(LVar::new(name, sort, 0))
@@ -797,10 +419,20 @@ mod tests {
         LVar::new("i", LSort::Node, idx)
     }
 
+    /// The signature the tests' formulas are parsed and elaborated under:
+    /// pairing, `xor` and the bilinear pairing `em`.
+    fn test_sig() -> MaudeSig {
+        pair_maude_sig()
+            .merge(xor_maude_sig())
+            .merge(bp_maude_sig())
+    }
+
     /// Parses a surface formula string straight to its guarded form.
     fn g(s: &str) -> Guarded {
-        let f = parse_formula_str(s).unwrap_or_else(|e| panic!("parse {s:?}: {e}"));
-        formula_to_guarded(&f).unwrap_or_else(|e| panic!("formula_to_guarded {s:?}: {e}"))
+        let sig = test_sig();
+        let f = parse_formula_str(s, &sig).unwrap_or_else(|e| panic!("parse {s:?}: {e}"));
+        crate::elaborate::formula_to_guarded_parsed(&f, &sig)
+            .unwrap_or_else(|e| panic!("formula_to_guarded {s:?}: {e:?}"))
     }
 
     /// A ground 0-ary NoEq function symbol term: never renamed, ordered by
@@ -847,7 +479,10 @@ mod tests {
 
     #[test]
     fn swapped_eq_operands_normalize_equally() {
-        assert_eq!(ac_normalize_guarded(&g("x = y")), ac_normalize_guarded(&g("y = x")));
+        assert_eq!(
+            ac_normalize_guarded(&g("x = y")),
+            ac_normalize_guarded(&g("y = x"))
+        );
     }
 
     #[test]
@@ -874,7 +509,10 @@ mod tests {
     fn bound_variable_display_names_do_not_count() {
         for (a, b) in [
             ("Ex x #i. G(x)@i", "Ex a #b. G(a)@b"),
-            ("All x y #i. P(x,y) @ #i ==> F", "All a b #i. P(a,b) @ #i ==> F"),
+            (
+                "All x y #i. P(x,y) @ #i ==> F",
+                "All a b #i. P(a,b) @ #i ==> F",
+            ),
             (
                 "All k #i. Setup(k) @ #i ==> Ex j #t. Foo(j) @ #t",
                 "All p #q. Setup(p) @ #q ==> Ex w #z. Foo(w) @ #z",
@@ -882,7 +520,6 @@ mod tests {
         ] {
             let (fa, fb) = (ac_normalize_guarded(&g(a)), ac_normalize_guarded(&g(b)));
             assert_eq!(fa, fb, "{a} vs {b}");
-            assert_eq!(fingerprint_guarded(&fa), fingerprint_guarded(&fb));
         }
     }
 
@@ -902,19 +539,18 @@ mod tests {
         let got = ac_normalize_guarded(&g("~'m' = ~'n'"));
         assert_eq!(got, ac_normalize_guarded(&g("~'n' = ~'m'")));
         match &got {
-            Guarded::Atom(GAtom::Eq(GTerm::FreshLit(a), GTerm::FreshLit(b))) => {
-                let mut names = [a.as_str(), b.as_str()];
+            Guarded::Atom(ProtoAtom::EqE(Term::Lit(Lit::Con(a)), Term::Lit(Lit::Con(b)))) => {
+                let mut names = [a.id.as_str(), b.id.as_str()];
                 names.sort();
                 assert_eq!(names, ["m", "n"]);
             }
-            other => panic!("expected Eq(FreshLit, FreshLit), got {other:?}"),
+            other => panic!("expected `=` over two names, got {other:?}"),
         }
         let (one, two) = (
             ac_normalize_guarded(&g("P(<'1', x>) @ #i")),
             ac_normalize_guarded(&g("P(<'2', x>) @ #i")),
         );
         assert_ne!(one, two);
-        assert_ne!(fingerprint_guarded(&one), fingerprint_guarded(&two));
         assert_ne!(
             ac_normalize_guarded(&g("not (Ex #j. Reveal('c') @ #j)")),
             ac_normalize_guarded(&g("not (Ex #j. Reveal('d') @ #j)"))
@@ -949,7 +585,6 @@ mod tests {
         let once = ac_normalize_guarded(&g("z = y & Ex x #i. G(x)@i"));
         let twice = ac_normalize_guarded(&once);
         assert_eq!(once, twice);
-        assert_eq!(fingerprint_guarded(&once), fingerprint_guarded(&twice));
     }
 
     // -- Whole systems -----------------------------------------------------
@@ -1027,7 +662,12 @@ mod tests {
             let fact = |f: &str| proto_fact(Multiplicity::Linear, f, vec![v(var, LSort::Msg)]);
             sys.add_node(
                 node(0),
-                rule_ac_inst(name, vec![in_fact(v(var, LSort::Msg))], vec![], vec![fact("M")]),
+                rule_ac_inst(
+                    name,
+                    vec![in_fact(v(var, LSort::Msg))],
+                    vec![],
+                    vec![fact("M")],
+                ),
             );
             canonicalize_constraint_system(&sys)
                 .unwrap_or_else(|e| panic!("canonicalize ({name}, {var}): {e:?}"))
@@ -1090,7 +730,11 @@ mod tests {
         assert_eq!(solve(node(0), "x"), solve(node(5), "y"));
         assert_ne!(
             solve(node(0), "x"),
-            canonicalize_proof_method(&ProofMethod::Simplify, &System::empty(), &CanonLabelling::empty())
+            canonicalize_proof_method(
+                &ProofMethod::Simplify,
+                &System::empty(),
+                &CanonLabelling::empty()
+            )
         );
     }
 
@@ -1119,8 +763,8 @@ mod tests {
                     ),
                 )])],
             });
-            let (_, labelling) = canonicalize_constraint_system_with_labelling(&sys)
-                .expect("canonicalize");
+            let (_, labelling) =
+                canonicalize_constraint_system_with_labelling(&sys).expect("canonicalize");
             canonicalize_proof_method(
                 &ProofMethod::SolveGoal(Goal::Split(SplitId(id))),
                 &sys,

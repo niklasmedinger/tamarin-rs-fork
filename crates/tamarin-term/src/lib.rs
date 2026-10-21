@@ -1,3 +1,7 @@
+// Currently GPL 3.0 until granted permission by the upstream authors
+// of the tamarin-prover sources this file cites; list them with:
+//   scripts/gen_license_headers.py --authors <this file>
+
 //! Term language for the Tamarin prover (Rust port).
 //!
 //! Modules ported (mapping to Haskell):
@@ -10,6 +14,8 @@
 //! - [`term`] ← `Term.Term.Raw` (raw term type + AC-normalising smart constructors)
 //! - [`vterm`] ← `Term.VTerm` (`Lit<C, V>` and helpers)
 //! - [`lterm`] ← `Term.LTerm` (sorts, names, LVar, BVar, HasFrees, rename)
+//! - [`bind`] ← `Control.Monad.Bind` over `LVar` keys, plus `Term.LTerm`'s
+//!   `someInst` and `renamePrecise`
 //! - [`pretty`] ← pretty-printing helpers (`prettyLNTerm`/`prettyTerm`)
 //! - [`subst`] ← `Term.Substitution.SubstVFree` (generic free substitution)
 //! - [`subst_vfresh`] ← `Term.Substitution.SubstVFresh` (fresh-range substitution)
@@ -20,8 +26,7 @@
 //! - [`maude_sig`] ← `Term.Maude.Signature`
 //! - [`maude_proc`] ← `Term.Maude.Process` (spawns/drives the Maude
 //!   subprocess; backs AC unification / matching / variants via
-//!   `unify` / `unifiable` / `match_eqs` /
-//!   `variant_unify_eqs`)
+//!   `unify` / `unifiable` / `match_eqs`)
 //! - [`maude_parse`] / [`maude_print`] / [`maude_types`] ←
 //!   `Term.Maude.{Parser, ...}` (Maude reply parsing, term printing,
 //!   and the LNTerm↔Maude conversion context)
@@ -32,14 +37,18 @@
 //! - [`norm`] ← `Term.Rewriting.Norm` (calls into Maude)
 //! - [`intern`] ← (no HS analog) global write-once intern pools for
 //!   symbol/variable names
+//! - [`tags`] ← the lemma and fact tag enums of `Items/LemmaItem.hs` and
+//!   `Theory/Model/Fact.hs`, kept here because `tamarin-parser` and
+//!   `tamarin-theory` both carry them
 //!
 //! Not yet ported:
 //! - `Term.Narrowing.{Variants, Variants.Check, Variants.Compute, Narrow}`
-//!   (variant computation as a standalone module; the variant-unification
-//!   entry point Tamarin needs lives in [`maude_proc`])
+//!   (variant computation as a standalone module)
 
 #[allow(dead_code)]
 pub mod alpha_eq_ac;
+pub mod apply;
+pub mod bind;
 pub mod builtin;
 pub mod fingerprint;
 pub mod function_symbols;
@@ -59,8 +68,7 @@ pub mod subst;
 pub mod subst_vfresh;
 pub mod subsumption;
 pub mod subterm_rule;
+pub mod tags;
 pub mod term;
-#[cfg(test)]
-mod test_maude;
 pub mod unification;
 pub mod vterm;
