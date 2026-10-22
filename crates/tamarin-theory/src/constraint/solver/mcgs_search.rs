@@ -33,6 +33,17 @@
 //! settles every ancestor at once. Visit counts are the only statistics,
 //! and they change only along the traversed path.
 //!
+//! ## Merging
+//!
+//! With `TAM_RS_MERGE`, a case is canonicalized when a traversal first
+//! enters it, not when its method is applied: an expansion applies up to
+//! `TAM_RS_MCGS_TOP_N` methods at once, and most of their cases are never
+//! entered. A case whose canonical form is an existing class's merges into
+//! that class ([`search_graph::SearchGraph::merge_into`]): its edge leads
+//! there, and the traversal goes on from there. Until a case is entered, its
+//! class is one system, so a case equal to a settled class or to a system on
+//! the path is found to be one only when entered.
+//!
 //! ## Priors
 //!
 //! `P_i = exp(log_softmax(−w_h · i + bias_i) / T)` for the heuristic's
@@ -80,6 +91,14 @@
 //!   skips BM25;
 //! - `TAM_RS_MCGS_IDF_QUERY=formula+path|formula|path`: the BM25 query,
 //!   default `formula+path`;
+//! - `TAM_RS_MCGS_MAX_METHODS=K`: at most K methods per system, the first
+//!   K that apply in prior order, default `0` for no cap. With K = 1 the
+//!   search walks a single proof tree, the one the prior's first choices
+//!   make, and only chooses which case to descend into;
+//! - `TAM_RS_MCGS_CASE_ORDER=visits|first`: the case to descend into at an
+//!   AND node: the least visited (TamRL's uniform case prior, the default)
+//!   or the first open one in name order, which with K = 1 is a depth-first
+//!   walk of that tree;
 //! - `TAM_RS_MERGE` (presence): merge canonically equal systems (needs
 //!   `bliss`), shared with the top-N search;
 //! - `TAM_RS_MCGS_STATS` (presence): one summary line per search on stderr.
@@ -100,8 +119,9 @@ use crate::constraint::solver::proof_method::ProofMethod;
 use crate::constraint::solver::reduction::avoid_fresh_state;
 use crate::constraint::solver::search::{self, candidate_methods, ProofNode};
 use crate::constraint::solver::search_graph::{
-    self, apply_method, classify, Applied, Child, ClassId, End, Interned, Materializer,
-    MergeCounts, StatsReporter, Status, Stored, WorkStats, WorkerEnv, DEPTH_CAP, ROOT,
+    self, apply_method, canonical_key, classify, Applied, Child, ClassId, End, Interned,
+    Materializer, MergeCounts, StatsReporter, Status, Stored, WorkStats, WorkerEnv, DEPTH_CAP,
+    ROOT,
 };
 use crate::constraint::system::System;
 use crate::prove::ProveError;
@@ -130,6 +150,15 @@ impl IdfQuery {
     }
 }
 
+/// Which open case of an applied method a traversal descends into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseOrder {
+    /// The least visited: TamRL's uniform prior over the cases.
+    Visits,
+    /// The first in name order.
+    First,
+}
+
 /// The MCGS search's settings, stamped onto each lemma's `ProofContext`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct McgsConfig {
@@ -145,6 +174,10 @@ pub struct McgsConfig {
     /// skips BM25.
     pub idf_weight: f64,
     pub idf_query: IdfQuery,
+    /// At most this many methods per class, the first that apply in prior
+    /// order; `0` for no cap.
+    pub max_methods: u32,
+    pub case_order: CaseOrder,
     /// Merge canonically equal systems into one class.
     pub merge: bool,
 }
@@ -159,6 +192,8 @@ impl McgsConfig {
             heuristic_weight: 0.3,
             idf_weight: 1.0,
             idf_query: IdfQuery::FormulaPath,
+            max_methods: 0,
+            case_order: CaseOrder::Visits,
             merge: false,
         }
     }
@@ -210,6 +245,16 @@ pub fn mcgs_from_env() -> Option<McgsConfig> {
                 "TAM_RS_MCGS_IDF_QUERY={other:?}: expected `formula+path`, `formula` or `path`"
             ),
         };
+        let max_methods = env_value(
+            "TAM_RS_MCGS_MAX_METHODS",
+            defaults.max_methods,
+            "a non-negative integer",
+        );
+        let case_order = match std::env::var("TAM_RS_MCGS_CASE_ORDER").as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("visits") => CaseOrder::Visits,
+            Ok("first") => CaseOrder::First,
+            other => panic!("TAM_RS_MCGS_CASE_ORDER={other:?}: expected `visits` or `first`"),
+        };
         Some(McgsConfig {
             budget,
             top_n,
@@ -217,6 +262,8 @@ pub fn mcgs_from_env() -> Option<McgsConfig> {
             heuristic_weight,
             idf_weight,
             idf_query,
+            max_methods,
+            case_order,
             merge: tamarin_utils::env_gate!("TAM_RS_MERGE"),
         })
     })
@@ -288,6 +335,11 @@ struct McgsExt {
     path_len: u32,
     /// Open, but nothing to expand is reachable from it any more.
     dead: bool,
+    /// [`McgsConfig::max_methods`]: no method is applied beyond this many.
+    max_methods: u32,
+    /// The class this case merged into when a traversal entered it: it has
+    /// no edge since.
+    merged_into: Option<ClassId>,
 }
 
 impl McgsExt {
@@ -305,8 +357,52 @@ impl McgsExt {
             .sum()
     }
 
+    /// Whether a virtual method may still be applied.
     fn has_virtual(&self) -> bool {
-        self.actions.iter().any(|a| a.state == ActionState::Virtual)
+        !self.capped() && self.actions.iter().any(|a| a.state == ActionState::Virtual)
+    }
+
+    /// The class has as many methods as [`McgsConfig::max_methods`] allows.
+    fn capped(&self) -> bool {
+        self.max_methods > 0 && self.and_rank.len() >= self.max_methods as usize
+    }
+}
+
+impl search_graph::DumpExt for McgsExt {
+    fn class_fields(&self, row: &mut serde_json::Map<String, serde_json::Value>) {
+        use serde_json::json;
+        row.insert("expanded".into(), json!(self.expanded));
+        row.insert("dead".into(), json!(self.dead));
+        row.insert("merged_into".into(), json!(self.merged_into));
+        row.insert("visits".into(), json!(self.visits()));
+        row.insert("path_len".into(), json!(self.path_len));
+        // Per candidate, in the heuristic's order: its prior, and `V`
+        // (virtual), `N` (does not apply) or the index of its applied method.
+        row.insert(
+            "priors".into(),
+            json!(self.actions.iter().map(|a| a.prior).collect::<Vec<_>>()),
+        );
+        row.insert(
+            "states".into(),
+            json!(self
+                .actions
+                .iter()
+                .map(|a| match a.state {
+                    ActionState::Virtual => "V".to_string(),
+                    ActionState::NotApplicable => "N".to_string(),
+                    ActionState::Applied(i) => i.to_string(),
+                })
+                .collect::<Vec<_>>()),
+        );
+    }
+
+    fn and_fields(&self, a: usize, row: &mut serde_json::Map<String, serde_json::Value>) {
+        use serde_json::json;
+        let rank = self.and_rank[a];
+        row.insert("rank".into(), json!(rank));
+        row.insert("prior".into(), json!(self.actions[rank].prior));
+        row.insert("visits".into(), json!(self.and_visits[a]));
+        row.insert("case_visits".into(), json!(self.case_visits[a]));
     }
 }
 
@@ -362,7 +458,12 @@ fn ranked_picks(g: &SearchGraph, c: ClassId, on_path: &[ClassId]) -> Vec<Pick> {
             ));
         }
     }
-    for i in by_prior(&ext.actions, |a| a.state == ActionState::Virtual) {
+    let virtuals = if ext.capped() {
+        Vec::new()
+    } else {
+        by_prior(&ext.actions, |a| a.state == ActionState::Virtual)
+    };
+    for i in virtuals {
         scored.push((
             score(visits, 0, ext.actions[i].prior, sum),
             Pick::Virtual(i),
@@ -381,12 +482,25 @@ fn by_prior(actions: &[Action], keep: impl Fn(&Action) -> bool) -> Vec<usize> {
     ranks
 }
 
-/// The case to descend into below method `a` of `c`: the best score under
-/// the uniform prior, which is the least visited enterable case, the first
-/// in name order among equals.
-fn pick_case(g: &SearchGraph, c: ClassId, a: u16, on_path: &[ClassId]) -> Option<usize> {
+/// The case to descend into below method `a` of `c`: with
+/// [`CaseOrder::Visits`] the best score under the uniform prior, which is the
+/// least visited enterable case, the first in name order among equals; with
+/// [`CaseOrder::First`] the first enterable case.
+fn pick_case(
+    g: &SearchGraph,
+    c: ClassId,
+    a: u16,
+    on_path: &[ClassId],
+    order: CaseOrder,
+) -> Option<usize> {
     let class = g.class(c);
     let and = &class.ands[a as usize];
+    if order == CaseOrder::First {
+        return and
+            .cases
+            .iter()
+            .position(|&(_, d)| enterable(g, d, on_path));
+    }
     let visits = &class.ext.case_visits[a as usize];
     let total: u32 = visits.iter().sum();
     let prior = 1.0 / and.cases.len() as f64;
@@ -421,6 +535,68 @@ fn priors(config: &McgsConfig, docs: &[Vec<String>], n: usize, query: &[String])
         .into_iter()
         .map(|l| ((l - log_sum) / config.temperature).exp())
         .collect()
+}
+
+/// The priors the search gives `ranked`, the candidates of `sys` in the
+/// heuristic's order, when it expands `sys` reached along `path`: each
+/// method applied on the way down with the system it was applied to. Lets
+/// the proof profiler (`examples/profile_reference_proof.rs`) compare a
+/// proof's choices with what this search would prefer at the same system.
+pub fn candidate_priors(
+    config: &McgsConfig,
+    lemma_text: &str,
+    sys: &System,
+    ranked: &[ProofMethod],
+    path: &[(&ProofMethod, &System)],
+) -> Vec<f64> {
+    let (docs, query) = bm25_inputs(config, lemma_text, sys, ranked, path);
+    priors(config, &docs, ranked.len(), &query)
+}
+
+/// The BM25 bias of [`candidate_priors`] at weight 1: the z-normalized BM25
+/// scores of `ranked` against the query, which the prior scales by
+/// `idf_weight` and adds to the rank bias. Lets a caller recompute the prior
+/// for other weights and temperatures.
+pub fn candidate_bm25_z(
+    config: &McgsConfig,
+    lemma_text: &str,
+    sys: &System,
+    ranked: &[ProofMethod],
+    path: &[(&ProofMethod, &System)],
+) -> Vec<f64> {
+    let config = McgsConfig {
+        idf_weight: 1.0,
+        ..*config
+    };
+    let (docs, query) = bm25_inputs(&config, lemma_text, sys, ranked, path);
+    bm25::z_bias(&bm25::bm25_plus_scores(&docs, &query), 1.0)
+}
+
+/// The candidates' BM25 documents and the query, as the search builds them.
+fn bm25_inputs(
+    config: &McgsConfig,
+    lemma_text: &str,
+    sys: &System,
+    ranked: &[ProofMethod],
+    path: &[(&ProofMethod, &System)],
+) -> (Vec<Vec<String>>, Vec<String>) {
+    let mut docs = Vec::new();
+    let mut query = Vec::new();
+    if config.idf_weight != 0.0 {
+        docs = ranked
+            .iter()
+            .map(|m| bm25::tokens(&bm25::method_text(m, sys)))
+            .collect();
+        if config.idf_query.path() {
+            for (m, s) in path {
+                query.extend(bm25::tokens(&bm25::method_text(m, s)));
+            }
+        }
+        if config.idf_query.formula() {
+            query.extend(bm25::lemma_query(lemma_text));
+        }
+    }
+    (docs, query)
 }
 
 // =============================================================================
@@ -528,16 +704,41 @@ impl<'a> Engine<'a> {
                 None
             }
             Interned::New(stored) => Some(stored),
-            Interned::Merged => {
-                self.stats.merges += 1;
-                let class = self.graph.class_mut(c);
-                class.min_depth = class.min_depth.min(depth);
-                return c;
-            }
+            Interned::Merged => unreachable!(
+                "MCGS keys a case when a traversal enters it; only the root, the first \
+                 class, is keyed when created"
+            ),
         };
         assert_eq!(self.store.len(), c as usize, "classes are stored in order");
         self.store.push(stored);
         c
+    }
+
+    /// Keys `c`, an unexpanded open class that a traversal enters, with
+    /// merging on (see the module docs). Returns the class `c` merged into,
+    /// if it is one's system; else `c` is keyed and keeps its labelling for
+    /// its methods.
+    fn enter(&mut self, c: ClassId) -> Option<ClassId> {
+        if !self.config.merge || self.graph.class(c).keyed {
+            return None;
+        }
+        let stored = self.store[c as usize]
+            .as_mut()
+            .expect("an unexpanded open class keeps its system");
+        let start = Instant::now();
+        let mut work = WorkStats::default();
+        let (key, labelling) = canonical_key(&stored.sys, &mut work);
+        work.busy = start.elapsed();
+        self.stats.work.add(&work);
+        let Some(existing) = self.graph.key(c, key) else {
+            stored.labelling = Some(labelling);
+            return None;
+        };
+        self.store[c as usize] = None;
+        self.graph.class_mut(c).ext.merged_into = Some(existing);
+        self.graph.merge_into(c, existing);
+        self.stats.merges += 1;
+        Some(existing)
     }
 
     /// The BM25 query for a system reached along `path`.
@@ -619,9 +820,12 @@ impl<'a> Engine<'a> {
         path: &[(ClassId, u16)],
     ) -> Result<(), ProveError> {
         self.stats.expansions += 1;
+        assert!(
+            !self.config.merge || self.graph.class(c).keyed,
+            "class #{c} is expanded unkeyed: its methods need its labelling"
+        );
         let depth = self.graph.class(c).min_depth;
         let cut = self.cut_children(c);
-        let merge = self.config.merge;
         let use_bm25 = self.config.idf_weight != 0.0;
         let stored = self.store[c as usize]
             .as_ref()
@@ -658,6 +862,7 @@ impl<'a> Engine<'a> {
         ext.docs = docs;
         ext.actions = actions;
         ext.path_len = path.len() as u32;
+        ext.max_methods = self.config.max_methods;
 
         let results: Vec<(usize, Result<Option<Applied>, ProveError>, WorkStats)> = {
             let ctx = self.ctx;
@@ -666,7 +871,7 @@ impl<'a> Engine<'a> {
                 tasks
                     .into_iter()
                     .map(|(i, method)| {
-                        let (applied, work) = run_method(ctx, env, stored, &method, cut, merge);
+                        let (applied, work) = run_method(ctx, env, stored, &method, cut);
                         (i, applied, work)
                     })
                     .collect()
@@ -680,7 +885,7 @@ impl<'a> Engine<'a> {
                 forked
                     .into_par_iter()
                     .map(|(i, method, stored)| {
-                        let (applied, work) = run_method(ctx, env, &stored, &method, cut, merge);
+                        let (applied, work) = run_method(ctx, env, &stored, &method, cut);
                         (i, applied, work)
                     })
                     .collect()
@@ -695,6 +900,8 @@ impl<'a> Engine<'a> {
                 continue;
             }
             match applied {
+                // Past the cap the method stays virtual, and is never picked.
+                Some(_) if self.graph.class(c).ext.capped() => {}
                 Some(applied) => {
                     self.integrate(c, rank, applied);
                 }
@@ -719,7 +926,7 @@ impl<'a> Engine<'a> {
         let stored = self.store[c as usize]
             .as_ref()
             .expect("a class with a virtual method keeps its system");
-        let (applied, work) = run_method(self.ctx, env, stored, &method, cut, self.config.merge);
+        let (applied, work) = run_method(self.ctx, env, stored, &method, cut);
         self.stats.work.add(&work);
         let outcome = match applied? {
             Some(applied) => Materialized::Applied(self.integrate(c, rank, applied)),
@@ -799,10 +1006,20 @@ impl<'a> Engine<'a> {
         let mut progress = false;
         while self.graph.class(c).status == Status::Open {
             if !self.graph.class(c).ext.expanded {
-                if self.store[c as usize].is_some() {
-                    self.expand(env, c, &path)?;
-                    progress = true;
+                if self.store[c as usize].is_none() {
+                    break;
                 }
+                progress = true;
+                if let Some(existing) = self.enter(c) {
+                    on_path.pop();
+                    if !enterable(&self.graph, existing, &on_path) {
+                        break;
+                    }
+                    c = existing;
+                    on_path.push(c);
+                    continue;
+                }
+                self.expand(env, c, &path)?;
                 break;
             }
             self.maybe_repath(c, &path);
@@ -812,7 +1029,7 @@ impl<'a> Engine<'a> {
             let k = if self.graph.class(c).ands[a as usize].cases.len() == 1 {
                 0
             } else {
-                let k = pick_case(&self.graph, c, a, &on_path)
+                let k = pick_case(&self.graph, c, a, &on_path, self.config.case_order)
                     .expect("a selectable method has an enterable case");
                 self.graph.class_mut(c).ext.case_visits[a as usize][k] += 1;
                 k
@@ -888,19 +1105,19 @@ impl<'a> Engine<'a> {
     }
 }
 
-/// Applies `method` to `stored`'s system in a worker environment.
+/// Applies `method` to `stored`'s system in a worker environment. The cases
+/// stay unkeyed: [`Engine::enter`] keys a case when a traversal enters it.
 fn run_method(
     ctx: &ProofContext,
     env: &WorkerEnv,
     stored: &Stored,
     method: &ProofMethod,
     cut: bool,
-    merge: bool,
 ) -> (Result<Option<Applied>, ProveError>, WorkStats) {
     let start = Instant::now();
     let mut work = WorkStats::default();
     let applied = env.run(ctx, avoid_fresh_state(&stored.sys), |worker_ctx| {
-        apply_method(worker_ctx, stored, method, cut, merge, &mut work)
+        apply_method(worker_ctx, stored, method, cut, false, &mut work)
     });
     work.busy = start.elapsed();
     (applied, work)
@@ -979,12 +1196,23 @@ fn print_stats(
         .filter(|c| c.parents.len() > 1)
         .count();
     let dead = engine.graph.classes.iter().filter(|c| c.ext.dead).count();
+    // Merging on: the classes with a key, and the cases no traversal entered
+    // yet, which hold their systems unkeyed.
+    let keyed = engine.graph.by_key.len();
+    let unkeyed = engine
+        .graph
+        .classes
+        .iter()
+        .zip(&engine.store)
+        .filter(|(c, stored)| config.merge && !c.keyed && stored.is_some())
+        .count();
     eprintln!(
         "[mcgs] lemma={} budget={} top_n={} temperature={} heuristic_weight={} idf_weight={} \
-         idf_query={:?} merge={} end={:?} root={:?} steps={} idle_steps={} expansions={} \
-         classes={} leaves={} merges={} shared={} dead={} applied={} materializations={} \
-         not_applicable={} repaths={} execs={} canons={} canon_s={:.3} busy_s={:.3} \
-         search_s={:.3} materialize_s={:.3}",
+         idf_query={:?} max_methods={} case_order={:?} merge={} end={:?} root={:?} steps={} \
+         idle_steps={} expansions={} \
+         classes={} keyed={} unkeyed={} leaves={} merges={} shared={} dead={} applied={} \
+         materializations={} not_applicable={} repaths={} execs={} canons={} canon_s={:.3} \
+         busy_s={:.3} search_s={:.3} materialize_s={:.3}",
         ctx.lemma_name,
         config.budget,
         config.top_n,
@@ -992,6 +1220,8 @@ fn print_stats(
         config.heuristic_weight,
         config.idf_weight,
         config.idf_query,
+        config.max_methods,
+        config.case_order,
         config.merge,
         end,
         root.status,
@@ -999,6 +1229,8 @@ fn print_stats(
         s.idle_steps,
         s.expansions,
         engine.graph.classes.len(),
+        keyed,
+        unkeyed,
         s.leaves,
         s.merges,
         shared,
@@ -1115,15 +1347,23 @@ mod tests {
         let (x, y, z) = (open(&mut g), open(&mut g), open(&mut g));
         let a = apply(&mut g, c, 0, &[x, y, z]);
         assert_eq!(
-            pick_case(&g, c, a, &[c]),
+            pick_case(&g, c, a, &[c], CaseOrder::Visits),
             Some(0),
             "all unvisited: name order"
         );
         g.class_mut(c).ext.case_visits[0] = vec![1, 0, 0];
-        assert_eq!(pick_case(&g, c, a, &[c]), Some(1));
-        assert_eq!(pick_case(&g, c, a, &[c, y]), Some(2), "y is on the path");
+        assert_eq!(pick_case(&g, c, a, &[c], CaseOrder::Visits), Some(1));
+        assert_eq!(
+            pick_case(&g, c, a, &[c, y], CaseOrder::Visits),
+            Some(2),
+            "y is on the path"
+        );
         g.class_mut(z).ext.dead = true;
-        assert_eq!(pick_case(&g, c, a, &[c, y]), Some(0), "z is dead");
+        assert_eq!(
+            pick_case(&g, c, a, &[c, y], CaseOrder::Visits),
+            Some(0),
+            "z is dead"
+        );
     }
 
     #[test]
@@ -1312,5 +1552,89 @@ mod tests {
             proof.method
         );
         assert_ne!(proof.status, NodeStatus::Contradictory);
+    }
+
+    // --- Merging (maude, bliss) ------------------------------------------
+
+    /// Cases are created unkeyed; entering the first keys it, entering a
+    /// second, canonically equal one merges it into the first, once.
+    #[test]
+    fn entering_a_case_keys_it_or_merges_it_into_its_class() {
+        let Some(ctx) = ctx() else {
+            return;
+        };
+        if !crate::bliss_proc::bliss_available() {
+            return;
+        }
+        let config = McgsConfig {
+            merge: true,
+            ..McgsConfig::with_budget(0)
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut engine = Engine::new(&ctx, config, DEPTH_CAP, deadline);
+        engine.add_root(two_branch_disjunction());
+        let a = engine.graph.add_and(ROOT, ProofMethod::Simplify, None);
+        let cases: Vec<ClassId> = (0..2)
+            .map(|i| {
+                let d = engine.intern(Child::Unkeyed(Stored::new(unproducible_action(), None)), 1);
+                engine.graph.add_case(ROOT, a, format!("case_{i}"), d);
+                d
+            })
+            .collect();
+        assert_eq!(
+            engine.stats.work.canons, 1,
+            "only the root is keyed when created"
+        );
+
+        assert_eq!(engine.enter(cases[0]), None);
+        assert!(engine.graph.class(cases[0]).keyed);
+        assert!(engine.store[cases[0] as usize]
+            .as_ref()
+            .unwrap()
+            .labelling
+            .is_some());
+        assert_eq!(engine.enter(cases[1]), Some(cases[0]));
+        assert!(engine.store[cases[1] as usize].is_none());
+        let targets: Vec<ClassId> = engine.graph.class(ROOT).ands[a as usize]
+            .cases
+            .iter()
+            .map(|&(_, d)| d)
+            .collect();
+        assert_eq!(targets, vec![cases[0], cases[0]]);
+        assert_eq!(engine.stats.merges, 1);
+        assert_eq!(
+            engine.enter(cases[0]),
+            None,
+            "a keyed class is not keyed again"
+        );
+        assert_eq!(engine.stats.work.canons, 3);
+    }
+
+    /// A case no traversal entered has no key; the proof shows it open.
+    #[test]
+    fn a_case_no_traversal_entered_shows_as_undecided() {
+        let Some(mut ctx) = ctx() else {
+            return;
+        };
+        if !crate::bliss_proc::bliss_available() {
+            return;
+        }
+        ctx.mcgs = Some(McgsConfig {
+            top_n: 1,
+            merge: true,
+            ..McgsConfig::with_budget(1)
+        });
+        let proof = run_proof_search(&ctx, unproducible_action(), 10).expect("proof search");
+        assert!(
+            matches!(proof.method, ProofMethod::Simplify),
+            "got {:?}",
+            proof.method
+        );
+        let case = proof.children.values().next().expect("simplify has a case");
+        assert!(
+            matches!(&case.method, ProofMethod::Sorry(Some(m)) if m == "MCGS: undecided"),
+            "got {:?}",
+            case.method
+        );
     }
 }

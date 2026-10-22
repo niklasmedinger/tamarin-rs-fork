@@ -5,7 +5,10 @@
 //!
 //! - an OR node ([`Class`]) is one constraint system or, with merging on, one
 //!   class of canonically equal systems ([`crate::canon`]); it is the choice
-//!   among the system's methods;
+//!   among the system's methods. The top-N search keys a case's class when
+//!   the case is created; MCGS keys it only when a traversal first enters it
+//!   ([`SearchGraph::key`]), so until then its class holds one system that
+//!   may equal another class's;
 //! - an AND node ([`And`]) is one applied method with its cases; a proof via
 //!   that method must close all of them.
 //!
@@ -107,6 +110,8 @@ pub(crate) struct Class<X> {
     pub(crate) settled_by: Option<u16>,
     /// When the class settled, on [`SearchGraph::clock`].
     pub(crate) settled_at: u64,
+    /// Its canonical key is in [`SearchGraph::by_key`].
+    pub(crate) keyed: bool,
     /// What the search keeps per class.
     pub(crate) ext: X,
 }
@@ -171,6 +176,7 @@ impl<X: Default> SearchGraph<X> {
             first_parent: None,
             settled_by: None,
             settled_at,
+            keyed: false,
             ext: X::default(),
         });
         id
@@ -224,9 +230,50 @@ impl<X: Default> SearchGraph<X> {
                 }
                 let c = self.add_class(Status::Open, depth);
                 self.by_key.insert(key, c);
+                self.class_mut(c).keyed = true;
                 (c, Interned::New(stored))
             }
         }
+    }
+
+    /// Gives `c`, an open class created unkeyed, its canonical key: `None`
+    /// when no class has the key yet, which makes it `c`'s; otherwise the
+    /// class that has it, into which the caller merges `c`
+    /// ([`Self::merge_into`]).
+    pub(crate) fn key(&mut self, c: ClassId, key: CanonicalSystemFingerprint) -> Option<ClassId> {
+        assert!(!self.class(c).keyed, "class #{c} is keyed twice");
+        match self.by_key.entry(key) {
+            std::collections::hash_map::Entry::Occupied(existing) => Some(*existing.get()),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(c);
+                self.class_mut(c).keyed = true;
+                None
+            }
+        }
+    }
+
+    /// Moves the edges into `from`, an unkeyed class without methods, onto
+    /// `to`, the class with `from`'s canonical key, and settles what `to`'s
+    /// status settles. `from` keeps no edge, so nothing reaches it again.
+    pub(crate) fn merge_into(&mut self, from: ClassId, to: ClassId) {
+        let class = self.class_mut(from);
+        assert!(
+            !class.keyed && class.ands.is_empty(),
+            "only an unkeyed class without methods merges into another (class #{from})"
+        );
+        let parents = std::mem::take(&mut class.parents);
+        let depth = class.min_depth;
+        for &(p, a) in &parents {
+            for case in &mut self.class_mut(p).ands[a as usize].cases {
+                if case.1 == from {
+                    case.1 = to;
+                }
+            }
+        }
+        let class = self.class_mut(to);
+        class.parents.extend(parents.iter().copied());
+        class.min_depth = class.min_depth.min(depth);
+        self.propagate(parents);
     }
 
     /// Whether expanding `c` can still matter: it is the root, or some parent
@@ -459,8 +506,8 @@ impl<X: Default> SearchGraph<X> {
 /// its methods runs.
 pub(crate) struct Stored {
     pub(crate) sys: Box<System>,
-    /// `sys`'s canonical labelling (merging on), to canonicalize the methods
-    /// applied to it.
+    /// `sys`'s canonical labelling (merging on, once the class is keyed), to
+    /// canonicalize the methods applied to it.
     pub(crate) labelling: Option<CanonLabelling>,
     /// `candidate_methods`, computed at the first expansion (top-N search).
     pub(crate) ranked: Option<Vec<ProofMethod>>,
@@ -494,7 +541,7 @@ pub(crate) enum Child {
     Finished(Settled),
     /// Merging on: its canonical key.
     Keyed(CanonicalSystemFingerprint, Stored),
-    /// Merging off.
+    /// Merging off, or not keyed yet (MCGS, [`SearchGraph::key`]).
     Unkeyed(Stored),
 }
 
@@ -586,11 +633,17 @@ pub(crate) struct MergeCounts {
 /// search over the graph, so a batch runner reads them alike. A progress line
 /// every `TAM_RS_SEARCH_STATS` seconds means a run killed at its timeout
 /// still leaves its last counts behind; the last line has `final=1`.
+///
+/// It also writes the graph dumps of `TAM_RS_SEARCH_DUMP` ([`DumpPlan`]): a
+/// snapshot at each requested time from the same tick, and a last one when
+/// the search ends.
 pub(crate) struct StatsReporter {
     search: &'static str,
     started: Instant,
     every: Option<Duration>,
     last: Instant,
+    /// Snapshot times not reached yet, earliest first.
+    snapshots: Vec<u64>,
 }
 
 impl StatsReporter {
@@ -601,17 +654,27 @@ impl StatsReporter {
             started: now,
             every: search_stats_every(),
             last: now,
+            snapshots: DumpPlan::from_env().map_or_else(Vec::new, |plan| plan.at.clone()),
         }
     }
 
-    /// A progress line, if one is due.
-    pub(crate) fn tick<X>(
+    /// A progress line, and a graph snapshot, if one is due.
+    pub(crate) fn tick<X: DumpExt>(
         &mut self,
         lemma: &str,
         graph: &SearchGraph<X>,
         counts: &MergeCounts,
         work: &WorkStats,
     ) {
+        let elapsed = self.started.elapsed();
+        if self
+            .snapshots
+            .first()
+            .is_some_and(|&at| elapsed >= Duration::from_secs(at))
+        {
+            let at = self.snapshots.remove(0);
+            self.dump(lemma, graph, counts, work, None, Some(at));
+        }
         let Some(every) = self.every else {
             return;
         };
@@ -622,8 +685,9 @@ impl StatsReporter {
         self.print(lemma, graph, counts, work, None);
     }
 
-    /// The last line, with why the search ended and the root's status.
-    pub(crate) fn finish<X>(
+    /// The last line, with why the search ended and the root's status, and
+    /// the last graph dump.
+    pub(crate) fn finish<X: DumpExt>(
         &self,
         lemma: &str,
         graph: &SearchGraph<X>,
@@ -634,6 +698,45 @@ impl StatsReporter {
         if self.every.is_some() {
             self.print(lemma, graph, counts, work, Some(end));
         }
+        self.dump(lemma, graph, counts, work, Some(end), None);
+    }
+
+    /// Writes the graph to `TAM_RS_SEARCH_DUMP`'s file for `lemma`, or for
+    /// its snapshot at `at` seconds; nothing without the variable.
+    fn dump<X: DumpExt>(
+        &self,
+        lemma: &str,
+        graph: &SearchGraph<X>,
+        counts: &MergeCounts,
+        work: &WorkStats,
+        end: Option<End>,
+        at: Option<u64>,
+    ) {
+        let Some(plan) = DumpPlan::from_env() else {
+            return;
+        };
+        let path = plan.path_for(lemma, at);
+        let header = serde_json::json!({
+            "search": self.search,
+            "lemma": lemma,
+            "final": end.is_some(),
+            "end": end.map_or("running".to_string(), |e| format!("{e:?}")),
+            "elapsed_s": self.started.elapsed().as_secs_f64(),
+            "applied": counts.applied,
+            "leaves": counts.leaves,
+            "merges": counts.merges,
+            "execs": work.execs,
+            "canons": work.canons,
+            "canon_s": work.canon_time.as_secs_f64(),
+            "busy_s": work.busy.as_secs_f64(),
+        });
+        let file = std::fs::File::create(&path)
+            .unwrap_or_else(|e| panic!("TAM_RS_SEARCH_DUMP: creating {}: {e}", path.display()));
+        let mut out = std::io::BufWriter::new(file);
+        graph
+            .write_dump(&mut out, header)
+            .and_then(|()| std::io::Write::flush(&mut out))
+            .unwrap_or_else(|e| panic!("TAM_RS_SEARCH_DUMP: writing {}: {e}", path.display()));
     }
 
     fn print<X>(
@@ -651,10 +754,21 @@ impl StatsReporter {
             .classes
             .first()
             .map_or("none".to_string(), |c| format!("{:?}", c.status));
+        // How deep the search got: any class, and a class it applied a
+        // method to.
+        let max_depth = graph.classes.iter().map(|c| c.min_depth).max().unwrap_or(0);
+        let max_applied_depth = graph
+            .classes
+            .iter()
+            .filter(|c| !c.ands.is_empty())
+            .map(|c| c.min_depth)
+            .max()
+            .unwrap_or(0);
         eprintln!(
             "[search-stats] search={} lemma={} final={} end={} root={} classes={} leaves={} \
              merges={} shared={} asleep={} skipped_asleep={} applied={} execs={} canons={} \
-             canon_s={:.3} canon_min_s={:.6} canon_max_s={:.6} busy_s={:.3} elapsed_s={:.3}",
+             canon_s={:.3} canon_min_s={:.6} canon_max_s={:.6} busy_s={:.3} elapsed_s={:.3} \
+             max_depth={} max_applied_depth={}",
             self.search,
             lemma,
             u8::from(end.is_some()),
@@ -674,7 +788,157 @@ impl StatsReporter {
             work.canon_max.as_secs_f64(),
             work.busy.as_secs_f64(),
             self.started.elapsed().as_secs_f64(),
+            max_depth,
+            max_applied_depth,
         );
+    }
+}
+
+// =============================================================================
+// Graph dumps
+// =============================================================================
+
+/// `TAM_RS_SEARCH_DUMP=<prefix>`, read once per process: write each lemma's
+/// search graph as JSON to `<prefix>.<lemma>.json` when its search ends.
+/// `TAM_RS_SEARCH_DUMP_AT=<secs>,…` adds snapshots
+/// `<prefix>.<lemma>.<secs>s.json` at those times since the search started.
+/// The dumps exist to line a search up with a reference proof
+/// (`examples/profile_reference_proof.rs`): both name a class by
+/// [`system_key_hex`].
+pub(crate) struct DumpPlan {
+    prefix: std::path::PathBuf,
+    at: Vec<u64>,
+}
+
+impl DumpPlan {
+    fn from_env() -> Option<&'static DumpPlan> {
+        static PLAN: std::sync::OnceLock<Option<DumpPlan>> = std::sync::OnceLock::new();
+        PLAN.get_or_init(|| {
+            let prefix = std::env::var_os("TAM_RS_SEARCH_DUMP")?;
+            let mut at: Vec<u64> = match std::env::var("TAM_RS_SEARCH_DUMP_AT") {
+                Err(std::env::VarError::NotPresent) => Vec::new(),
+                Ok(v) => v
+                    .split(',')
+                    .map(|t| {
+                        t.trim().parse().unwrap_or_else(|_| {
+                            panic!("TAM_RS_SEARCH_DUMP_AT={v:?}: expected seconds, comma-separated")
+                        })
+                    })
+                    .collect(),
+                Err(e) => panic!("TAM_RS_SEARCH_DUMP_AT: {e}"),
+            };
+            at.sort_unstable();
+            Some(DumpPlan {
+                prefix: prefix.into(),
+                at,
+            })
+        })
+        .as_ref()
+    }
+
+    fn path_for(&self, lemma: &str, at: Option<u64>) -> std::path::PathBuf {
+        let mut name = self.prefix.as_os_str().to_owned();
+        name.push(format!(".{lemma}"));
+        if let Some(at) = at {
+            name.push(format!(".{at}s"));
+        }
+        name.push(".json");
+        name.into()
+    }
+}
+
+/// What a search adds to the rows of a graph dump: the per-class and
+/// per-method state it keeps in its extension, which the shared graph does
+/// not see.
+pub(crate) trait DumpExt {
+    /// Extra fields of the class's row.
+    fn class_fields(&self, _row: &mut serde_json::Map<String, serde_json::Value>) {}
+    /// Extra fields of the row of the class's `a`-th applied method.
+    fn and_fields(&self, _a: usize, _row: &mut serde_json::Map<String, serde_json::Value>) {}
+}
+
+impl DumpExt for () {}
+
+fn hex(digest: &Fingerprint) -> String {
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A canonical key as one hex digest, the name of a class in a graph dump.
+/// The proof profiler writes the same digest for each system of a proof, so
+/// a dump and a proof can be joined on it.
+pub fn system_key_hex(key: &CanonicalSystemFingerprint) -> String {
+    let mut h = tamarin_utils::fingerprint::FingerprintHasher::new();
+    h.tag(&format!("{:?}", key.source_kind))
+        .tag(&format!("{:?}", key.side))
+        .u8(u8::from(key.contradictory));
+    for section in &key.sections {
+        h.digest(section);
+    }
+    hex(&h.finish())
+}
+
+/// A canonical proof method's fingerprint as hex, as a graph dump writes it.
+pub fn method_key_hex(method_fp: &Fingerprint) -> String {
+    hex(method_fp)
+}
+
+impl<X: DumpExt> SearchGraph<X> {
+    /// Writes the graph as one JSON object: `header`'s fields and a
+    /// `classes` array, one row per class in id order.
+    fn write_dump(
+        &self,
+        out: &mut impl std::io::Write,
+        header: serde_json::Value,
+    ) -> std::io::Result<()> {
+        use serde_json::{json, Map, Value};
+        let mut keys: Vec<Option<String>> = vec![None; self.classes.len()];
+        for (key, &c) in &self.by_key {
+            keys[c as usize] = Some(system_key_hex(key));
+        }
+        let classes: Vec<Value> = self
+            .classes
+            .iter()
+            .enumerate()
+            .map(|(c, class)| {
+                let ands: Vec<Value> = class
+                    .ands
+                    .iter()
+                    .enumerate()
+                    .map(|(a, and)| {
+                        let mut row = Map::new();
+                        row.insert(
+                            "method".into(),
+                            json!(crate::pretty_theory::pretty_proof_method_inline(
+                                &and.method
+                            )),
+                        );
+                        row.insert("method_fp".into(), json!(and.method_fp.as_ref().map(hex)));
+                        row.insert("status".into(), json!(format!("{:?}", and.status)));
+                        row.insert("cases".into(), json!(and.cases));
+                        class.ext.and_fields(a, &mut row);
+                        Value::Object(row)
+                    })
+                    .collect();
+                let mut row = Map::new();
+                row.insert("id".into(), json!(c));
+                row.insert("key".into(), json!(keys[c]));
+                row.insert("depth".into(), json!(class.min_depth));
+                row.insert("status".into(), json!(format!("{:?}", class.status)));
+                row.insert("closed".into(), json!(class.closed));
+                row.insert("parents".into(), json!(class.parents.len()));
+                row.insert("first_parent".into(), json!(class.first_parent));
+                row.insert("settled_by".into(), json!(class.settled_by));
+                class.ext.class_fields(&mut row);
+                row.insert("ands".into(), Value::Array(ands));
+                Value::Object(row)
+            })
+            .collect();
+        let mut doc = match header {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        doc.insert("classes".into(), Value::Array(classes));
+        serde_json::to_writer(out, &Value::Object(doc)).map_err(std::io::Error::other)
     }
 }
 
@@ -735,17 +999,17 @@ pub(crate) fn canonical_key(
     (key, labelling)
 }
 
-/// Prepares one case: finished, or else keyed for merging.
+/// Prepares one case: finished, or else keyed for merging when `keyed`.
 pub(crate) fn classify(
     ctx: &ProofContext,
     sys: System,
-    merge: bool,
+    keyed: bool,
     work: &mut WorkStats,
 ) -> Child {
     if let Some(result) = is_finished(ctx, &sys) {
         return Child::Finished(Settled::of(&result));
     }
-    if merge {
+    if keyed {
         let (key, labelling) = canonical_key(&sys, work);
         Child::Keyed(key, Stored::new(sys, Some(labelling)))
     } else {
@@ -753,15 +1017,16 @@ pub(crate) fn classify(
     }
 }
 
-/// Applies `method` to the stored system and prepares its cases; `None`
-/// when the method does not apply, which `exec_proof_method` also answers,
-/// without trying the method, once the deadline has passed.
+/// Applies `method` to the stored system and prepares its cases, keyed when
+/// `key_cases`; `None` when the method does not apply, which
+/// `exec_proof_method` also answers, without trying the method, once the
+/// deadline has passed.
 pub(crate) fn apply_method(
     ctx: &ProofContext,
     stored: &Stored,
     method: &ProofMethod,
     cut_children: bool,
-    merge: bool,
+    key_cases: bool,
     work: &mut WorkStats,
 ) -> Result<Option<Applied>, ProveError> {
     work.execs += 1;
@@ -778,7 +1043,7 @@ pub(crate) fn apply_method(
             let child = if cut_children {
                 Child::Cut
             } else {
-                classify(ctx, sys, merge, work)
+                classify(ctx, sys, key_cases, work)
             };
             (name, child)
         })
@@ -813,12 +1078,19 @@ enum Resolved {
     Finished(System, MethodResult),
     /// A system of this class, with its canonical labelling when merging.
     Class(System, Option<CanonLabelling>, ClassId),
+    /// A system no class has the canonical key of, where the method's cases
+    /// in the graph include an open class the search never keyed: MCGS keys
+    /// a case only when a traversal enters it.
+    Unkeyed(System),
 }
 
 impl Resolved {
     fn sys(&self) -> &System {
         match self {
-            Resolved::Cut(sys) | Resolved::Finished(sys, _) | Resolved::Class(sys, _, _) => sys,
+            Resolved::Cut(sys)
+            | Resolved::Finished(sys, _)
+            | Resolved::Class(sys, _, _)
+            | Resolved::Unkeyed(sys) => sys,
         }
     }
 }
@@ -866,7 +1138,7 @@ fn sorry(ctx: &ProofContext, sys: System, message: String) -> ProofNode {
 
 impl<X: Default + Sync> Materializer<'_, X> {
     pub(crate) fn root(&self, ctx: &ProofContext, sys: System) -> Result<ProofNode, ProveError> {
-        let resolved = self.resolve(ctx, sys, 0, Some(ROOT));
+        let resolved = self.resolve(ctx, sys, 0, Some(ROOT), false);
         self.build(ctx, resolved, 0, None, &[])
     }
 
@@ -892,13 +1164,16 @@ impl<X: Default + Sync> Materializer<'_, X> {
     }
 
     /// The class of `sys`, reached at `depth`. Merging off, a case's class is
-    /// the graph's (`known`); merging on, it is looked up by canonical key.
+    /// the graph's (`known`); merging on, it is looked up by canonical key,
+    /// which only a case of a method with an open unkeyed case in the graph
+    /// (`unkeyed_case`) may miss.
     fn resolve(
         &self,
         ctx: &ProofContext,
         sys: System,
         depth: u32,
         known: Option<ClassId>,
+        unkeyed_case: bool,
     ) -> Resolved {
         if depth >= self.bound {
             return Resolved::Cut(sys);
@@ -911,10 +1186,13 @@ impl<X: Default + Sync> Materializer<'_, X> {
             return Resolved::Class(sys, None, class);
         }
         let (key, labelling) = canonical_key(&sys, &mut WorkStats::default());
-        let class = *self.graph.by_key.get(&key).unwrap_or_else(|| {
-            panic!("materializing the proof: a case reaches a system the search never saw")
-        });
-        Resolved::Class(sys, Some(labelling), class)
+        match self.graph.by_key.get(&key) {
+            Some(&class) => Resolved::Class(sys, Some(labelling), class),
+            None if unkeyed_case => Resolved::Unkeyed(sys),
+            None => {
+                panic!("materializing the proof: a case reaches a system the search never saw")
+            }
+        }
     }
 
     /// Whether `resolved` counts as settled `settled` below a class that
@@ -928,6 +1206,7 @@ impl<X: Default + Sync> Materializer<'_, X> {
                 let class = self.graph.class(*d);
                 class.status == Status::Settled(settled) && class.settled_at < before
             }
+            Resolved::Unkeyed(_) => false,
         }
     }
 
@@ -964,6 +1243,7 @@ impl<X: Default + Sync> Materializer<'_, X> {
             Resolved::Cut(_) => false,
             Resolved::Finished(_, result) => Settled::of(result) == Settled::Solved,
             Resolved::Class(_, _, d) => self.reaches_trace(*d, avoid),
+            Resolved::Unkeyed(_) => false,
         }
     }
 
@@ -984,6 +1264,8 @@ impl<X: Default + Sync> Materializer<'_, X> {
             Resolved::Class(sys, labelling, c) => {
                 self.expand(ctx, sys, labelling, c, depth, edge, path)
             }
+            // What an open class without methods shows.
+            Resolved::Unkeyed(sys) => Ok(sorry(ctx, sys, self.undecided_message())),
         }
     }
 
@@ -1019,7 +1301,13 @@ impl<X: Default + Sync> Materializer<'_, X> {
         let class = self.graph.class(c);
         if class.closed && class.ands.is_empty() {
             "no method".into()
-        } else if self.end == End::Deadline {
+        } else {
+            self.undecided_message()
+        }
+    }
+
+    fn undecided_message(&self) -> String {
+        if self.end == End::Deadline {
             "deadline reached".into()
         } else {
             format!("{}: undecided", self.label)
@@ -1100,6 +1388,10 @@ impl<X: Default + Sync> Materializer<'_, X> {
             );
             and.cases.iter().map(|&(_, child)| Some(child)).collect()
         };
+        let unkeyed_case = and.cases.iter().any(|&(_, d)| {
+            let class = self.graph.class(d);
+            !class.keyed && class.status == Status::Open && !class.closed
+        });
         let items: Vec<((String, System), Option<ClassId>)> =
             cases.into_iter().zip(known).collect();
         let resolved: Vec<(String, Resolved)> = self.map_workers(
@@ -1107,7 +1399,10 @@ impl<X: Default + Sync> Materializer<'_, X> {
             items,
             |((_, sys), _)| sys,
             |worker_ctx, ((name, sys), known)| {
-                (name, self.resolve(worker_ctx, sys, depth + 1, known))
+                (
+                    name,
+                    self.resolve(worker_ctx, sys, depth + 1, known, unkeyed_case),
+                )
             },
         );
         let selected: Vec<(String, Resolved)> = match class.status {
@@ -1276,6 +1571,45 @@ mod tests {
         and(&mut g, root, &[pending, contra]);
         assert_eq!(g.class(root).status, Status::Open);
         and(&mut g, root, &[contra, contra]);
+        assert_eq!(
+            g.class(root).status,
+            Status::Settled(Settled::Contradictory)
+        );
+    }
+
+    fn key(n: u8) -> CanonicalSystemFingerprint {
+        CanonicalSystemFingerprint {
+            source_kind: None,
+            side: None,
+            contradictory: false,
+            sections: std::array::from_fn(|_| [n; 32]),
+        }
+    }
+
+    /// A class keyed after its creation (MCGS) takes a key no class has; with
+    /// a known key it merges into that class: its edge leads there, the class
+    /// takes the shallower depth, and its status settles the method above.
+    #[test]
+    fn a_class_keyed_late_merges_into_the_class_with_its_key() {
+        let mut g = Graph::new();
+        let root = open(&mut g);
+        let deep = g.add_class(Status::Open, 5);
+        assert_eq!(g.key(deep, key(1)), None);
+        let contra = leaf_class(&mut g, Settled::Contradictory);
+        and(&mut g, deep, &[contra]);
+        assert_eq!(
+            g.class(deep).status,
+            Status::Settled(Settled::Contradictory)
+        );
+        let case = g.add_class(Status::Open, 1);
+        let a = and(&mut g, root, &[case, contra]);
+        assert_eq!(g.class(root).status, Status::Open);
+        assert_eq!(g.key(case, key(1)), Some(deep));
+        g.merge_into(case, deep);
+        assert_eq!(g.class(root).ands[a as usize].cases[0].1, deep);
+        assert_eq!(g.class(deep).parents, vec![(root, a)]);
+        assert_eq!(g.class(deep).min_depth, 1);
+        assert!(g.class(case).parents.is_empty());
         assert_eq!(
             g.class(root).status,
             Status::Settled(Settled::Contradictory)
