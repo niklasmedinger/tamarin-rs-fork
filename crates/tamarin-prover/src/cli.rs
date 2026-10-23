@@ -1,6 +1,5 @@
-// Currently GPL 3.0 until granted permission by the upstream authors
-// of the tamarin-prover sources this file cites; list them with:
-//   scripts/gen_license_headers.py --authors <this file>
+// Currently GPL 3.0; see README.md for licensing details.
+// Derived from the upstream tamarin-prover sources referenced below.
 
 //! Command-line interface for the Rust tamarin-prover port.
 //!
@@ -38,6 +37,12 @@
 //! The flags with no HS `flagOpt` history (`--output-json/--output-dot`,
 //! `--processors`, `--maude-processes`, `--data-dir`) take ordinary clap
 //! values: `=`, attached, or space-separated.
+//!
+//! A small RTS compatibility pass extracts `+RTS -N[CORES] -RTS` and sets
+//! `processors`, for batch-tamarin. Bare `-N` uses all available cores;
+//! other RTS options are rejected.
+//! RTS blocks may end at argv's end; `--RTS` and `--` stop RTS processing.
+//! Mixed `-N` / `--processors` settings use the last occurrence.
 //!
 //! Loader and tool flags are `global`, so they work before or after a
 //! subcommand name (HS's interactive mode shares the loader flag set);
@@ -120,7 +125,7 @@ pub struct Args {
     // Lemma selection.
     /// True iff any `--prove` (with or without value) was passed.
     pub prove_mode: bool,
-    /// HS `lemmaNames` (TheoryLoader.hs:326): the `--prove` values followed
+    /// HS `lemmaNames` (TheoryLoader.hs): the `--prove` values followed
     /// by the `--lemma` values, each flag's values in reverse command-line
     /// order.  An empty entry (e.g. bare `--prove`) means "all lemmas".
     /// `lemma_matches` reads the list as a set; the order is observable
@@ -336,7 +341,8 @@ struct ToolOpts {
           default_missing_value = "json", value_name = "PATH")]
     json_path: Option<String>,
 
-    /// Rayon worker-pool size (default: all cores; 1 = sequential output)
+    /// Rayon worker-pool size (also +RTS -N<N> -RTS; default: all cores;
+    /// 1 = sequential output)
     #[arg(long, global = true, value_parser = positive_usize, value_name = "N")]
     processors: Option<usize>,
 
@@ -425,7 +431,7 @@ struct InteractiveOpts {
     #[arg(long = "no-logging")]
     no_logging: bool,
 
-    /// Directory with the static web assets (default: auto-detected `data/`)
+    /// Override the embedded GUI with static web assets from DIR
     #[arg(long = "data-dir", value_name = "DIR")]
     data_dir: Option<String>,
 }
@@ -433,7 +439,7 @@ struct InteractiveOpts {
 #[derive(Debug, Parser)]
 #[command(
     name = "tamarin-rs",
-    version = VERSION,
+    version = RUST_VERSION,
     long_version = LONG_VERSION,
     about = "Security protocol analysis and verification (Rust port of the Tamarin prover)",
     arg_required_else_help = true,
@@ -510,12 +516,69 @@ fn positive_usize(s: &str) -> Result<usize, String> {
     Ok(n)
 }
 
+/// Strip RTS blocks and return the processor override, if it follows the last
+/// native `--processors` flag. Keep settings separate so blocks can appear
+/// between application options and their values.
+fn extract_rts_args(raw: &[String]) -> Result<(Vec<String>, Option<usize>), clap::Error> {
+    let mut args = Vec::with_capacity(raw.len());
+    let mut processors = None;
+    let mut in_rts = false;
+    let mut rts_enabled = true;
+    let mut iter = raw.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "+RTS" if rts_enabled => in_rts = true,
+            "-RTS" if rts_enabled => in_rts = false,
+            "--RTS" if rts_enabled => {
+                in_rts = false;
+                rts_enabled = false;
+            }
+            "--" => {
+                args.push(arg.clone());
+                args.extend(iter.cloned());
+                break;
+            }
+            _ if in_rts => {
+                let Some(value) = arg.strip_prefix("-N") else {
+                    return Err(clap::Error::raw(
+                        clap::error::ErrorKind::UnknownArgument,
+                        format!("unsupported RTS option {arg:?}; supported: -N[CORES]\n"),
+                    ));
+                };
+                let n = if value.is_empty() {
+                    Args::default().effective_processors()
+                } else {
+                    positive_usize(value)
+                        .ok()
+                        .filter(|_| value.bytes().all(|b| b.is_ascii_digit()))
+                        .ok_or_else(|| {
+                            clap::Error::raw(
+                                clap::error::ErrorKind::ValueValidation,
+                                format!("invalid RTS option {arg:?}; expected -N or -N<positive integer>\n"),
+                            )
+                        })?
+                };
+                processors = Some(n);
+            }
+            _ => {
+                // A later native flag supersedes the pending RTS override.
+                if arg == "--processors" || arg.starts_with("--processors=") {
+                    processors = None;
+                }
+                args.push(arg.clone());
+            }
+        }
+    }
+    Ok((args, processors))
+}
+
 /// Parse an argv (without the binary name) into [`Args`].
 ///
 /// The `Err` is clap's — the caller renders it with
 /// [`clap::Error::exit`], which also handles `--help`/`--version`
 /// (printed to stdout, exit 0).
 pub fn parse_args(raw: &[String]) -> Result<Args, clap::Error> {
+    let (raw, rts_processors) = extract_rts_args(raw)?;
     let cli =
         Cli::try_parse_from(std::iter::once("tamarin-rs".to_string()).chain(raw.iter().cloned()))?;
 
@@ -548,9 +611,9 @@ pub fn parse_args(raw: &[String]) -> Result<Args, clap::Error> {
         prove_mode: !cli.load.prove.is_empty(),
         lemma_names: {
             // HS `lemmaNames = findArg "prove" as ++ findArg "lemma" as`
-            // (TheoryLoader.hs:326).  `addArg` PREPENDS each occurrence to
-            // the `Arguments` list (Console.hs:279-280) and `findArg` reads
-            // that list front to back (Console.hs:269-270), so one flag's
+            // (TheoryLoader.hs).  `addArg` PREPENDS each occurrence to
+            // the `Arguments` list (Console.hs) and `findArg` reads
+            // that list front to back (Console.hs), so one flag's
             // values arrive in reverse command-line order.
             let mut v: Vec<String> = cli.load.prove.into_iter().rev().collect();
             v.extend(cli.load.lemma.into_iter().rev());
@@ -578,7 +641,7 @@ pub fn parse_args(raw: &[String]) -> Result<Args, clap::Error> {
         no_compress: cli.batch.no_compress,
         parse_only: cli.batch.parse_only,
         precompute_only: cli.batch.precompute_only,
-        processors: cli.tools.processors,
+        processors: rts_processors.or(cli.tools.processors),
         maude_processes: cli.tools.maude_processes,
         output_file: cli.batch.output_file,
         output_dir: cli.batch.output_dir,
@@ -645,7 +708,7 @@ impl Args {
 
 /// Does the lemma name match the user's `--prove`/`--lemma` filter?
 ///
-/// Mirrors HS `lemmaSelector` (TheoryLoader.hs:418-432): the empty
+/// Mirrors HS `lemmaSelector` (TheoryLoader.hs): the empty
 /// filter `[]`, the single-empty filter `[""]`, and the double-empty
 /// filter `["",""]` all mean "all lemmas".  Otherwise we run
 /// `any lemmaMatches filter` where a pattern ending in `*` matches by
@@ -673,18 +736,25 @@ pub(crate) fn lemma_matches(filter: &[String], lemma_name: &str) -> bool {
 // Build metadata
 // =============================================================================
 
-/// The crate version; also spliced into the `Generated from:` block of
-/// emitted theories (`pretty_theory::BuildInfo`).
+/// Upstream Tamarin compatibility version, spliced into the `Generated from:`
+/// block of emitted theories (`pretty_theory::BuildInfo`).
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The Rust port's own identity: short Git hash, with `-dirty` for local edits.
+const RUST_VERSION: &str = env!("TAMARIN_RS_VERSION");
 
 /// Git revision + branch + build timestamp, populated by `build.rs`.
 pub(crate) const GIT_REV: &str = env!("TAMARIN_GIT_REV");
 pub(crate) const GIT_BRANCH: &str = env!("TAMARIN_GIT_BRANCH");
 pub(crate) const BUILD_TIMESTAMP: &str = env!("TAMARIN_BUILD_TIMESTAMP");
 
-/// `--version` detail: version plus the build provenance `build.rs` records.
+/// Keep the upstream version on the first line for batch-tamarin's detection,
+/// alongside the Rust revision and the build provenance `build.rs` records.
 const LONG_VERSION: &str = concat!(
+    env!("TAMARIN_RS_VERSION"),
+    " (Rust port of tamarin-prover ",
     env!("CARGO_PKG_VERSION"),
+    ")",
     "\ngit revision ",
     env!("TAMARIN_GIT_REV"),
     " (branch ",

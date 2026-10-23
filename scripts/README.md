@@ -1,12 +1,12 @@
-# scripts/ — parity gates, caches, and triage tools
+# scripts/ — GUI builds, tests, parity gates, and triage tools
 
 Per-script reference. For *which* gates to run and in what order, start from
 the verification ladder in [`../TESTING.md`](../TESTING.md).
 
-Every script compares the Rust port (`target/release/tamarin-rs`) against the
+The parity gates compare the Rust port (`target/release/tamarin-rs`) against the
 patched Haskell oracle (`../tamarin-prover-testing/`, built by
 `./setup.sh testing`). Result TSVs land in `results/` (gitignored).
-Most scripts take `ALLOWLIST=` (file of corpus-relative paths) to run a
+Most gates take `ALLOWLIST=` (file of corpus-relative paths) to run a
 subset, and `RS_PATH=`/`HS_PATH=` to point at other binaries.
 
 **Build the port first.** Every gate checks an in-tree `target/` binary against
@@ -16,6 +16,27 @@ cannot be attributed to this checkout by its timestamps, so it is content-
 fingerprinted for the duration of the run but its source provenance remains
 the caller's responsibility. `target/release/tamarin-rs <theory> | grep
 '^Git revision:'` says what a gate actually measured.
+
+## GUI build and browser tests
+
+Cargo invokes `build_gui.sh` automatically to compile the frontend with npm
+in its build output directory, then embeds those assets in the binary. It
+initializes the upstream submodule when missing. Node.js and npm are build
+dependencies; the installed binary needs no separate GUI files.
+
+`cargo_binary_path.mjs` reads Cargo's JSON build output for `make install`, so
+installation finds the correct executable when a Cargo build target is configured.
+
+For standalone frontend development, `./setup.sh gui` or `make frontend`
+prepares `target/gui/frontend/dist`. The helper accepts an optional output
+directory as its first argument; `make frontend` uses `CARGO_TARGET_DIR/gui`.
+These standalone files are not inputs to Cargo's embedded GUI build.
+
+`test_gui.mjs` checks a copied binary in Chromium, including page loading,
+embedded and standalone graphs, and server-rendered SVG. See the
+[GUI browser regression instructions](../TESTING.md#gui-browser-regression)
+for the Playwright dependencies and invocation. It needs Maude and Graphviz,
+and does not use the Haskell oracle.
 
 ## The HS reference caches
 
@@ -423,7 +444,7 @@ walks the RS test harness's ladder because its captures must use the maude
 
 - **`bump_submodule.sh`** — submodule bump workflow: checks each entry in
   `patches/series`, rebuilds the oracle, refreshes the tamarin-server HTTP
-  captures, remaps HS line cites across `crates/`, and prints a six-step
+  captures, and prints a six-step
   re-certification checklist covering the divergence and CLI captures,
   batch/fast/flag gates, server tests, and web ladder. `SKIP_BUILD=1` also
   skips the HTTP capture and warns that it must be run explicitly. The gate
@@ -492,8 +513,8 @@ walks the RS test harness's ladder because its captures must use the maude
   script stops with an error. It never falls through to a different compiler.
   `--file Main.hs` runs a whole Haskell program verbatim. Use `--file` for a
   session that derives a dozen related cases with shared bindings.
-- **`bench.sh`** — RS-vs-HS wall/RSS benchmark; emits the README's markdown
-  tables.
+- **`bench.sh`** — RS-vs-HS wall/RSS benchmark; emits the
+  [performance tables](../docs/PERFORMANCE.md). Use `--write` to update that document.
 - **`../prove_and_reverify.sh`** (repo root) — prove with tamarin-rs, re-check
   the emitted proofs with the Haskell prover; stdout is the re-verified proof
   file.
@@ -599,56 +620,18 @@ divergence can be added.
 fixtures from the new oracle, and `git diff divergence_fixtures/expected/` is
 then upstream behaviour moving under them.
 
-## Licensing / attribution
+## Upstream references and licensing
 
-- **`gen_license_headers.py`** — maintains the constant GPL notice on every
-  file whose upstream citations resolve (no blame needed; `--check` for
-  CI-style staleness, `--preview FILE` for one file). `--authors FILE`
-  computes that file's pending-permission author list on demand
-  (range-blame over its cited spans at the pinned submodule commit).
-- **`extend_anchor_citations.py`** — rewrites bare `Foo.hs:162` citations
-  into function-extent ranges (`Foo.hs:150-183, see line 162`) so blame
-  scopes stay accurate.
-- **`remap_hs_cites.py`** — remaps every HS line cite in crates/ comments
-  across a submodule bump (`--old <pin> --new <pin> [--apply]`): pure line
-  shifts applied mechanically, moved declarations re-anchored by name,
-  ambiguous cites reported for a human pass. Run automatically by
-  `bump_submodule.sh`.
-- **`check_hs_cites.py`** — checks every `Foo.hs:N` cite against the pinned
-  submodule. It reads the cites in `crates/**/*.rs` comments **and in every
-  hand-written `*.spthy`**. It reads those theories under `crates/`, under
-  `divergence_fixtures/`, and under `../tests/wellformedness_fixtures/`. The
-  submodule's own corpus is out of scope. The script exits nonzero on a
-  finding. The first five finding classes are MISSING, AMBIGUOUS, RANGE, BLANK
-  and COMMENT. AMBIGUOUS is a bare basename that names two upstream files, so
-  its line number is uncheckable. The sixth class is SEELINE (a
-  `see line N` outside the extent it annotates). Nothing else catches a cite
-  that has drifted — `remap_hs_cites.py` reports ambiguity rather than
-  failing on it — so this is the post-bump gate, run automatically by
-  `bump_submodule.sh` at the end of a bump (findings land in the cite-remap
-  report). `--crate NAME` and `--skip CLASS` are repeatable; the whole tree
-  is currently at zero findings.
+Source and fixture comments refer to upstream files and optional Haskell
+symbols, for example `Theory/Model/Rule.hs#getRuleName`. Use enough of the path
+to identify the file unambiguously in the pinned `tamarin-prover/` submodule.
+Keep explanations of the relevant behaviour alongside the reference. Use
+file paths and symbol names without line numbers or ranges.
+For an exact historical implementation, use a commit-pinned permalink.
 
-  The `.spthy` half matters for one reason. A divergence fixture's header is a
-  paragraph-long argument about upstream behaviour, and it cites that
-  behaviour line by line. It is the one place where a reader checks a
-  divergence claim. A second lexer (`lex_spans_spthy`) reads the fixtures. The
-  Rust lexer does not read them. The comment forms are the same in both lexers:
-  `//` and nested `/* */`, per `spthyStyle` in `Theory/Text/Parser/Token.hs`.
-  A theory's `'psk'` is a single-quoted string. Rust's lexer reads a `'` as the
-  start of a lifetime, so it walks into such a string. It then misreads a cite
-  inside a public name as commentary and reports that cite as a finding.
-
-  Know one asymmetry at bump time. `remap_hs_cites.py` walks `crates/**/*.rs`
-  only, so it does not shift the fixtures' cites. Name the fixtures on its
-  command line to remap the `//` ones
-  (`remap_hs_cites.py --old … --new … scripts/divergence_fixtures/*.spthy`).
-  Cites inside a fixture's `/* */` header are outside that tool's plain
-  `//`/`#` scan. Correct those cites by hand. In both cases, the checker turns
-  a drifted fixture cite into a finding. It never leaves such a cite
-  unreported.
-- **`header_identities.json`** — email → GitHub-username map used by the
-  header generator.
+GPL notices are explicit and maintained independently of these references.
+Adding, changing, or removing a reference must not automatically add or remove
+a licence notice. See [the licensing notes](../docs/LICENSING.md).
 
 ## Data files (tracked)
 

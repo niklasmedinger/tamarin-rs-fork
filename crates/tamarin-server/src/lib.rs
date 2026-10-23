@@ -1,12 +1,11 @@
-// Currently GPL 3.0 until granted permission by the upstream authors
-// of the tamarin-prover sources this file cites; list them with:
-//   scripts/gen_license_headers.py --authors <this file>
+// Currently GPL 3.0; see README.md for licensing details.
+// Derived from the upstream tamarin-prover sources referenced below.
 
 //! HTTP server for the Tamarin prover (Rust port) interactive UI.
 //!
 //! Goal: serve the existing `frontend/` (TypeScript + d3 + viz-js)
-//! and the static assets under `data/` (jQuery, CSS, images) without
-//! modifying any frontend code.  The route shape closely mirrors
+//! and the static assets under `data/` (jQuery, CSS, images), embedded into
+//! the binary at compile time. The route shape closely mirrors
 //! Haskell's `Web.Dispatch` — same URL layout and the same JSON
 //! response envelope (`{ html, title }` / `{ alert }` / `{ redirect }`)
 //! used by the progressive UI.
@@ -71,8 +70,8 @@ use std::sync::Arc;
 pub struct ServerConfig {
     /// Address to bind, e.g. `127.0.0.1:3001`.
     pub bind_addr: SocketAddr,
-    /// Path to the `data/` directory (CSS, JS, images, fonts).
-    pub data_dir: PathBuf,
+    /// Optional override for the embedded GUI (CSS, JS, images, fonts).
+    pub data_dir: Option<PathBuf>,
     /// Path to the bundled frontend output (`frontend/dist/`), if any.
     pub frontend_dist: Option<PathBuf>,
     /// Path to the Maude binary.
@@ -85,20 +84,20 @@ pub struct ServerConfig {
     pub solver_parameters: tamarin_theory::constraint::solver::sources::IntegerParameters,
     /// CLI `--stop-on-trace` (None = flag absent).  Merged with each
     /// theory's in-file `configuration:` block at `ProofState::new` time
-    /// per HS `closeTheory`'s `configStopOnTrace` (TheoryLoader.hs:759-763):
+    /// per HS `closeTheory`'s `configStopOnTrace` (TheoryLoader.hs):
     /// the CLI value wins; the block is consulted only when this is `None`.
     pub stop_on_trace: Option<tamarin_theory::constraint::solver::context::CutStrategy>,
     /// CLI `--with-dot` — the GraphViz binary every graph render shells out
     /// to, the bare `"dot"` (resolved through `$PATH`) when the flag is
     /// absent.  That is HS `readOutputCommand`'s `OutDot` branch
-    /// (Environment.hs:41-45), whose string `dotToImg` invokes verbatim
-    /// (Web/Theory.hs:1494-1497).
+    /// (Environment.hs), whose string `dotToImg` invokes verbatim
+    /// (Web/Theory.hs).
     pub dot_path: String,
     /// CLI `--with-json` — when given, HS `readOutputCommand` switches to
-    /// `OutJSON` (Environment.hs:41-45, overriding `--with-dot`) and the
+    /// `OutJSON` (Environment.hs, overriding `--with-dot`) and the
     /// graph route renders through `jsonToImg`: the system's JSON graph is
     /// written to a file and `<json-cmd> <img> <json>` produces the image
-    /// (`imgThyPath` → `renderGraphCode`, Web/Theory.hs:1404-1412, 1484-1491).
+    /// (`imgThyPath` → `renderGraphCode`, Web/Theory.hs).
     /// `None` = flag absent, the `dot` pipeline above.
     pub json_path: Option<String>,
     /// Generate a sources lemma when partial deconstructions remain.
@@ -112,10 +111,14 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    pub fn new(bind_addr: SocketAddr, data_dir: PathBuf, maude_path: String) -> Self {
+    pub fn new(
+        bind_addr: SocketAddr,
+        data_dir: impl Into<Option<PathBuf>>,
+        maude_path: String,
+    ) -> Self {
         Self {
             bind_addr,
-            data_dir,
+            data_dir: data_dir.into(),
             frontend_dist: None,
             maude_path,
             derivcheck_timeout: 5,
@@ -153,15 +156,18 @@ pub async fn serve(
     cfg: ServerConfig,
     theory_paths: Vec<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(data_dir) = &cfg.data_dir {
+        handlers::static_files::validate_assets(data_dir, cfg.frontend_dist.as_deref())?;
+    }
     init_process_globals();
 
     let store = TheoryStore::default();
 
     // Eager-load every command-line theory.  Per-theory stdout reporting
-    // mirrors HS `loadTheories` (Web/Dispatch.hs:160-212): a non-empty
+    // mirrors HS `loadTheories` (Web/Dispatch.hs): a non-empty
     // wellformedness report is echoed via `ppInteractive`
-    // (Dispatch.hs:203-212), and a load failure prints the dashed
-    // `reportFailure` block (Dispatch.hs:194-201) and skips the theory.
+    // (Dispatch.hs), and a load failure prints the dashed
+    // `reportFailure` block (Dispatch.hs) and skips the theory.
     for p in &theory_paths {
         match theory_io::load_from_path(p, &cfg) {
             Ok(entry) => {
@@ -198,12 +204,12 @@ pub async fn serve(
 
     let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr).await?;
-    // HS ready message (Interactive.hs:125), printed by `loadTheories` after
-    // every theory has loaded (Dispatch.hs:160-164, see line 163) — note the
+    // HS ready message (Interactive.hs), printed by `loadTheories` after
+    // every theory has loaded (Dispatch.hs) — note the
     // trailing space after "at" and the indented URL line.
     println!(
         "Finished loading theories ... server ready at \n\n    http://{}\n",
-        cfg.bind_addr,
+        listener.local_addr()?,
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

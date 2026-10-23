@@ -30,6 +30,12 @@ GNU `time` is required only for `scripts/bench.sh` (`sudo apt-get install time`)
 and `lld` is an optional but substantially faster linker for the full Rust
 suite (`sudo apt-get install lld`).
 
+The server embeds its GUI at compile time. Install Node.js 22.12+ or 24+ and
+npm. Cargo initializes a missing submodule and builds the frontend automatically
+when building or testing the workspace. It rebuilds the frontend when its sources
+or build configuration change; the first build needs network access for missing
+Git and npm dependencies.
+
 **The Haskell oracle.** `./setup.sh testing` materialises a patched copy of
 the prover at `tamarin-prover-testing/` (the submodule itself is never
 modified). That directory is disposable: when its revision differs, setup
@@ -207,9 +213,9 @@ fast gates do need the oracle binary present to address it.**
 | `scripts/corpus_file_diff.sh` | the ground-truth batch gate: 432-file `--prove` byte parity (~30–60 min cold) |
 | `scripts/pe_sweep.sh` / `module_sweep.sh` / `json_sweep.sh` | the same sweeps over their full corpora |
 | `ALLOWLIST=<filelist> scripts/web_parity.sh` | interactive-mode gate: crawl + HTML byte comparison |
-| `scripts/bench.sh` | performance tables (see README) |
+| `scripts/bench.sh` | performance tables (see [results](docs/PERFORMANCE.md)) |
 
-**CI enforces `cargo fmt`, clippy, HS citation integrity, licence headers,
+**CI enforces `cargo fmt`, clippy,
 `cargo test --workspace`, the 18-file wellformedness roster,
 `scripts/divergence_fixtures/check.sh`, and `rs_ref_check.sh check`.** It runs
 no live Haskell binary. The divergence step compares 55 corner cases with
@@ -269,6 +275,29 @@ The three flag sweeps carry two non-fatal fields beside the verdict:
 compared-file count described above.
 
 ## Rust test suite
+
+### GUI browser regression
+
+The HTTP route tests compare HTML and graph data; browser coverage also checks
+that the JavaScript loads and actually draws graphs. CI runs this after the
+Rust suite. To run it locally:
+
+```bash
+cargo build --profile ci --bin tamarin-rs
+npm install --prefix target/gui-browser-test --no-audit --no-fund --no-save playwright@1.63.0
+target/gui-browser-test/node_modules/.bin/playwright install chromium
+node scripts/test_gui.mjs
+```
+
+Use `RS_PATH` to select another binary and `CHROMIUM_PATH` to use an existing
+Chromium installation. Maude and Graphviz must be on `PATH`. The test copies
+only the binary to a temporary installation, launches from an
+unrelated theory directory, and checks page loading, an autoproved graph in
+an iframe and standalone window, and server-rendered SVG. It also checks that
+a local `data/` directory cannot shadow the embedded GUI, and fails on browser
+errors.
+
+### Unit and integration suites
 
 ```bash
 MAUDE_PATH="$(command -v maude)" cargo test --profile ci --workspace
@@ -963,7 +992,5 @@ exits 2 rather than running with a private fallback.
 
 | Script | Purpose |
 |---|---|
-| `bump_submodule.sh` | submodule bump: patch rebase, oracle rebuild, automatic server-fixture refresh, cite remap, and explicit re-certification checklist (the caches self-invalidate, so none is archived) |
-| `bench.sh` | RS-vs-HS wall-clock + memory tables (`--write` regenerates the README block) |
-| `check_hs_cites.py` / `remap_hs_cites.py` / `extend_anchor_citations.py` | upstream line-cite validation and remapping |
-| `gen_license_headers.py` (+ `header_identities.json`) | GPL notice maintenance (`--check` for staleness) |
+| `bump_submodule.sh` | submodule bump: patch rebase, oracle rebuild, automatic server-fixture refresh, and explicit re-certification checklist (the caches self-invalidate, so none is archived) |
+| `bench.sh` | RS-vs-HS wall-clock + memory tables (`--write` regenerates `docs/PERFORMANCE.md`) |

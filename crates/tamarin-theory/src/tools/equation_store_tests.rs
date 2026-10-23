@@ -1,6 +1,5 @@
-// Currently GPL 3.0 until granted permission by the upstream authors
-// of the tamarin-prover sources this file cites; list them with:
-//   scripts/gen_license_headers.py --authors <this file>
+// Currently GPL 3.0; see README.md for licensing details.
+// Derived from the upstream tamarin-prover sources referenced below.
 
 use super::*;
 use tamarin_term::lterm::LSort;
@@ -382,7 +381,7 @@ fn remove_permutations_drops_renamed_variants() {
 
 /// `add_eqs` for AC-free, same-sort var-var input must orient the
 /// resulting subst with LARGER-idx as KEY (Haskell `unifyRaw`
-/// convention, Unification.hs:273-281, see line 276).
+/// convention, Unification.hs).
 ///
 /// This is the most important orientation invariant for downstream
 /// `restrict stableVars`: stable pattern vars (small idx) must stay
@@ -572,7 +571,7 @@ fn add_eqs_unsatisfiable_sets_store_false() {
 use tamarin_term::lterm::{frees_list, HasFrees};
 
 /// A variable named `n` distinguished by its index, so `Ord` follows the index
-/// (LTerm.hs:546-548) and a walk order is readable off the indices alone.
+/// (LTerm.hs) and a walk order is readable off the indices alone.
 fn hf_var(n: &str, idx: u64) -> LVar {
     LVar::new(n, LSort::Msg, idx)
 }
@@ -602,8 +601,8 @@ fn hf_disj() -> EqDisj {
 }
 
 /// The disjunction walks its substitutions in ascending `Ord` order, the
-/// `S.toList` of HS's `S.Set LNSubstVFresh` (LTerm.hs:898-901), and each of
-/// them exposes its domain keys alone (SubstVFresh.hs:196-202).
+/// `S.toList` of HS's `S.Set LNSubstVFresh` (LTerm.hs), and each of
+/// them exposes its domain keys alone (SubstVFresh.hs).
 #[test]
 fn eq_disj_walks_its_substitution_domains_in_ord_order() {
     assert_eq!(
@@ -642,7 +641,7 @@ fn eq_disj_arbitrary_map_deduplicates_collapsed_substitutions() {
     assert_eq!(mapped.substs, vec![hf_subst(0, 7)]);
 }
 
-/// `instance HasFrees EqStore` (EquationStore.hs:155-164): the free
+/// `instance HasFrees EqStore` (EquationStore.hs): the free
 /// substitution — each entry's key before its value — then the conjunction in
 /// list order.  `next_split` holds no variable.
 #[test]
@@ -671,4 +670,120 @@ fn eq_store_walks_the_substitution_then_the_conjunction() {
         vec![(hf_var("x", 103), hf_term("y", 4))]
     );
     assert_eq!(mapped.next_split, SplitId(11));
+}
+
+/// The pairwise-scan `simp_minimize` that the `BTreeSet` dedup replaced,
+/// kept verbatim as the reference the current implementation must match.
+fn simp_minimize_pairwise<F: Fn(&LNSubstVFresh) -> bool>(
+    store: &mut EquationStore,
+    is_contr: F,
+) -> bool {
+    let mut changed = false;
+    let empty = LNSubstVFresh::empty();
+    for d in store.conj.iter_mut() {
+        let mut has_dup = false;
+        for (i, s) in d.substs.iter().enumerate() {
+            if d.substs[..i].iter().any(|x| x == s) {
+                has_dup = true;
+                break;
+            }
+        }
+        let needs_work = has_dup || d.substs.iter().any(|s| s == &empty || is_contr(s));
+        if !needs_work {
+            continue;
+        }
+        let mut seen: Vec<LNSubstVFresh> = Vec::new();
+        for s in &d.substs {
+            if !seen.iter().any(|x| x == s) {
+                seen.push(s.clone());
+            }
+        }
+        let original_len = d.substs.len();
+        let reduce_to_empty = seen.iter().any(|s| s == &empty || is_contr(s));
+        if reduce_to_empty {
+            if seen.iter().any(|s| s == &empty) {
+                seen = vec![empty.clone()];
+            } else {
+                seen.retain(|s| !is_contr(s));
+            }
+        }
+        if seen.len() != original_len || seen != d.substs {
+            d.substs = seen;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn assert_simp_minimize_matches_pairwise(substs_per_disj: Vec<Vec<LNSubstVFresh>>) {
+    // Substs 2 and 5 of the `fresh_subst_n` pool are the contradictory ones.
+    let is_contr = |s: &LNSubstVFresh| *s == fresh_subst_n(2) || *s == fresh_subst_n(5);
+    let mut store = EquationStore::empty();
+    // Push the disjs directly: `add_disj` would sort and dedup them.
+    for (i, substs) in substs_per_disj.into_iter().enumerate() {
+        store.conj.push(EqDisj {
+            split_id: SplitId(i as i64),
+            substs,
+        });
+    }
+    let mut expected = store.clone();
+    let expected_changed = simp_minimize_pairwise(&mut expected, is_contr);
+    let changed = store.simp_minimize(is_contr);
+    assert_eq!(changed, expected_changed);
+    assert_eq!(store.conj.len(), expected.conj.len());
+    for (d, e) in store.conj.iter().zip(&expected.conj) {
+        assert_eq!(d.split_id, e.split_id);
+        assert_eq!(d.substs, e.substs);
+    }
+}
+
+#[test]
+fn simp_minimize_matches_pairwise_dedup() {
+    let s = fresh_subst_n;
+    let empty = LNSubstVFresh::empty;
+    // No duplicate, empty or contradictory subst: untouched, unsorted order kept.
+    assert_simp_minimize_matches_pairwise(vec![vec![s(4), s(1), s(3)]]);
+    // Sorted, as `simp_with_fresh_avoiding` passes it: untouched, or only
+    // the contradictory subst dropped.
+    assert_simp_minimize_matches_pairwise(vec![vec![s(0), s(1), s(3)]]);
+    assert_simp_minimize_matches_pairwise(vec![vec![s(0), s(2), s(3)]]);
+    // Duplicates: first occurrences kept, in input order.
+    assert_simp_minimize_matches_pairwise(vec![vec![s(4), s(1), s(4), s(3), s(1), s(1)]]);
+    // Empty subst present: the disj collapses to it.
+    assert_simp_minimize_matches_pairwise(vec![vec![s(3), empty(), s(3), empty()]]);
+    // Contradictory substs are dropped, with and without duplicates.
+    assert_simp_minimize_matches_pairwise(vec![vec![s(2), s(1), s(5), s(0)]]);
+    assert_simp_minimize_matches_pairwise(vec![vec![s(5), s(1), s(5), s(1), s(2)]]);
+    // All contradictory: the disj becomes empty.
+    assert_simp_minimize_matches_pairwise(vec![vec![s(2), s(5), s(2)]]);
+    // Empty and contradictory together.
+    assert_simp_minimize_matches_pairwise(vec![vec![s(2), empty(), s(0)]]);
+    // Several disjs, only some of which change; and an empty disj.
+    assert_simp_minimize_matches_pairwise(vec![
+        vec![s(0), s(1)],
+        vec![s(3), s(3)],
+        vec![],
+        vec![s(1), s(0)],
+    ]);
+
+    // Pseudo-random stores over a small pool, so duplicates, empties and
+    // contradictory substs occur in every combination.
+    let pool: Vec<LNSubstVFresh> = (0..7).map(s).chain([empty()]).collect();
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % bound
+    };
+    for _ in 0..500 {
+        let disjs = (0..1 + next(3))
+            .map(|_| {
+                (0..next(9))
+                    .map(|_| pool[next(pool.len() as u64) as usize].clone())
+                    .collect()
+            })
+            .collect();
+        assert_simp_minimize_matches_pairwise(disjs);
+    }
 }
