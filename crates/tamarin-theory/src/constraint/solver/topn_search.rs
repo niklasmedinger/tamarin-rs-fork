@@ -522,12 +522,20 @@ impl<'a> Engine<'a> {
     }
 
     fn merge_counts(&self) -> MergeCounts {
+        let (stored, stored_unkeyed) =
+            search_graph::stored_counts(&self.graph, &self.store, self.config.merge);
         MergeCounts {
             applied: self.stats.applied,
             leaves: self.stats.leaves,
             merges: self.stats.merges,
             skipped_asleep: self.stats.skipped_asleep,
             asleep: self.stats.asleep,
+            // Every merge happens when a case is created; whether a later
+            // step goes through it is not tracked here.
+            merges_used: self.stats.merges,
+            stored,
+            stored_unkeyed,
+            ..MergeCounts::default()
         }
     }
 

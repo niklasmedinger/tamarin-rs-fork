@@ -627,6 +627,65 @@ pub(crate) struct MergeCounts {
     /// With sleep sets: open classes left without a method because every
     /// remaining one slept.
     pub(crate) asleep: u64,
+    /// Merges that changed what the search did: a merge into a class
+    /// already settled, or one a traversal went on through. Under MCGS's
+    /// just-in-time keying every merge is one, since it happens when a
+    /// traversal enters the case.
+    pub(crate) merges_used: u64,
+    /// Of `merges_used`, those into a class already settled then: the case
+    /// closed without an expansion of its own.
+    pub(crate) merges_settled: u64,
+    /// Of `merges_used`, those into a class on the entering traversal's
+    /// path, which ends it.
+    pub(crate) merges_on_path: u64,
+    /// Without merging, with shadow keys (MCGS): claimed systems whose key
+    /// an earlier claimed system had, which merging would have merged.
+    pub(crate) shadow_dups: u64,
+    /// Systems held for classes that may still get a method.
+    pub(crate) stored: u64,
+    /// Of `stored`, those not canonicalized yet (MCGS's just-in-time keying:
+    /// cases no traversal entered).
+    pub(crate) stored_unkeyed: u64,
+    /// Wall time the search thread spent canonicalizing between traversals
+    /// and expansions (MCGS's keying passes), when no expansion overlaps it.
+    pub(crate) key_wall: Duration,
+}
+
+/// The systems `store` holds, and how many of them belong to classes not
+/// keyed yet, for [`MergeCounts::stored`] and
+/// [`MergeCounts::stored_unkeyed`]. `store` is indexed by class.
+pub(crate) fn stored_counts<X>(
+    graph: &SearchGraph<X>,
+    store: &[Option<Stored>],
+    merge: bool,
+) -> (u64, u64) {
+    let mut stored = 0;
+    let mut unkeyed = 0;
+    for (class, entry) in graph.classes.iter().zip(store) {
+        if entry.is_some() {
+            stored += 1;
+            if merge && !class.keyed {
+                unkeyed += 1;
+            }
+        }
+    }
+    (stored, unkeyed)
+}
+
+/// The process's resident set size now and at its peak, in MB (`VmRSS` and
+/// `VmHWM` of `/proc/self/status`); `None` where that file does not exist.
+pub(crate) fn rss_mb() -> (Option<u64>, Option<u64>) {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return (None, None);
+    };
+    let field = |name: &str| {
+        status.lines().find_map(|line| {
+            let rest = line.strip_prefix(name)?;
+            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            Some(kb / 1024)
+        })
+    };
+    (field("VmRSS:"), field("VmHWM:"))
 }
 
 /// Writes `[search-stats]` lines for one search: the same fields for every
@@ -764,11 +823,15 @@ impl StatsReporter {
             .map(|c| c.min_depth)
             .max()
             .unwrap_or(0);
+        let (rss, peak_rss) = rss_mb();
+        let mb = |v: Option<u64>| v.map_or("-".to_string(), |v| v.to_string());
         eprintln!(
             "[search-stats] search={} lemma={} final={} end={} root={} classes={} leaves={} \
              merges={} shared={} asleep={} skipped_asleep={} applied={} execs={} canons={} \
              canon_s={:.3} canon_min_s={:.6} canon_max_s={:.6} busy_s={:.3} elapsed_s={:.3} \
-             max_depth={} max_applied_depth={}",
+             max_depth={} max_applied_depth={} keyed={} merges_used={} merges_settled={} \
+             merges_on_path={} shadow_dups={} stored={} stored_unkeyed={} key_wall_s={:.3} \
+             rss_mb={} peak_rss_mb={}",
             self.search,
             lemma,
             u8::from(end.is_some()),
@@ -790,6 +853,16 @@ impl StatsReporter {
             self.started.elapsed().as_secs_f64(),
             max_depth,
             max_applied_depth,
+            graph.by_key.len(),
+            counts.merges_used,
+            counts.merges_settled,
+            counts.merges_on_path,
+            counts.shadow_dups,
+            counts.stored,
+            counts.stored_unkeyed,
+            counts.key_wall.as_secs_f64(),
+            mb(rss),
+            mb(peak_rss),
         );
     }
 }
