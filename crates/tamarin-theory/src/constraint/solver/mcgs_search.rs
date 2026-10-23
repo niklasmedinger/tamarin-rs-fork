@@ -77,6 +77,15 @@
 //! system merged into a class it may enter goes on from there and may claim
 //! another system, which the next pass keys.
 //!
+//! What merging saved shows in the `[search-stats]` lines as `expanded`,
+//! the classes the search expanded, against `unfolded`, their occurrences
+//! once the graph is unfolded into a tree ([`search_graph::unfold`]): what a
+//! search without merging would have to expand to reach the same systems
+//! along every path the graph has to them. It is not what the unmerged
+//! search expands, which makes other choices. Under eager keying the tree
+//! also has the cases merged when their method was applied that no
+//! traversal entered.
+//!
 //! ## Priors
 //!
 //! `P_i = exp(log_softmax(−w_h · i + bias_i) / T)` for the heuristic's
@@ -847,11 +856,15 @@ impl<'a> Engine<'a> {
             stored,
             stored_unkeyed,
             key_wall: self.stats.key_wall,
+            unfolding: Some(search_graph::unfold(&self.graph, |class| class.ext.expanded)),
         }
     }
 
     /// A `[search-stats]` progress line, if one is due.
     fn report_progress(&mut self) {
+        if !self.reporter.due() {
+            return;
+        }
         let counts = self.merge_counts();
         self.reporter
             .tick(&self.ctx.lemma_name, &self.graph, &counts, &self.stats.work);

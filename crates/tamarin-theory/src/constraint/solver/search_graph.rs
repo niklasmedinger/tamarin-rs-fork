@@ -649,6 +649,98 @@ pub(crate) struct MergeCounts {
     /// Wall time the search thread spent canonicalizing between traversals
     /// and expansions (MCGS's keying passes), when no expansion overlaps it.
     pub(crate) key_wall: Duration,
+    /// The expanded classes and the graph unfolded into a tree ([`unfold`]);
+    /// MCGS reports it, top-N does not (`None`).
+    pub(crate) unfolding: Option<Unfolding>,
+}
+
+/// The classes a search expanded, and how many times they occur once its
+/// graph is unfolded into a tree from the root: a class reached along `k`
+/// paths occurs `k` times. That tree is what a search without merging would
+/// have to expand to reach the same systems along every path the graph has
+/// to them. Without merging the graph is a tree, and the two counts agree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Unfolding {
+    /// Expanded classes reachable from the root.
+    pub(crate) expanded: u64,
+    /// Their occurrences in the unfolded tree. A float, since the number of
+    /// paths grows exponentially with the depth of shared classes; exact
+    /// below 2^53.
+    pub(crate) unfolded: f64,
+    /// Case edges into a class the edge is itself below (a cycle). They are
+    /// left out of the unfolding, which would otherwise never end.
+    pub(crate) loops: u64,
+}
+
+/// [`Unfolding`] of `graph`, counting the classes `expanded` selects. One
+/// depth-first pass from the root, then one pass in topological order, so
+/// it is linear in the graph's size.
+pub(crate) fn unfold<X>(
+    graph: &SearchGraph<X>,
+    expanded: impl Fn(&Class<X>) -> bool,
+) -> Unfolding {
+    const UNSEEN: u32 = u32::MAX;
+    const ON_STACK: u32 = u32::MAX - 1;
+    let n = graph.classes.len();
+    // Per class: its index in `post` once finished, or a marker.
+    let mut position = vec![UNSEEN; n];
+    let mut post: Vec<ClassId> = Vec::with_capacity(n);
+    let mut loops = 0;
+    if n > 0 {
+        // Per class on the stack: the method and case of its next edge.
+        let mut stack: Vec<(ClassId, usize, usize)> = vec![(ROOT, 0, 0)];
+        position[ROOT as usize] = ON_STACK;
+        while let Some(top) = stack.last_mut() {
+            let (c, a, k) = *top;
+            let ands = &graph.classes[c as usize].ands;
+            if a == ands.len() {
+                stack.pop();
+                position[c as usize] = post.len() as u32;
+                post.push(c);
+            } else if k == ands[a].cases.len() {
+                *top = (c, a + 1, 0);
+            } else {
+                top.2 += 1;
+                let d = ands[a].cases[k].1;
+                match position[d as usize] {
+                    ON_STACK => loops += 1,
+                    UNSEEN => {
+                        position[d as usize] = ON_STACK;
+                        stack.push((d, 0, 0));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Every edge but a loop leads to a class finished earlier, so reverse
+    // post-order sees all of a class's parents before the class.
+    let mut paths = vec![0.0f64; n];
+    if n > 0 {
+        paths[ROOT as usize] = 1.0;
+    }
+    for &c in post.iter().rev() {
+        let here = paths[c as usize];
+        for and in &graph.classes[c as usize].ands {
+            for &(_, d) in &and.cases {
+                if position[d as usize] < position[c as usize] {
+                    paths[d as usize] += here;
+                }
+            }
+        }
+    }
+    let mut unfolding = Unfolding {
+        expanded: 0,
+        unfolded: 0.0,
+        loops,
+    };
+    for &c in &post {
+        if expanded(&graph.classes[c as usize]) {
+            unfolding.expanded += 1;
+            unfolding.unfolded += paths[c as usize];
+        }
+    }
+    unfolding
 }
 
 /// The systems `store` holds, and how many of them belong to classes not
@@ -717,6 +809,25 @@ impl StatsReporter {
         }
     }
 
+    fn snapshot_due(&self) -> bool {
+        let elapsed = self.started.elapsed();
+        self.snapshots
+            .first()
+            .is_some_and(|&at| elapsed >= Duration::from_secs(at))
+    }
+
+    fn line_due(&self) -> bool {
+        self.every
+            .is_some_and(|every| !every.is_zero() && self.last.elapsed() >= every)
+    }
+
+    /// Whether [`Self::tick`] would write anything now. A search that ticks
+    /// every step computes its counts, which take passes over the graph,
+    /// only then.
+    pub(crate) fn due(&self) -> bool {
+        self.snapshot_due() || self.line_due()
+    }
+
     /// A progress line, and a graph snapshot, if one is due.
     pub(crate) fn tick<X: DumpExt>(
         &mut self,
@@ -725,23 +836,14 @@ impl StatsReporter {
         counts: &MergeCounts,
         work: &WorkStats,
     ) {
-        let elapsed = self.started.elapsed();
-        if self
-            .snapshots
-            .first()
-            .is_some_and(|&at| elapsed >= Duration::from_secs(at))
-        {
+        if self.snapshot_due() {
             let at = self.snapshots.remove(0);
             self.dump(lemma, graph, counts, work, None, Some(at));
         }
-        let Some(every) = self.every else {
-            return;
-        };
-        if every.is_zero() || self.last.elapsed() < every {
-            return;
+        if self.line_due() {
+            self.last = Instant::now();
+            self.print(lemma, graph, counts, work, None);
         }
-        self.last = Instant::now();
-        self.print(lemma, graph, counts, work, None);
     }
 
     /// The last line, with why the search ended and the root's status, and
@@ -825,13 +927,16 @@ impl StatsReporter {
             .unwrap_or(0);
         let (rss, peak_rss) = rss_mb();
         let mb = |v: Option<u64>| v.map_or("-".to_string(), |v| v.to_string());
+        let unfolding = |field: fn(&Unfolding) -> String| {
+            counts.unfolding.as_ref().map_or("-".to_string(), field)
+        };
         eprintln!(
             "[search-stats] search={} lemma={} final={} end={} root={} classes={} leaves={} \
              merges={} shared={} asleep={} skipped_asleep={} applied={} execs={} canons={} \
              canon_s={:.3} canon_min_s={:.6} canon_max_s={:.6} busy_s={:.3} elapsed_s={:.3} \
              max_depth={} max_applied_depth={} keyed={} merges_used={} merges_settled={} \
              merges_on_path={} shadow_dups={} stored={} stored_unkeyed={} key_wall_s={:.3} \
-             rss_mb={} peak_rss_mb={}",
+             rss_mb={} peak_rss_mb={} expanded={} unfolded={} unfold_loops={}",
             self.search,
             lemma,
             u8::from(end.is_some()),
@@ -863,6 +968,10 @@ impl StatsReporter {
             counts.key_wall.as_secs_f64(),
             mb(rss),
             mb(peak_rss),
+            unfolding(|u| u.expanded.to_string()),
+            // A float prints without a fraction or an exponent here.
+            unfolding(|u| u.unfolded.to_string()),
+            unfolding(|u| u.loops.to_string()),
         );
     }
 }
@@ -1648,6 +1757,42 @@ mod tests {
             g.class(root).status,
             Status::Settled(Settled::Contradictory)
         );
+    }
+
+    fn has_methods(class: &Class<()>) -> bool {
+        !class.ands.is_empty()
+    }
+
+    /// A tree unfolds into itself.
+    #[test]
+    fn a_tree_unfolds_into_itself() {
+        let mut g = Graph::new();
+        let root = open(&mut g);
+        let (a, b) = (open(&mut g), open(&mut g));
+        let contra = leaf_class(&mut g, Settled::Contradictory);
+        and(&mut g, root, &[a, b]);
+        and(&mut g, a, &[contra]);
+        let u = unfold(&g, has_methods);
+        assert_eq!((u.expanded, u.unfolded, u.loops), (2, 2.0, 0));
+    }
+
+    /// A class occurs once per path from the root: `s` is reached through
+    /// `x` and twice through `y`, whose two cases both lead to it. The edge
+    /// from `s` back to `x`, above it, is a loop and is not unfolded.
+    #[test]
+    fn a_class_occurs_once_per_path_and_a_loop_is_not_unfolded() {
+        let mut g = Graph::new();
+        let root = open(&mut g);
+        let (x, y, s) = (open(&mut g), open(&mut g), open(&mut g));
+        let contra = leaf_class(&mut g, Settled::Contradictory);
+        and(&mut g, root, &[x, y]);
+        and(&mut g, x, &[s]);
+        and(&mut g, s, &[x]);
+        and(&mut g, s, &[contra]);
+        and(&mut g, y, &[s, s]);
+        let u = unfold(&g, has_methods);
+        // root, x and y once each, s three times.
+        assert_eq!((u.expanded, u.unfolded, u.loops), (4, 6.0, 1));
     }
 
     fn key(n: u8) -> CanonicalSystemFingerprint {
