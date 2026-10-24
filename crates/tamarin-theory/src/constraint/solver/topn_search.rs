@@ -87,6 +87,8 @@
 //! - `TAM_RS_TOP_METHODS=N`: search the first N applicable methods per system;
 //! - `TAM_RS_SEARCH_ORDER=iddfs|bfs`: the frontier order, default `iddfs`;
 //! - `TAM_RS_MERGE` (presence): merge canonically equal systems (needs `bliss`);
+//! - `TAM_RS_CANON_INVARIANT=off|on|check`: how merging canonicalizes
+//!   ([`super::canon_table`]), as in the MCGS search;
 //! - `TAM_RS_SLEEP_SETS` (presence): skip the methods of sleeping goals (see
 //!   above); excludes `TAM_RS_MERGE`;
 //! - `TAM_RS_TOPN_BATCH=B`: entries expanded per step, default the rayon
@@ -108,15 +110,19 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
+use crate::constraint::solver::canon_table::{canon_mode_from_env, CanonicalTable};
 use crate::constraint::solver::context::ProofContext;
 use crate::constraint::solver::proof_method::ProofMethod;
 use crate::constraint::solver::reduction::avoid_fresh_state;
 use crate::constraint::solver::search::{self, candidate_methods, ProofNode};
+use crate::canon_term_graph::system_to_term;
 use crate::constraint::solver::search_graph::{
-    self, apply_method, classify, Applied, Child, ClassId, End, Interned, Materializer,
-    MergeCounts, StatsReporter, Status, Stored, WorkStats, WorkerEnv, DEPTH_CAP, ROOT,
+    self, apply_method, classify, kept_system, Applied, Child, ClassId, End, Interned,
+    KeptSystems, Materializer, MergeCounts, StatsReporter, Status, Stored, WorkStats, WorkerEnv,
+    DEPTH_CAP, ROOT,
 };
 use crate::constraint::system::System;
+use tamarin_utils::FastMap;
 use crate::prove::ProveError;
 
 // =============================================================================
@@ -388,7 +394,9 @@ struct Expansion {
 
 /// Applies the class's next applicable method whose goal is awake and
 /// prepares its cases.
-fn expand_task(ctx: &ProofContext, task: Task, merge: bool) -> Expansion {
+/// With merging, `table` is the search's canonical table, which the cases
+/// are prepared for.
+fn expand_task(ctx: &ProofContext, task: Task, table: Option<&CanonicalTable>) -> Expansion {
     let start = Instant::now();
     let Task {
         class,
@@ -428,7 +436,15 @@ fn expand_task(ctx: &ProofContext, task: Task, merge: bool) -> Expansion {
             continue;
         }
         let method = method.clone();
-        let applied = match apply_method(ctx, &stored, &method, cut_children, merge, &mut work) {
+        let applied = match apply_method(
+            ctx,
+            &stored,
+            &method,
+            cut_children,
+            table,
+            table.is_some(),
+            &mut work,
+        ) {
             Ok(applied) => applied,
             Err(e) => break Outcome::Failed(e),
         };
@@ -489,6 +505,9 @@ struct Engine<'a> {
     graph: SearchGraph,
     /// Indexed by class; see [`Stored`].
     store: Vec<Option<Stored>>,
+    /// The systems of pending classes of the canonical table that the store
+    /// dropped: the table needs them to canonicalize a representative.
+    retained: FastMap<ClassId, Box<System>>,
     frontier: BinaryHeap<Entry>,
     /// Classes whose live entry waits for a higher limit
     /// ([`Pending::parked`]). A class may appear twice; it gets its entry
@@ -497,6 +516,8 @@ struct Engine<'a> {
     /// `--bound`: no class at this depth or deeper is expanded.
     bound: u32,
     deadline: Instant,
+    /// With merging: the classes' canonical keys.
+    table: CanonicalTable,
     stats: Stats,
     reporter: StatsReporter,
 }
@@ -512,10 +533,12 @@ impl<'a> Engine<'a> {
             config,
             graph: SearchGraph::new(),
             store: Vec::new(),
+            retained: FastMap::default(),
             frontier: BinaryHeap::new(),
             parked: Vec::new(),
             bound,
             deadline,
+            table: CanonicalTable::new(canon_mode_from_env()),
             stats: Stats::default(),
             reporter: StatsReporter::new("topn"),
         }
@@ -535,15 +558,22 @@ impl<'a> Engine<'a> {
             merges_used: self.stats.merges,
             stored,
             stored_unkeyed,
+            retained: self.retained.len() as u64,
             ..MergeCounts::default()
         }
+        .with_table(&self.table)
     }
 
     /// A `[search-stats]` progress line, if one is due.
     fn report_progress(&mut self) {
         let counts = self.merge_counts();
-        self.reporter
-            .tick(&self.ctx.lemma_name, &self.graph, &counts, &self.stats.work);
+        self.reporter.tick(
+            &self.ctx.lemma_name,
+            &self.graph,
+            &self.table,
+            &counts,
+            &self.stats.work,
+        );
     }
 
     #[cfg(test)]
@@ -608,7 +638,7 @@ impl<'a> Engine<'a> {
         let child = if self.bound == 0 {
             Child::Cut
         } else {
-            classify(self.ctx, sys, self.config.merge, &mut work)
+            classify(self.ctx, sys, self.config.merge.then_some(&self.table), &mut work)
         };
         self.stats.work.add(&work);
         let root = self.intern(child, 0, 0);
@@ -618,7 +648,9 @@ impl<'a> Engine<'a> {
     /// The class of a prepared case reached at `depth` and `cost`: a new one,
     /// or with merging an existing one reached again.
     fn intern(&mut self, child: Child, depth: u32, cost: u32) -> ClassId {
-        let (c, interned) = self.graph.intern(child, depth);
+        let (c, interned) = self
+            .graph
+            .intern(child, depth, &mut self.table, &mut self.stats.work);
         match interned {
             Interned::Cut => self.adopt(c, cost, None),
             Interned::Leaf => {
@@ -713,7 +745,9 @@ impl<'a> Engine<'a> {
             let c = e.class.0;
             if self.graph.class(c).status != Status::Open {
                 self.graph.class_mut(c).ext.pending = None;
-                self.store[c as usize] = None;
+                if let Some(stored) = self.store[c as usize].take() {
+                    self.set_aside(c, stored);
+                }
                 continue;
             }
             if !self.graph.is_relevant(c) {
@@ -754,11 +788,12 @@ impl<'a> Engine<'a> {
         let count = tasks.len();
         let results = {
             let ctx = self.ctx;
-            let merge = self.config.merge;
+            // Workers read the table while this thread waits for them.
+            let table = self.config.merge.then_some(&self.table);
             let expand = |task: Task| -> Expansion {
                 let avoid_next = avoid_fresh_state(&task.stored.sys);
                 env.run(ctx, avoid_next, |worker_ctx| {
-                    expand_task(worker_ctx, task, merge)
+                    expand_task(worker_ctx, task, table)
                 })
             };
             if count == 1 {
@@ -771,6 +806,24 @@ impl<'a> Engine<'a> {
         self.stats.tasks += count as u64;
         self.stats.batch_wall += start.elapsed();
         results
+    }
+
+    /// `stored`, the system of `c`, which the search is done with: set aside
+    /// if `c` is a pending class of the canonical table, which needs it to
+    /// canonicalize the class's representative when a system with its
+    /// invariant comes; dropped otherwise.
+    fn set_aside(&mut self, c: ClassId, stored: Stored) {
+        if self.table.is_pending(c) {
+            self.retained.insert(c, stored.sys);
+        }
+    }
+
+    /// Drops the set-aside systems of the classes the canonical table keyed
+    /// since: it needs them no more.
+    fn forget_keyed(&mut self) {
+        for c in self.table.take_keyed() {
+            self.retained.remove(&c);
+        }
     }
 
     /// Phase 3: adds one expansion to the graph.
@@ -798,10 +851,11 @@ impl<'a> Engine<'a> {
                     self.stats.asleep += 1;
                 }
                 self.graph.close(c);
+                self.set_aside(c, stored);
             }
             Outcome::Applied(Applied {
                 method,
-                method_fp,
+                method_key,
                 cases,
             }) => {
                 self.stats.applied += 1;
@@ -810,7 +864,7 @@ impl<'a> Engine<'a> {
                     .sleep_sets
                     .then(|| goal_nr(&stored.sys, &method))
                     .flatten();
-                let a = self.graph.add_and(c, method, method_fp);
+                let a = self.graph.add_and(c, method, method_key);
                 let class = self.graph.class(c);
                 let depth = class.min_depth + 1;
                 let cost = class
@@ -838,6 +892,7 @@ impl<'a> Engine<'a> {
                     self.push_entry(c, self.next_rank(c));
                 } else {
                     self.graph.class_mut(c).closed = true;
+                    self.set_aside(c, stored);
                 }
                 self.graph.propagate(vec![(c, a)]);
                 // `closed` may also settle `c` without any method changing.
@@ -909,10 +964,31 @@ impl<'a> Engine<'a> {
                 if tasks.is_empty() {
                     break;
                 }
-                let results = self.expand_batch(env, tasks);
+                let mut results = self.expand_batch(env, tasks);
+                // What no worker could key, before any case is placed. A
+                // representative may be a class this batch expanded, whose
+                // system is in its expansion until integrated.
+                let mut expanded: FastMap<ClassId, &System> = FastMap::default();
+                let mut items = Vec::new();
+                for expansion in &mut results {
+                    expanded.insert(expansion.class, &expansion.stored.sys);
+                    if let Outcome::Applied(applied) = &mut expansion.outcome {
+                        items.extend(Child::prepared_mut(&mut applied.cases));
+                    }
+                }
+                self.table.precompute(
+                    items,
+                    |r| {
+                        kept_system(&self.store, &self.retained, r)
+                            .or_else(|| expanded.get(&r).copied())
+                            .map(system_to_term)
+                    },
+                    &mut self.stats.work,
+                );
                 for result in results {
                     self.integrate(result)?;
                 }
+                self.forget_keyed();
                 self.report_progress();
             }
             self.report_iteration(limit, &start);
@@ -956,6 +1032,7 @@ pub fn run(
     engine.reporter.finish(
         &ctx.lemma_name,
         &engine.graph,
+        &engine.table,
         &engine.merge_counts(),
         &engine.stats.work,
         end,
@@ -965,8 +1042,14 @@ pub fn run(
     // must not cut that short.
     let no_deadline = search::capture_search_tls(None);
     let materialize_start = Instant::now();
+    let kept = KeptSystems::new(
+        std::mem::take(&mut engine.store),
+        std::mem::take(&mut engine.retained),
+    );
     let materializer = Materializer {
         graph: &engine.graph,
+        table: &engine.table,
+        kept: &kept,
         merge: config.merge,
         bound,
         end,
@@ -978,6 +1061,7 @@ pub fn run(
         materializer.root(ctx, initial)?
     };
     let materialized = materialize_start.elapsed();
+    (engine.store, engine.retained) = kept.into_inner();
 
     if tamarin_utils::env_gate!("TAM_RS_TOPN_STATS") {
         print_stats(ctx, &config, &engine, end, &root, searched, materialized);
@@ -1189,7 +1273,7 @@ mod tests {
     fn applied(goal: &Goal, case: System) -> Outcome {
         Outcome::Applied(Applied {
             method: ProofMethod::SolveGoal(goal.clone()),
-            method_fp: None,
+            method_key: None,
             cases: vec![("case".into(), Child::Unkeyed(Stored::new(case, None)))],
         })
     }
@@ -1256,7 +1340,7 @@ mod tests {
             .find(|t| t.class == after_h)
             .expect("the case of `h` has an entry");
         task.stored.ranked = Some(vec![ProofMethod::SolveGoal(g.clone())]);
-        let result = expand_task(&ctx, task, false);
+        let result = expand_task(&ctx, task, None);
         assert!(matches!(result.outcome, Outcome::Terminal));
         assert_eq!(result.skipped_asleep, 1);
         engine.integrate(result).expect("integrate");

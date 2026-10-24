@@ -679,12 +679,31 @@ fn a_system_without_free_variables_skips_bliss() {
 
 // -- Which systems are equal -------------------------------------------------
 
+/// The pairs of [`equality_battery`] that are renamed copies of each other.
+const RENAMED_COPIES: [(usize, usize); 3] = [(0, 1), (2, 4), (5, 6)];
+
 /// Over a set of systems, exactly the renamed copies get the same form.
 #[test]
 fn exactly_the_renamed_copies_are_equal() {
     if !bliss_available() {
         return;
     }
+    let systems = equality_battery();
+    let forms: Vec<CanonicalSystem> = systems.iter().map(form).collect();
+    for i in 0..systems.len() {
+        for j in i + 1..systems.len() {
+            assert_eq!(
+                forms[i] == forms[j],
+                RENAMED_COPIES.contains(&(i, j)),
+                "systems {i} and {j}"
+            );
+        }
+    }
+}
+
+/// Systems of which exactly the pairs in [`RENAMED_COPIES`] are renamed
+/// copies.
+fn equality_battery() -> Vec<System> {
     let (x, y, z) = (v(msg("x", 0)), v(msg("y", 0)), v(msg("z", 2)));
     let mut systems = vec![
         worked(),
@@ -720,18 +739,101 @@ fn exactly_the_renamed_copies_are_equal() {
         tgt: (node(0), PremIdx(0)),
     };
     systems.push(moved);
+    systems
+}
 
-    let forms: Vec<CanonicalSystem> = systems.iter().map(form).collect();
-    let renamed_copies = [(0, 1), (2, 4), (5, 6)];
-    for i in 0..systems.len() {
-        for j in i + 1..systems.len() {
-            assert_eq!(
-                forms[i] == forms[j],
-                renamed_copies.contains(&(i, j)),
-                "systems {i} and {j}"
-            );
-        }
+// -- The invariant ------------------------------------------------------------
+
+fn system_invariant(sys: &System) -> Fingerprint {
+    invariant(&system_to_term(sys))
+}
+
+/// Equal forms have equal invariants: every renamed copy of the battery
+/// shares its original's.
+#[test]
+fn renamed_copies_have_the_same_invariant() {
+    let invariants: Vec<Fingerprint> = equality_battery().iter().map(system_invariant).collect();
+    for (i, j) in RENAMED_COPIES {
+        assert_eq!(invariants[i], invariants[j], "systems {i} and {j}");
     }
+}
+
+/// The invariant normalizes after abstracting: `x = k` and its renamed copy
+/// `j = y` are sorted by their variables, in opposite orders, so abstracting
+/// the normal forms leaves them apart.
+#[test]
+fn the_invariant_normalizes_after_abstracting() {
+    let eq = |l: LVar, r: LVar| STerm::App(Op::GEq, vec![free(l), free(r)]);
+    let original = eq(msg("x", 1), fresh("k", 2));
+    let renamed = eq(fresh("j", 0), msg("y", 9));
+    assert_eq!(invariant(&original), invariant(&renamed));
+    assert_ne!(
+        abstract_vars(&normalize(original)),
+        abstract_vars(&normalize(renamed))
+    );
+}
+
+/// Witnesses are abstracted too: swapping the equation store's two
+/// disjunctions renumbers their witnesses ([`witness`]) without changing
+/// the system.
+#[test]
+fn reordering_the_disjunctions_keeps_the_invariant() {
+    let (x, y) = (msg("x", 0), msg("y", 0));
+    let (w1, w2, w3) = (msg("w", 1), msg("w", 2), msg("w", 3));
+    let first = vec![alt(vec![(x, pair(v(w1), v(w2)))])];
+    let second = vec![alt(vec![(y, pk(v(w3)))])];
+    let system = |conj: Vec<Vec<LNSubstVFresh>>| {
+        let mut sys = ku_goal_system(vec![v(x), v(y)]);
+        set_conj(&mut sys, conj);
+        sys
+    };
+    let ab = system(vec![first.clone(), second.clone()]);
+    let ba = system(vec![second, first]);
+    assert_eq!(system_invariant(&ab), system_invariant(&ba));
+    if bliss_available() {
+        assert_eq!(form(&ab), form(&ba));
+    }
+}
+
+/// A placeholder carries its variable's number of occurrences: in
+/// `x ∪ x ∪ y` next to `<'a', x>`, `x` occurs three times and `y` once; in
+/// `y ∪ y ∪ x` next to `<'a', x>` both occur twice. Different forms
+/// ([`ac_multiplicity_of_a_variable_counts`]), and different invariants.
+#[test]
+fn occurrence_counts_tell_which_variable_occurs_twice() {
+    let (x, y) = (v(msg("x", 0)), v(msg("y", 0)));
+    let xxy = doubled_union(x.clone(), y.clone(), x.clone());
+    let xyy = doubled_union(y, x.clone(), x);
+    assert_ne!(system_invariant(&xxy), system_invariant(&xyy));
+}
+
+/// `<x, y>` next to `<'a', <second, third>>`.
+fn crossed(x: LNTerm, y: LNTerm, second: LNTerm, third: LNTerm) -> System {
+    ku_goal_system(vec![pair(x, y), pair(pub_term("a"), pair(second, third))])
+}
+
+/// Coarser than the form: with every variable occurring twice, how the
+/// second pair links them back to the first is lost.
+#[test]
+fn the_invariant_forgets_how_equally_frequent_variables_are_linked() {
+    let (x, y) = (v(msg("x", 0)), v(msg("y", 0)));
+    let swapped = crossed(x.clone(), y.clone(), y.clone(), x.clone());
+    let kept = crossed(x.clone(), y.clone(), x, y);
+    assert_eq!(system_invariant(&swapped), system_invariant(&kept));
+    if bliss_available() {
+        assert_ne!(form(&swapped), form(&kept));
+    }
+}
+
+/// A different system has a different invariant where the difference is not
+/// only in its variables: here, another rule.
+#[test]
+fn which_rule_a_node_instantiates_changes_the_invariant() {
+    let ru = |name| rule(name, vec![], vec![], vec![fact("A", vec![v(msg("x", 0))])]);
+    assert_ne!(
+        system_invariant(&one_node(ru("R"))),
+        system_invariant(&one_node(ru("S")))
+    );
 }
 
 // --- Step 3: the canonical form of a term --------------------------------

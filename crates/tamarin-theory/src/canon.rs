@@ -199,7 +199,7 @@ pub fn ac_normalize_guarded(g: &Guarded) -> Guarded {
 // =============================================================================
 
 use crate::bliss_proc::BlissError;
-use crate::canon_term_graph::{canonical_eq_disj, canonical_goal, Op, STerm, SYSTEM_SECTIONS};
+use crate::canon_term_graph::{eq_disj_term, goal_term, under, Op, STerm, SYSTEM_SECTIONS};
 use crate::constraint::constraints::Goal;
 use crate::constraint::solver::proof_method::{ProofMethod, Result as FinishedResult};
 use crate::constraint::solver::Contradiction;
@@ -335,7 +335,34 @@ pub fn canonicalize_proof_method(
     sys: &System,
     labelling: &CanonLabelling,
 ) -> CanonicalProofMethod {
-    match method {
+    pre_canonical_proof_method(method, sys).under(labelling)
+}
+
+/// A [`ProofMethod`] translated like its system's term but not renamed yet:
+/// everything [`canonicalize_proof_method`] needs of the system. Renaming it
+/// ([`Self::under`]) needs only the system's labelling, which can be computed
+/// later from the system's term, after the system itself is gone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreCanonicalProofMethod(CanonicalProofMethod);
+
+impl PreCanonicalProofMethod {
+    /// The method in the canonical form of its system, whose canonical
+    /// labelling is `labelling`.
+    pub fn under(&self, labelling: &CanonLabelling) -> CanonicalProofMethod {
+        match &self.0 {
+            CanonicalProofMethod::Solve(goal) => CanonicalProofMethod::Solve(under(goal, labelling)),
+            CanonicalProofMethod::SolveSplit(disj) => {
+                CanonicalProofMethod::SolveSplit(under(disj, labelling))
+            }
+            other => other.clone(),
+        }
+    }
+}
+
+/// `method`, offered for `sys`, translated for [`PreCanonicalProofMethod::under`].
+/// Panics as [`canonicalize_proof_method`] does, except on variables.
+pub fn pre_canonical_proof_method(method: &ProofMethod, sys: &System) -> PreCanonicalProofMethod {
+    PreCanonicalProofMethod(match method {
         ProofMethod::Simplify => CanonicalProofMethod::Simplify,
         ProofMethod::Induction => CanonicalProofMethod::Induction,
         ProofMethod::Sorry(reason) => CanonicalProofMethod::Sorry(reason.clone()),
@@ -359,20 +386,15 @@ pub fn canonicalize_proof_method(
                 .iter()
                 .position(|d| d.split_id == *id)
                 .unwrap_or_else(|| panic!("split goal {id:?} names no EqDisj in eq_store.conj"));
-            CanonicalProofMethod::SolveSplit(canonical_eq_disj(
-                &sys.eq_store().conj[index],
-                index,
-                labelling,
-            ))
+            CanonicalProofMethod::SolveSplit(eq_disj_term(&sys.eq_store().conj[index], index))
         }
         ProofMethod::SolveGoal(goal) => CanonicalProofMethod::Solve(
-            canonical_goal(goal, labelling)
-                .expect("only Goal::Split has no goal term, handled above"),
+            goal_term(goal).expect("only Goal::Split has no goal term, handled above"),
         ),
         ProofMethod::Invalidated => {
             panic!("{method:?} is display-only and never a candidate proof method")
         }
-    }
+    })
 }
 
 fn contradiction_kind(c: &Contradiction) -> &'static str {

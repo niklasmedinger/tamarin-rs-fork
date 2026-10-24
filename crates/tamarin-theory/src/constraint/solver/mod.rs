@@ -38,6 +38,7 @@
 
 pub mod annotated_goals;
 pub mod bm25;
+pub mod canon_table;
 pub mod context;
 pub mod contradictions;
 pub mod goals;

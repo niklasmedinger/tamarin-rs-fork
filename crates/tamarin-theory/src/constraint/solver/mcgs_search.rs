@@ -154,6 +154,11 @@
 //!   (see "Merging");
 //! - `TAM_RS_MCGS_SHADOW_KEYS` (presence): without merging, canonicalize
 //!   claimed systems and count the duplicates, without merging them;
+//! - `TAM_RS_CANON_INVARIANT=off|on|check`: how merging and shadow keys
+//!   canonicalize ([`super::canon_table`]): every system (`off`, the
+//!   default), only one whose cheap invariant another system has (`on`), or
+//!   every system, checked against its invariant (`check`); the decisions
+//!   are the same;
 //! - `TAM_RS_MCGS_STATS` (presence): one summary line per search on stderr.
 //! - `TAM_RS_SEARCH_STATS=SECS`: `[search-stats]` lines on stderr, the merge
 //!   counters both graph searches share in one format: one every SECS
@@ -166,16 +171,15 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
-use tamarin_term::alpha_eq_ac::CanonLabelling;
-
-use crate::canon_fingerprint::CanonicalSystemFingerprint;
 use crate::constraint::solver::bm25;
+use crate::constraint::solver::canon_table::{canon_mode_from_env, CanonicalTable, Prepared};
 use crate::constraint::solver::context::ProofContext;
 use crate::constraint::solver::proof_method::ProofMethod;
 use crate::constraint::solver::reduction::avoid_fresh_state;
 use crate::constraint::solver::search::{self, candidate_methods, ProofNode};
+use crate::canon_term_graph::system_to_term;
 use crate::constraint::solver::search_graph::{
-    self, apply_method, canonical_key, classify, Applied, Child, ClassId, End, Interned,
+    self, apply_method, classify, kept_system, Applied, Child, ClassId, End, Interned, KeptSystems,
     Materializer, MergeCounts, StatsReporter, Status, Stored, WorkStats, WorkerEnv, DEPTH_CAP,
     ROOT,
 };
@@ -792,7 +796,8 @@ struct LeafTask {
 /// A claimed class's expansion, as a worker computed it.
 struct Expansion {
     c: ClassId,
-    stored: Stored,
+    /// The class's system, until it goes back to the store.
+    stored: Option<Stored>,
     path_len: u32,
     ranked: Vec<ProofMethod>,
     docs: Vec<Vec<String>>,
@@ -807,13 +812,19 @@ struct Engine<'a> {
     graph: SearchGraph,
     /// Indexed by class: its system while it may still get a method.
     store: Vec<Option<Stored>>,
+    /// The systems of pending classes of a canonical table that the store
+    /// dropped: the table needs them to canonicalize a representative.
+    retained: FastMap<ClassId, Box<System>>,
     /// `--bound`: no class at this depth or deeper is expanded.
     bound: u32,
     deadline: Instant,
     /// The lemma's BM25 query tokens.
     formula_query: Vec<String>,
-    /// With shadow keys: each key seen, and the first class that had it.
-    shadow: FastMap<CanonicalSystemFingerprint, ClassId>,
+    /// With merging: the classes' canonical keys.
+    table: CanonicalTable,
+    /// With shadow keys: the key of each claimed system, and the first class
+    /// that had it.
+    shadow: CanonicalTable,
     stats: Stats,
     reporter: StatsReporter,
 }
@@ -830,10 +841,12 @@ impl<'a> Engine<'a> {
             config,
             graph: SearchGraph::new(),
             store: Vec::new(),
+            retained: FastMap::default(),
             bound,
             deadline,
             formula_query,
-            shadow: FastMap::default(),
+            table: CanonicalTable::new(canon_mode_from_env()),
+            shadow: CanonicalTable::new(canon_mode_from_env()),
             stats: Stats::default(),
             reporter: StatsReporter::new("mcgs"),
         }
@@ -857,6 +870,21 @@ impl<'a> Engine<'a> {
             stored_unkeyed,
             key_wall: self.stats.key_wall,
             unfolding: Some(search_graph::unfold(&self.graph, |class| class.ext.expanded)),
+            retained: self.retained.len() as u64,
+            ..MergeCounts::default()
+        }
+        .with_table(if self.config.shadow_keys {
+            &self.shadow
+        } else {
+            &self.table
+        })
+    }
+
+    /// How methods applied now key their cases and themselves.
+    fn keying(&self) -> MethodKeying<'_> {
+        MethodKeying {
+            cases_for: self.config.key_cases().then_some(&self.table),
+            merge: self.config.merge,
         }
     }
 
@@ -866,8 +894,13 @@ impl<'a> Engine<'a> {
             return;
         }
         let counts = self.merge_counts();
-        self.reporter
-            .tick(&self.ctx.lemma_name, &self.graph, &counts, &self.stats.work);
+        self.reporter.tick(
+            &self.ctx.lemma_name,
+            &self.graph,
+            &self.table,
+            &counts,
+            &self.stats.work,
+        );
     }
 
     fn add_root(&mut self, sys: System) {
@@ -875,7 +908,7 @@ impl<'a> Engine<'a> {
         let child = if self.bound == 0 {
             Child::Cut
         } else {
-            classify(self.ctx, sys, self.config.merge, &mut work)
+            classify(self.ctx, sys, self.config.merge.then_some(&self.table), &mut work)
         };
         self.stats.work.add(&work);
         let root = self.intern(child, 0);
@@ -890,7 +923,9 @@ impl<'a> Engine<'a> {
     /// [`Self::intern`], and whether the case merged into an existing class,
     /// which only an eagerly keyed case does.
     fn intern_case(&mut self, child: Child, depth: u32) -> (ClassId, bool) {
-        let (c, interned) = self.graph.intern(child, depth);
+        let (c, interned) = self
+            .graph
+            .intern(child, depth, &mut self.table, &mut self.stats.work);
         let stored = match interned {
             Interned::Cut => {
                 self.graph.class_mut(c).ext.dead = true;
@@ -917,22 +952,20 @@ impl<'a> Engine<'a> {
         (c, false)
     }
 
-    /// Gives `c`, a claimed class without a key, the key `key` its system
-    /// `stored` canonicalizes to. If no class has it, it is `c`'s, and `c`
-    /// keeps the labelling for its methods. Otherwise `c` merges into the
-    /// class that has it, which is returned.
-    fn settle_key(
-        &mut self,
-        c: ClassId,
-        mut stored: Stored,
-        key: CanonicalSystemFingerprint,
-        labelling: CanonLabelling,
-    ) -> Option<ClassId> {
-        let Some(existing) = self.graph.key(c, key) else {
-            stored.labelling = Some(labelling);
+    /// Places `c`, a claimed class without a key, in the canonical table by
+    /// its system `stored`, `prepared` for it. If no class is canonically
+    /// equal, `c` is a class of its own, and keeps the labelling for its
+    /// methods if the table gave one. Otherwise `c` merges into that class,
+    /// which is returned.
+    fn settle_key(&mut self, c: ClassId, mut stored: Stored, prepared: Prepared) -> Option<ClassId> {
+        let placed = self.table.intern(prepared, || c, &mut self.stats.work);
+        if !placed.merged {
+            self.graph.mark_keyed(c);
+            stored.labelling = placed.labelling;
             self.store[c as usize] = Some(stored);
             return None;
-        };
+        }
+        let existing = placed.class;
         let ext = &mut self.graph.class_mut(c).ext;
         ext.in_flight = false;
         ext.merged_into = Some(existing);
@@ -946,9 +979,9 @@ impl<'a> Engine<'a> {
     }
 
     /// Keys the systems the round's traversals claimed, with merging on (see
-    /// the module docs), in passes: each canonicalizes the claimed systems
-    /// without a key in parallel, then settles their keys in traversal
-    /// order. A traversal whose system merged goes on from the class it
+    /// the module docs), in passes: each prepares the claimed systems without
+    /// a key for the canonical table in parallel, then places them in
+    /// traversal order. A traversal whose system merged goes on from the class it
     /// merged into, if it may enter it, and may claim another system, which
     /// the next pass keys. Each pass merges or keys every system it takes,
     /// and none creates a class, so the passes end.
@@ -982,21 +1015,28 @@ impl<'a> Engine<'a> {
                 })
                 .collect();
             let pass = Instant::now();
-            let keyed = map_in_order(owned, |stored| {
+            let table = &self.table;
+            let mut prepared = map_in_order(owned, |stored| {
                 let start = Instant::now();
                 let mut work = WorkStats::default();
-                let (key, labelling) = canonical_key(&stored.sys, &mut work);
+                let prepared = table.prepare(&stored.sys, &mut work);
                 work.busy = start.elapsed();
-                (stored, key, labelling, work)
+                (stored, prepared, work)
             });
+            self.table.precompute(
+                prepared.iter_mut().map(|(_, prepared, _)| prepared),
+                |r| kept_system(&self.store, &self.retained, r).map(system_to_term),
+                &mut self.stats.work,
+            );
             self.stats.key_wall += pass.elapsed();
             let mut merged = Vec::new();
-            for (&(i, c), (stored, key, labelling, work)) in unkeyed.iter().zip(keyed) {
+            for (&(i, c), (stored, prepared, work)) in unkeyed.iter().zip(prepared) {
                 self.stats.work.add(&work);
-                if let Some(existing) = self.settle_key(c, stored, key, labelling) {
+                if let Some(existing) = self.settle_key(c, stored, prepared) {
                     merged.push((i, existing));
                 }
             }
+            self.forget_keyed();
             for (i, existing) in merged {
                 let t = &mut ts[i];
                 t.on_path.pop();
@@ -1032,25 +1072,28 @@ impl<'a> Engine<'a> {
             })
             .collect();
         let pass = Instant::now();
-        let keyed = map_in_order(owned, |stored| {
+        let shadow = &self.shadow;
+        let mut prepared = map_in_order(owned, |stored| {
             let mut work = WorkStats::default();
-            let (key, _) = canonical_key(&stored.sys, &mut work);
-            (stored, key, work)
+            let prepared = shadow.prepare(&stored.sys, &mut work);
+            (stored, prepared, work)
         });
+        self.shadow.precompute(
+            prepared.iter_mut().map(|(_, prepared, _)| prepared),
+            |r| kept_system(&self.store, &self.retained, r).map(system_to_term),
+            &mut self.stats.work,
+        );
         self.stats.key_wall += pass.elapsed();
-        for (c, (stored, key, work)) in claimed.into_iter().zip(keyed) {
+        for (c, (stored, prepared, work)) in claimed.into_iter().zip(prepared) {
             self.stats.work.add(&work);
             self.store[c as usize] = Some(stored);
-            match self.shadow.get(&key) {
-                Some(&first) => {
-                    self.graph.class_mut(c).ext.dup_of = Some(first);
-                    self.stats.shadow_dups += 1;
-                }
-                None => {
-                    self.shadow.insert(key, c);
-                }
+            let placed = self.shadow.intern(prepared, || c, &mut self.stats.work);
+            if placed.merged {
+                self.graph.class_mut(c).ext.dup_of = Some(placed.class);
+                self.stats.shadow_dups += 1;
             }
         }
+        self.forget_keyed();
     }
 
     /// The BM25 query for a system reached along `path`.
@@ -1080,11 +1123,11 @@ impl<'a> Engine<'a> {
     fn integrate(&mut self, c: ClassId, rank: usize, applied: Applied) -> u16 {
         let Applied {
             method,
-            method_fp,
+            method_key,
             cases,
         } = applied;
         self.stats.applied += 1;
-        let a = self.graph.add_and(c, method, method_fp);
+        let a = self.graph.add_and(c, method, method_key);
         let ext = &mut self.graph.class_mut(c).ext;
         assert_eq!(
             ext.and_rank.len(),
@@ -1126,10 +1169,29 @@ impl<'a> Engine<'a> {
     fn tidy(&mut self, c: ClassId) {
         let class = self.graph.class(c);
         if class.status != Status::Open {
-            self.store[c as usize] = None;
+            self.release(c);
         } else if !class.ext.has_virtual() && !class.closed {
-            self.store[c as usize] = None;
+            self.release(c);
             self.graph.close(c);
+        }
+    }
+
+    /// Drops `c`'s system from the store: the class needs it no more. The
+    /// system of a pending class of a canonical table is set aside, to
+    /// canonicalize the class's representative when a system with its
+    /// invariant comes.
+    fn release(&mut self, c: ClassId) {
+        let pending = self.table.is_pending(c) || self.shadow.is_pending(c);
+        if let Some(stored) = self.store[c as usize].take().filter(|_| pending) {
+            self.retained.insert(c, stored.sys);
+        }
+    }
+
+    /// Drops the set-aside systems of the classes the canonical tables keyed
+    /// since: they need them no more.
+    fn forget_keyed(&mut self) {
+        for c in self.table.take_keyed().into_iter().chain(self.shadow.take_keyed()) {
+            self.retained.remove(&c);
         }
     }
 
@@ -1144,7 +1206,7 @@ impl<'a> Engine<'a> {
             };
             assert!(
                 !self.config.merge || self.graph.class(c).keyed,
-                "class #{c} is expanded unkeyed: its methods need its labelling"
+                "class #{c} is expanded unkeyed: merging places a class before its methods"
             );
             tasks.push(LeafTask {
                 c,
@@ -1157,8 +1219,16 @@ impl<'a> Engine<'a> {
                 path_len: t.path.len() as u32,
             });
         }
-        let (ctx, config) = (self.ctx, self.config);
-        let expansions = map_in_order(tasks, |task| expand_leaf(ctx, env, &config, task));
+        let (ctx, config, keying) = (self.ctx, self.config, self.keying());
+        let mut expansions =
+            map_in_order(tasks, |task| expand_leaf(ctx, env, &config, keying, task));
+        // Every expanded system back before any case is placed: a case of
+        // one expansion may collide with the pending class of another, or of
+        // its own, whose representative the canonical table canonicalizes
+        // from the store.
+        for expansion in expansions.iter_mut().flatten() {
+            self.store[expansion.c as usize] = expansion.stored.take();
+        }
         for expansion in expansions {
             self.integrate_expansion(expansion?)?;
         }
@@ -1170,13 +1240,22 @@ impl<'a> Engine<'a> {
     fn integrate_expansion(&mut self, expansion: Expansion) -> Result<(), ProveError> {
         let Expansion {
             c,
-            stored,
+            stored: _,
             path_len,
             ranked,
             docs,
             actions,
-            results,
+            mut results,
         } = expansion;
+        // Eager keying: what no worker could key, before any case is placed.
+        self.table.precompute(
+            results
+                .iter_mut()
+                .filter_map(|(_, applied, _)| applied.as_mut().ok()?.as_mut())
+                .flat_map(|applied| Child::prepared_mut(&mut applied.cases)),
+            |r| kept_system(&self.store, &self.retained, r).map(system_to_term),
+            &mut self.stats.work,
+        );
         self.stats.expansions += 1;
         let ext = &mut self.graph.class_mut(c).ext;
         ext.expanded = true;
@@ -1186,7 +1265,6 @@ impl<'a> Engine<'a> {
         ext.actions = actions;
         ext.path_len = path_len;
         ext.max_methods = self.config.max_methods;
-        self.store[c as usize] = Some(stored);
         for (rank, applied, work) in results {
             self.stats.work.add(&work);
             self.graph.class_mut(c).ext.expand_s += work.busy.as_secs_f64();
@@ -1206,6 +1284,7 @@ impl<'a> Engine<'a> {
                 None => self.drop_action(c, rank),
             }
         }
+        self.forget_keyed();
         self.tidy(c);
         Ok(())
     }
@@ -1224,11 +1303,21 @@ impl<'a> Engine<'a> {
             .as_ref()
             .expect("a class with a virtual method keeps its system");
         let (applied, work) =
-            run_method(self.ctx, env, stored, &method, cut, self.config.key_cases());
+            run_method(self.ctx, env, stored, &method, cut, self.keying());
         self.stats.work.add(&work);
         self.graph.class_mut(c).ext.expand_s += work.busy.as_secs_f64();
         let outcome = match applied? {
-            Some(applied) => Materialized::Applied(self.integrate(c, rank, applied)),
+            Some(mut applied) => {
+                // Eager keying: what the method's run could not key.
+                self.table.precompute(
+                    Child::prepared_mut(&mut applied.cases),
+                    |r| kept_system(&self.store, &self.retained, r).map(system_to_term),
+                    &mut self.stats.work,
+                );
+                let a = self.integrate(c, rank, applied);
+                self.forget_keyed();
+                Materialized::Applied(a)
+            }
             None if Instant::now() >= self.deadline => return Ok(Materialized::Aborted),
             None => {
                 self.drop_action(c, rank);
@@ -1388,7 +1477,7 @@ impl<'a> Engine<'a> {
         }
         for c in 0..n as ClassId {
             if self.graph.class(c).status != Status::Open {
-                self.store[c as usize] = None;
+                self.release(c);
             } else if !alive[c as usize] {
                 self.graph.class_mut(c).ext.dead = true;
             }
@@ -1427,6 +1516,7 @@ fn expand_leaf(
     ctx: &ProofContext,
     env: &WorkerEnv,
     config: &McgsConfig,
+    keying: MethodKeying<'_>,
     task: LeafTask,
 ) -> Result<Expansion, ProveError> {
     let LeafTask {
@@ -1468,7 +1558,7 @@ fn expand_leaf(
             .into_iter()
             .map(|(i, method)| {
                 let (applied, work) =
-                    run_method(ctx, env, &stored, &method, cut, config.key_cases());
+                    run_method(ctx, env, &stored, &method, cut, keying);
                 (i, applied, work)
             })
             .collect()
@@ -1483,14 +1573,14 @@ fn expand_leaf(
             .into_par_iter()
             .map(|(i, method, stored)| {
                 let (applied, work) =
-                    run_method(ctx, env, &stored, &method, cut, config.key_cases());
+                    run_method(ctx, env, &stored, &method, cut, keying);
                 (i, applied, work)
             })
             .collect()
     };
     Ok(Expansion {
         c,
-        stored,
+        stored: Some(stored),
         path_len,
         ranked,
         docs,
@@ -1509,22 +1599,39 @@ fn map_in_order<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync + Sen
     }
 }
 
-/// Applies `method` to `stored`'s system in a worker environment. With
-/// `key_cases` (eager keying) its cases are canonicalized here; otherwise
-/// they stay unkeyed, and [`Engine::key_leaves`] keys a case when a
-/// traversal claims it.
+/// How [`run_method`] keys what it produces.
+#[derive(Clone, Copy)]
+struct MethodKeying<'t> {
+    /// Eager keying: the canonical table the cases are prepared for.
+    /// Otherwise they stay unkeyed, and [`Engine::key_leaves`] keys a case
+    /// when a traversal claims it.
+    cases_for: Option<&'t CanonicalTable>,
+    /// Merging on: the method gets its key.
+    merge: bool,
+}
+
+/// Applies `method` to `stored`'s system in a worker environment, keyed as
+/// `keying` says.
 fn run_method(
     ctx: &ProofContext,
     env: &WorkerEnv,
     stored: &Stored,
     method: &ProofMethod,
     cut: bool,
-    key_cases: bool,
+    keying: MethodKeying<'_>,
 ) -> (Result<Option<Applied>, ProveError>, WorkStats) {
     let start = Instant::now();
     let mut work = WorkStats::default();
     let applied = env.run(ctx, avoid_fresh_state(&stored.sys), |worker_ctx| {
-        apply_method(worker_ctx, stored, method, cut, key_cases, &mut work)
+        apply_method(
+            worker_ctx,
+            stored,
+            method,
+            cut,
+            keying.cases_for,
+            keying.merge,
+            &mut work,
+        )
     });
     work.busy = start.elapsed();
     (applied, work)
@@ -1555,6 +1662,7 @@ pub fn run(
     engine.reporter.finish(
         &ctx.lemma_name,
         &engine.graph,
+        &engine.table,
         &engine.merge_counts(),
         &engine.stats.work,
         end,
@@ -1564,8 +1672,14 @@ pub fn run(
     // must not cut that short.
     let no_deadline = search::capture_search_tls(None);
     let materialize_start = Instant::now();
+    let kept = KeptSystems::new(
+        std::mem::take(&mut engine.store),
+        std::mem::take(&mut engine.retained),
+    );
     let materializer = Materializer {
         graph: &engine.graph,
+        table: &engine.table,
+        kept: &kept,
         merge: config.merge,
         bound,
         end,
@@ -1577,6 +1691,7 @@ pub fn run(
         materializer.root(ctx, initial)?
     };
     let materialized = materialize_start.elapsed();
+    (engine.store, engine.retained) = kept.into_inner();
 
     if tamarin_utils::env_gate!("TAM_RS_MCGS_STATS") {
         print_stats(ctx, &config, &engine, end, &root, searched, materialized);
@@ -1605,7 +1720,7 @@ fn print_stats(
     let dead = engine.graph.classes.iter().filter(|c| c.ext.dead).count();
     // Merging on: the classes with a key, and the cases no traversal entered
     // yet, which hold their systems unkeyed.
-    let keyed = engine.graph.by_key.len();
+    let keyed = engine.table.keyed();
     let unkeyed = engine
         .graph
         .classes
@@ -2115,8 +2230,14 @@ mod tests {
         let (mut engine, a, cases) = engine_with_cases(&ctx, config, vec![unproducible_action()]);
         // An expanded class with the case's key, and one unkeyed case below.
         let existing = engine.intern(Child::Unkeyed(Stored::new(unproducible_action(), None)), 3);
-        let (key, _) = canonical_key(&unproducible_action(), &mut WorkStats::default());
-        assert_eq!(engine.graph.key(existing, key), None);
+        let prepared = engine
+            .table
+            .prepare(&unproducible_action(), &mut WorkStats::default());
+        let placed = engine
+            .table
+            .intern(prepared, || existing, &mut WorkStats::default());
+        assert!(!placed.merged);
+        engine.graph.mark_keyed(existing);
         let ext = &mut engine.graph.class_mut(existing).ext;
         ext.expanded = true;
         ext.actions = vec![Action {
@@ -2176,7 +2297,7 @@ mod tests {
         let mut work = WorkStats::default();
         let cases: Vec<(String, Child)> = (0..2)
             .map(|i| {
-                let child = classify(&ctx, unproducible_action(), true, &mut work);
+                let child = classify(&ctx, unproducible_action(), Some(&engine.table), &mut work);
                 (format!("case_{i}"), child)
             })
             .collect();
@@ -2185,7 +2306,7 @@ mod tests {
             0,
             Applied {
                 method: ProofMethod::Simplify,
-                method_fp: None,
+                method_key: None,
                 cases,
             },
         );

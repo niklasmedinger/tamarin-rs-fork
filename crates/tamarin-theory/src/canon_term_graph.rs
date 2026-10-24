@@ -159,6 +159,7 @@ use tamarin_term::lterm::{BVar, HasFrees, LNTerm, LSort, LVar, Name};
 use tamarin_term::term::Term;
 use tamarin_term::vterm::Lit;
 use tamarin_utils::fingerprint::{Fingerprint, FingerprintHasher};
+use tamarin_utils::FastMap;
 
 use crate::atom::{Atom, ProtoAtom};
 use crate::bliss_proc::{run_bliss_with_stats, to_dimacs, BlissError, Color, Permutation};
@@ -1068,6 +1069,114 @@ pub fn fingerprint_sterm(t: &STerm) -> Fingerprint {
     h.0.finish()
 }
 
+// =============================================================================
+// A cheap invariant of the form
+// =============================================================================
+
+/// The name every variable takes in [`abstract_vars`]. It starts with a NUL,
+/// like a witness ([`WITNESS_MARK`]), so it names no variable of a theory or
+/// of the solver; it only ever meets other placeholders, in a hash.
+const PLACEHOLDER: &str = "\0sort";
+
+/// How often each variable, free or witness, occurs in a term; a binder's
+/// variables are not occurrences.
+type Occurrences = FastMap<VarRef, u64>;
+
+fn count_occurrences(t: &STerm, counts: &mut Occurrences) {
+    match t {
+        STerm::Var(v) => *counts.entry(*v).or_insert(0) += 1,
+        STerm::Const(_) => {}
+        STerm::App(_, args) => args.iter().for_each(|a| count_occurrences(a, counts)),
+        STerm::Exists(_, _, body) => count_occurrences(body, counts),
+    }
+}
+
+/// The placeholder of `v`: its sort, and in place of an index, how often `v`
+/// occurs.
+fn placeholder(v: VarRef, counts: &Occurrences) -> LVar {
+    let (VarRef::Free(x) | VarRef::Witness(x)) = v;
+    LVar {
+        name: PLACEHOLDER,
+        sort: x.sort,
+        idx: counts.get(&v).copied().unwrap_or(0),
+    }
+}
+
+/// `t` with every variable, free or witness, and every binder's variables
+/// replaced by its placeholder: one per sort and number of occurrences in
+/// `t`. A free variable stays a `VarRef::Free` and a witness a
+/// `VarRef::Witness`, as renaming keeps them. Names, de Bruijn indices and
+/// closed subterms are constants and stay. Counts first, in a pass of its
+/// own: a placeholder needs its variable's count before anything sorts it.
+pub fn abstract_vars(t: &STerm) -> STerm {
+    let mut counts = Occurrences::default();
+    count_occurrences(t, &mut counts);
+    abstract_counted(t, &counts)
+}
+
+fn abstract_counted(t: &STerm, counts: &Occurrences) -> STerm {
+    match t {
+        STerm::Var(v @ VarRef::Free(_)) => STerm::Var(VarRef::Free(placeholder(*v, counts))),
+        STerm::Var(v @ VarRef::Witness(_)) => {
+            STerm::Var(VarRef::Witness(placeholder(*v, counts)))
+        }
+        STerm::Const(_) => t.clone(),
+        STerm::App(op, args) => STerm::App(
+            op.clone(),
+            args.iter().map(|a| abstract_counted(a, counts)).collect(),
+        ),
+        STerm::Exists(scope, vars, body) => {
+            // The root binder binds the free variables, the other the
+            // witnesses.
+            let var_ref = |v: LVar| match scope {
+                Scope::Root => VarRef::Free(v),
+                Scope::Witnesses => VarRef::Witness(v),
+            };
+            STerm::Exists(
+                *scope,
+                vars.iter().map(|v| placeholder(var_ref(*v), counts)).collect(),
+                Box::new(abstract_counted(body, counts)),
+            )
+        }
+    }
+}
+
+/// A cheap invariant of a system term ([`system_to_term`]): its fingerprint
+/// once every variable is the placeholder of its sort and its number of
+/// occurrences ([`abstract_vars`]) and the result is normalized modulo AC
+/// and C ([`normalize`]). No bliss, no graph.
+///
+/// Two systems with the same canonical form have the same invariant, so a
+/// different invariant proves the forms differ, and only an equal one leaves
+/// the question to bliss. The argument rests on the form alone, not on the
+/// faithfulness claims (A) and (B) of the module docs: a form is
+/// `normalize(rename(body, θ))` for a θ that keeps sorts and keeps free
+/// variables free and witnesses witnesses, so
+///
+/// - renaming by θ does not change the abstraction: a variable and its image
+///   have the same sort and occur equally often, so they get the same
+///   placeholder;
+/// - flattening and reordering AC and C arguments keeps every occurrence
+///   (`normalize` keeps duplicates), so they leave the counts alone; the
+///   abstraction is then a substitution, under which equality modulo AC and
+///   C is preserved, and `normalize` is a normal form for that equality, so
+///   normalizing before abstracting does not change the result;
+/// - the binders bind exactly the variables of the body, which θ maps one to
+///   one, so their abstracted lists, sorted, agree too.
+///
+/// Normalizing after abstracting is what makes it an invariant: `x = 'a'` and
+/// `'a' = x` (`=` is C), or an AC section whose entries are ordered by their
+/// variables' names, abstract to terms that are equal only modulo AC and C.
+/// Witnesses are abstracted for the same reason: their names come from raw
+/// positions in the equation store ([`witness`]).
+///
+/// Coarser than the form: systems that differ only in how variables that
+/// occur equally often are linked share it: `<x, y>` next to `<'a', <y, x>>`,
+/// against `<x, y>` next to `<'a', <x, y>>`.
+pub fn invariant(term: &STerm) -> Fingerprint {
+    fingerprint_sterm(&normalize(abstract_vars(term)))
+}
+
 /// [`FingerprintHasher`] as a [`std::hash::Hasher`], for a derived `Hash`.
 /// Each write is length-prefixed ([`FingerprintHasher::bytes`]).
 struct Sha256Hasher(FingerprintHasher);
@@ -1157,14 +1266,26 @@ pub fn canonicalize_constraint_system_via_term_graph_with_labelling(
     sys: &System,
     options: TermGraphOptions,
 ) -> Result<(CanonicalSystem, CanonLabelling, TermGraphStats), BlissError> {
+    let start = Instant::now();
+    let term = system_to_term(sys);
+    let time_term = start.elapsed();
+    let (canon, labelling, mut stats) = canonicalize_term(&term, options)?;
+    stats.time_term = time_term;
+    Ok((canon, labelling, stats))
+}
+
+/// [`canonicalize_constraint_system_via_term_graph_with_labelling`] from the
+/// system's term ([`system_to_term`]): everything after the term needs only
+/// the term, so a caller that keeps a system's term can canonicalize it after
+/// the system is gone. `time_term` stays zero.
+pub fn canonicalize_term(
+    term: &STerm,
+    options: TermGraphOptions,
+) -> Result<(CanonicalSystem, CanonLabelling, TermGraphStats), BlissError> {
     let mut stats = TermGraphStats::default();
 
     let start = Instant::now();
-    let term = system_to_term(sys);
-    stats.time_term = start.elapsed();
-
-    let start = Instant::now();
-    let graph = term_to_graph(&term);
+    let graph = term_to_graph(term);
     stats.vertices = graph.keys.len();
     stats.edges = graph.edges.len();
     stats.free_vars = graph.free_vars.len();
@@ -1197,7 +1318,7 @@ pub fn canonicalize_constraint_system_via_term_graph_with_labelling(
     let labelling = labelling_from_positions(&graph, position);
 
     let start = Instant::now();
-    let canon = content_under(&term, &labelling);
+    let canon = content_under(term, &labelling);
     stats.time_content = start.elapsed();
 
     // Any other canonical labeling is the canonical one composed with an
@@ -1224,7 +1345,7 @@ pub fn canonicalize_constraint_system_via_term_graph_with_labelling(
         stats.generators_moving_vars += 1;
         if options.check_generators {
             let moved = labelling_from_positions(&graph, |w| position(g.image_of(w)));
-            let other = content_under(&term, &moved);
+            let other = content_under(term, &moved);
             if other != canon {
                 stats.non_genuine_generators += 1;
                 for moved in &moves {
@@ -1303,34 +1424,36 @@ fn content_under(term: &STerm, labelling: &CanonLabelling) -> CanonicalSystem {
     CanonicalSystem::new(normalize(rename(body, labelling.theta())))
 }
 
-/// `goal` as its system's canonical form writes it, without its solved flag:
-/// translated like a goal of the system term, renamed by `labelling` and
-/// normalized. `None` for a `Split` goal, which the form leaves out.
-pub(crate) fn canonical_goal(goal: &Goal, labelling: &CanonLabelling) -> Option<STerm> {
+/// `goal` translated like a goal of the system term, without its solved flag,
+/// not renamed yet: [`under`] its system's labelling, it is the goal as the
+/// system's canonical form writes it. `None` for a `Split` goal, which the
+/// form leaves out.
+pub(crate) fn goal_term(goal: &Goal) -> Option<STerm> {
     let (mut free, mut witnesses) = (BTreeSet::new(), BTreeSet::new());
     let mut tr = Translator {
         free: &mut free,
         witnesses: &mut witnesses,
     };
-    let payload = tr.goal(goal)?;
-    Some(normalize(rename(&payload, labelling.theta())))
+    tr.goal(goal)
 }
 
-/// `disj`, the equation store's disjunction number `conj_index`, as its
-/// system's canonical form writes it: translated with the witnesses it has
-/// in the system term ([`witness`]), renamed by `labelling` and normalized.
-pub(crate) fn canonical_eq_disj(
-    disj: &EqDisj,
-    conj_index: usize,
-    labelling: &CanonLabelling,
-) -> STerm {
+/// `disj`, the equation store's disjunction number `conj_index`, translated
+/// with the witnesses it has in the system term ([`witness`]), not renamed
+/// yet: [`under`] its system's labelling, it is the disjunction as the
+/// system's canonical form writes it.
+pub(crate) fn eq_disj_term(disj: &EqDisj, conj_index: usize) -> STerm {
     let (mut free, mut witnesses) = (BTreeSet::new(), BTreeSet::new());
     let mut tr = Translator {
         free: &mut free,
         witnesses: &mut witnesses,
     };
-    let term = tr.eq_disj(conj_index, disj);
-    normalize(rename(&term, labelling.theta()))
+    tr.eq_disj(conj_index, disj)
+}
+
+/// A part of a system's term (a goal, a disjunction) as the system's
+/// canonical form writes it: renamed by the system's `labelling`, normalized.
+pub(crate) fn under(part: &STerm, labelling: &CanonLabelling) -> STerm {
+    normalize(rename(part, labelling.theta()))
 }
 
 /// A hash of `graph` relabeled by `labeling` (see

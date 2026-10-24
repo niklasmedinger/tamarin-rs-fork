@@ -30,10 +30,15 @@ use tamarin_term::alpha_eq_ac::CanonLabelling;
 use tamarin_term::fingerprint::Fingerprint;
 use tamarin_utils::FastMap;
 
-use crate::canon::{canonicalize_constraint_system_with_labelling, canonicalize_proof_method};
+use crate::canon::{
+    canonicalize_constraint_system_with_labelling, canonicalize_proof_method,
+    pre_canonical_proof_method, PreCanonicalProofMethod,
+};
 use crate::canon_fingerprint::{
     fingerprint_constraint_system, fingerprint_proof_method, CanonicalSystemFingerprint,
 };
+use crate::canon_term_graph::{invariant, system_to_term, STerm};
+use crate::constraint::solver::canon_table::{CanonicalTable, Prepared};
 use crate::constraint::solver::context::ProofContext;
 use crate::constraint::solver::proof_method::{
     exec_proof_method, is_finished, ProofMethod, Result as MethodResult,
@@ -78,13 +83,23 @@ pub enum Status {
     Settled(Settled),
 }
 
+/// How a method applied with merging on is identified among the candidates
+/// of any other system of its class, when the proof is materialized.
+pub(crate) enum MethodKey {
+    /// Canonicalized through the representative's labelling, which the class
+    /// had when the method was applied.
+    Fp(Fingerprint),
+    /// Translated, not renamed: the class had no labelling yet (a pending
+    /// class of the canonical table), and gets one when the proof needs it
+    /// ([`CanonicalTable::late_labelling`]).
+    Pre(PreCanonicalProofMethod),
+}
+
 /// One applied method of its class.
 pub(crate) struct And {
     pub(crate) method: ProofMethod,
-    /// The method canonicalized through the representative's labelling
-    /// (merging on): identifies it among the candidates of any other system
-    /// of the class when the proof is materialized.
-    pub(crate) method_fp: Option<Fingerprint>,
+    /// Merging on.
+    pub(crate) method_key: Option<MethodKey>,
     /// Sorted by case name, like the greedy driver's children.
     pub(crate) cases: Vec<(String, ClassId)>,
     pub(crate) status: Status,
@@ -110,18 +125,19 @@ pub(crate) struct Class<X> {
     pub(crate) settled_by: Option<u16>,
     /// When the class settled, on [`SearchGraph::clock`].
     pub(crate) settled_at: u64,
-    /// Its canonical key is in [`SearchGraph::by_key`].
+    /// The canonical table placed it ([`CanonicalTable::intern`]), keyed or
+    /// pending.
     pub(crate) keyed: bool,
     /// What the search keeps per class.
     pub(crate) ext: X,
 }
 
-/// The classes, their methods and the transposition table. Holds no
-/// `System`: those carry `Cell` caches, so they may move between threads but
-/// not be shared, and the graph is read by the materializer's workers.
+/// The classes and their methods; the transposition table is the search's
+/// [`CanonicalTable`]. Holds no `System`: those carry `Cell` caches, so they
+/// may move between threads but not be shared, and the graph is read by the
+/// materializer's workers.
 pub(crate) struct SearchGraph<X> {
     pub(crate) classes: Vec<Class<X>>,
-    pub(crate) by_key: FastMap<CanonicalSystemFingerprint, ClassId>,
     /// Counts settlements, to order them ([`Class::settled_at`]).
     clock: u64,
 }
@@ -142,7 +158,6 @@ impl<X: Default> SearchGraph<X> {
     pub(crate) fn new() -> Self {
         SearchGraph {
             classes: Vec::new(),
-            by_key: FastMap::default(),
             clock: 0,
         }
     }
@@ -186,13 +201,13 @@ impl<X: Default> SearchGraph<X> {
         &mut self,
         c: ClassId,
         method: ProofMethod,
-        method_fp: Option<Fingerprint>,
+        method_key: Option<MethodKey>,
     ) -> u16 {
         let ands = &mut self.class_mut(c).ands;
         let a = u16::try_from(ands.len()).expect("more than u16::MAX methods per class");
         ands.push(And {
             method,
-            method_fp,
+            method_key,
             cases: Vec::new(),
             status: Status::Open,
         });
@@ -210,9 +225,16 @@ impl<X: Default> SearchGraph<X> {
     }
 
     /// The class of a prepared case reached at `depth`: a new one, or with
-    /// merging an existing one reached again. The caller keeps the system
-    /// of a new open class and does its own bookkeeping for the others.
-    pub(crate) fn intern(&mut self, child: Child, depth: u32) -> (ClassId, Interned) {
+    /// merging an existing one reached again, which `table` finds. The
+    /// caller keeps the system of a new open class and does its own
+    /// bookkeeping for the others.
+    pub(crate) fn intern(
+        &mut self,
+        child: Child,
+        depth: u32,
+        table: &mut CanonicalTable,
+        work: &mut WorkStats,
+    ) -> (ClassId, Interned) {
         match child {
             Child::Cut => {
                 let c = self.add_class(Status::Open, depth);
@@ -224,32 +246,24 @@ impl<X: Default> SearchGraph<X> {
                 Interned::Leaf,
             ),
             Child::Unkeyed(stored) => (self.add_class(Status::Open, depth), Interned::New(stored)),
-            Child::Keyed(key, stored) => {
-                if let Some(&existing) = self.by_key.get(&key) {
-                    return (existing, Interned::Merged);
+            Child::Prepared(prepared, mut stored) => {
+                let placed = table.intern(prepared, || self.add_class(Status::Open, depth), work);
+                if placed.merged {
+                    return (placed.class, Interned::Merged);
                 }
-                let c = self.add_class(Status::Open, depth);
-                self.by_key.insert(key, c);
-                self.class_mut(c).keyed = true;
-                (c, Interned::New(stored))
+                self.class_mut(placed.class).keyed = true;
+                stored.labelling = placed.labelling;
+                (placed.class, Interned::New(stored))
             }
         }
     }
 
-    /// Gives `c`, an open class created unkeyed, its canonical key: `None`
-    /// when no class has the key yet, which makes it `c`'s; otherwise the
-    /// class that has it, into which the caller merges `c`
-    /// ([`Self::merge_into`]).
-    pub(crate) fn key(&mut self, c: ClassId, key: CanonicalSystemFingerprint) -> Option<ClassId> {
+    /// Records that the canonical table placed `c`, an open class created
+    /// unkeyed, in a class of its own (MCGS keys a case when a traversal
+    /// enters it).
+    pub(crate) fn mark_keyed(&mut self, c: ClassId) {
         assert!(!self.class(c).keyed, "class #{c} is keyed twice");
-        match self.by_key.entry(key) {
-            std::collections::hash_map::Entry::Occupied(existing) => Some(*existing.get()),
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(c);
-                self.class_mut(c).keyed = true;
-                None
-            }
-        }
+        self.class_mut(c).keyed = true;
     }
 
     /// Moves the edges into `from`, an unkeyed class without methods, onto
@@ -506,8 +520,9 @@ impl<X: Default> SearchGraph<X> {
 /// its methods runs.
 pub(crate) struct Stored {
     pub(crate) sys: Box<System>,
-    /// `sys`'s canonical labelling (merging on, once the class is keyed), to
-    /// canonicalize the methods applied to it.
+    /// `sys`'s canonical labelling (merging on, once the class is keyed with
+    /// a canonicalization), to canonicalize the methods applied to it. A
+    /// pending class of the canonical table has none.
     pub(crate) labelling: Option<CanonLabelling>,
     /// `candidate_methods`, computed at the first expansion (top-N search).
     pub(crate) ranked: Option<Vec<ProofMethod>>,
@@ -533,22 +548,73 @@ impl Stored {
     }
 }
 
+/// The system a search keeps for class `c`: in its `store` while the class
+/// may still get a method, and in `retained` once the search is done with it
+/// but the canonical table still needs it (a pending class).
+pub(crate) fn kept_system<'s>(
+    store: &'s [Option<Stored>],
+    retained: &'s FastMap<ClassId, Box<System>>,
+    c: ClassId,
+) -> Option<&'s System> {
+    store
+        .get(c as usize)
+        .and_then(Option::as_ref)
+        .map(|stored| &*stored.sys)
+        .or_else(|| retained.get(&c).map(|sys| &**sys))
+}
+
+/// A search's kept systems ([`kept_system`]) behind a lock, for the proof
+/// materializer's workers: a `System` may move between threads but not be
+/// shared.
+pub(crate) struct KeptSystems(std::sync::Mutex<(Vec<Option<Stored>>, FastMap<ClassId, Box<System>>)>);
+
+impl KeptSystems {
+    pub(crate) fn new(store: Vec<Option<Stored>>, retained: FastMap<ClassId, Box<System>>) -> Self {
+        KeptSystems(std::sync::Mutex::new((store, retained)))
+    }
+
+    /// The term of class `c`'s kept system.
+    pub(crate) fn rep_term(&self, c: ClassId) -> Option<STerm> {
+        let kept = self.0.lock().expect("a materializer worker panicked");
+        kept_system(&kept.0, &kept.1, c).map(system_to_term)
+    }
+
+    /// The store and the set-aside systems, back for the search's statistics.
+    pub(crate) fn into_inner(self) -> (Vec<Option<Stored>>, FastMap<ClassId, Box<System>>) {
+        self.0.into_inner().expect("a materializer worker panicked")
+    }
+}
+
 /// One case of an applied method, as a worker prepared it.
 pub(crate) enum Child {
     /// At or below `--bound`.
     Cut,
     /// Already finished; never canonicalized, so never merged.
     Finished(Settled),
-    /// Merging on: its canonical key.
-    Keyed(CanonicalSystemFingerprint, Stored),
-    /// Merging off, or not keyed yet (MCGS, [`SearchGraph::key`]).
+    /// Merging on: prepared for the search's canonical table.
+    Prepared(Prepared, Stored),
+    /// Merging off, or not keyed yet (MCGS keys a case when a traversal
+    /// enters it).
     Unkeyed(Stored),
+}
+
+impl Child {
+    /// The prepared systems among `cases`, in order, for
+    /// [`CanonicalTable::precompute`].
+    pub(crate) fn prepared_mut(
+        cases: &mut [(String, Child)],
+    ) -> impl Iterator<Item = &mut Prepared> {
+        cases.iter_mut().filter_map(|(_, child)| match child {
+            Child::Prepared(prepared, _) => Some(prepared),
+            _ => None,
+        })
+    }
 }
 
 /// A method that applied, with its prepared cases.
 pub(crate) struct Applied {
     pub(crate) method: ProofMethod,
-    pub(crate) method_fp: Option<Fingerprint>,
+    pub(crate) method_key: Option<MethodKey>,
     /// Sorted by case name.
     pub(crate) cases: Vec<(String, Child)>,
 }
@@ -562,6 +628,10 @@ pub(crate) struct WorkStats {
     /// when `canons > 0`.
     pub(crate) canon_min: Duration,
     pub(crate) canon_max: Duration,
+    /// Invariants computed ([`super::canon_table`]), and the time they took,
+    /// building the system's term included.
+    pub(crate) invariants: u64,
+    pub(crate) invariant_time: Duration,
     pub(crate) busy: Duration,
 }
 
@@ -578,10 +648,17 @@ impl WorkStats {
         self.execs += other.execs;
         self.canons += other.canons;
         self.canon_time += other.canon_time;
+        self.invariants += other.invariants;
+        self.invariant_time += other.invariant_time;
         self.busy += other.busy;
     }
 
-    fn record_canon(&mut self, took: Duration) {
+    pub(crate) fn record_invariant(&mut self, took: Duration) {
+        self.invariants += 1;
+        self.invariant_time += took;
+    }
+
+    pub(crate) fn record_canon(&mut self, took: Duration) {
         self.canon_min = if self.canons == 0 {
             took
         } else {
@@ -652,6 +729,32 @@ pub(crate) struct MergeCounts {
     /// The expanded classes and the graph unfolded into a tree ([`unfold`]);
     /// MCGS reports it, top-N does not (`None`).
     pub(crate) unfolding: Option<Unfolding>,
+    /// Classes with a canonical key in the search's table.
+    pub(crate) keyed: u64,
+    /// From the canonical table ([`super::canon_table::TableStats`]):
+    /// systems placed whose invariant a class had, and of those the ones
+    /// that became a class of their own.
+    pub(crate) inv_hits: u64,
+    pub(crate) inv_false: u64,
+    /// Classes placed without a canonicalization, not keyed since.
+    pub(crate) pending: u64,
+    /// Systems of pending classes the search set aside: it was done with
+    /// them, but the canonical table may still need them.
+    pub(crate) retained: u64,
+}
+
+impl MergeCounts {
+    /// `self` with the canonical table's counters.
+    pub(crate) fn with_table(self, table: &CanonicalTable) -> Self {
+        let stats = table.stats();
+        MergeCounts {
+            keyed: table.keyed() as u64,
+            inv_hits: stats.inv_hits,
+            inv_false: stats.inv_false,
+            pending: table.pending() as u64,
+            ..self
+        }
+    }
 }
 
 /// The classes a search expanded, and how many times they occur once its
@@ -833,12 +936,13 @@ impl StatsReporter {
         &mut self,
         lemma: &str,
         graph: &SearchGraph<X>,
+        table: &CanonicalTable,
         counts: &MergeCounts,
         work: &WorkStats,
     ) {
         if self.snapshot_due() {
             let at = self.snapshots.remove(0);
-            self.dump(lemma, graph, counts, work, None, Some(at));
+            self.dump(lemma, graph, table, counts, work, None, Some(at));
         }
         if self.line_due() {
             self.last = Instant::now();
@@ -852,6 +956,7 @@ impl StatsReporter {
         &self,
         lemma: &str,
         graph: &SearchGraph<X>,
+        table: &CanonicalTable,
         counts: &MergeCounts,
         work: &WorkStats,
         end: End,
@@ -859,15 +964,17 @@ impl StatsReporter {
         if self.every.is_some() {
             self.print(lemma, graph, counts, work, Some(end));
         }
-        self.dump(lemma, graph, counts, work, Some(end), None);
+        self.dump(lemma, graph, table, counts, work, Some(end), None);
     }
 
     /// Writes the graph to `TAM_RS_SEARCH_DUMP`'s file for `lemma`, or for
     /// its snapshot at `at` seconds; nothing without the variable.
+    #[allow(clippy::too_many_arguments)]
     fn dump<X: DumpExt>(
         &self,
         lemma: &str,
         graph: &SearchGraph<X>,
+        table: &CanonicalTable,
         counts: &MergeCounts,
         work: &WorkStats,
         end: Option<End>,
@@ -895,7 +1002,7 @@ impl StatsReporter {
             .unwrap_or_else(|e| panic!("TAM_RS_SEARCH_DUMP: creating {}: {e}", path.display()));
         let mut out = std::io::BufWriter::new(file);
         graph
-            .write_dump(&mut out, header)
+            .write_dump(&mut out, header, table)
             .and_then(|()| std::io::Write::flush(&mut out))
             .unwrap_or_else(|e| panic!("TAM_RS_SEARCH_DUMP: writing {}: {e}", path.display()));
     }
@@ -936,7 +1043,8 @@ impl StatsReporter {
              canon_s={:.3} canon_min_s={:.6} canon_max_s={:.6} busy_s={:.3} elapsed_s={:.3} \
              max_depth={} max_applied_depth={} keyed={} merges_used={} merges_settled={} \
              merges_on_path={} shadow_dups={} stored={} stored_unkeyed={} key_wall_s={:.3} \
-             rss_mb={} peak_rss_mb={} expanded={} unfolded={} unfold_loops={}",
+             rss_mb={} peak_rss_mb={} expanded={} unfolded={} unfold_loops={} invariants={} \
+             inv_s={:.3} inv_hits={} inv_false={} pending={} retained={}",
             self.search,
             lemma,
             u8::from(end.is_some()),
@@ -958,7 +1066,7 @@ impl StatsReporter {
             self.started.elapsed().as_secs_f64(),
             max_depth,
             max_applied_depth,
-            graph.by_key.len(),
+            counts.keyed,
             counts.merges_used,
             counts.merges_settled,
             counts.merges_on_path,
@@ -972,6 +1080,12 @@ impl StatsReporter {
             // A float prints without a fraction or an exponent here.
             unfolding(|u| u.unfolded.to_string()),
             unfolding(|u| u.loops.to_string()),
+            work.invariants,
+            work.invariant_time.as_secs_f64(),
+            counts.inv_hits,
+            counts.inv_false,
+            counts.pending,
+            counts.retained,
         );
     }
 }
@@ -1066,15 +1180,17 @@ pub fn method_key_hex(method_fp: &Fingerprint) -> String {
 
 impl<X: DumpExt> SearchGraph<X> {
     /// Writes the graph as one JSON object: `header`'s fields and a
-    /// `classes` array, one row per class in id order.
+    /// `classes` array, one row per class in id order. A class's key and
+    /// invariant come from `table`; a pending class has no key.
     fn write_dump(
         &self,
         out: &mut impl std::io::Write,
         header: serde_json::Value,
+        table: &CanonicalTable,
     ) -> std::io::Result<()> {
         use serde_json::{json, Map, Value};
         let mut keys: Vec<Option<String>> = vec![None; self.classes.len()];
-        for (key, &c) in &self.by_key {
+        for (key, c) in table.keys() {
             keys[c as usize] = Some(system_key_hex(key));
         }
         let classes: Vec<Value> = self
@@ -1094,7 +1210,11 @@ impl<X: DumpExt> SearchGraph<X> {
                                 &and.method
                             )),
                         );
-                        row.insert("method_fp".into(), json!(and.method_fp.as_ref().map(hex)));
+                        let method_fp = match &and.method_key {
+                            Some(MethodKey::Fp(fp)) => Some(hex(fp)),
+                            _ => None,
+                        };
+                        row.insert("method_fp".into(), json!(method_fp));
                         row.insert("status".into(), json!(format!("{:?}", and.status)));
                         row.insert("cases".into(), json!(and.cases));
                         class.ext.and_fields(a, &mut row);
@@ -1104,6 +1224,10 @@ impl<X: DumpExt> SearchGraph<X> {
                 let mut row = Map::new();
                 row.insert("id".into(), json!(c));
                 row.insert("key".into(), json!(keys[c]));
+                row.insert(
+                    "invariant".into(),
+                    json!(table.invariant_of(c as ClassId).map(hex)),
+                );
                 row.insert("depth".into(), json!(class.min_depth));
                 row.insert("status".into(), json!(format!("{:?}", class.status)));
                 row.insert("closed".into(), json!(class.closed));
@@ -1169,6 +1293,8 @@ impl WorkerEnv {
     }
 }
 
+/// `sys`'s canonical key and labelling, timed as one canonicalization (the
+/// canonical table's `off` mode).
 pub(crate) fn canonical_key(
     sys: &System,
     work: &mut WorkStats,
@@ -1181,34 +1307,37 @@ pub(crate) fn canonical_key(
     (key, labelling)
 }
 
-/// Prepares one case: finished, or else keyed for merging when `keyed`.
+/// Prepares one case: finished, or else, when `table` is given, prepared
+/// for it to place.
 pub(crate) fn classify(
     ctx: &ProofContext,
     sys: System,
-    keyed: bool,
+    table: Option<&CanonicalTable>,
     work: &mut WorkStats,
 ) -> Child {
     if let Some(result) = is_finished(ctx, &sys) {
         return Child::Finished(Settled::of(&result));
     }
-    if keyed {
-        let (key, labelling) = canonical_key(&sys, work);
-        Child::Keyed(key, Stored::new(sys, Some(labelling)))
-    } else {
-        Child::Unkeyed(Stored::new(sys, None))
+    match table {
+        Some(table) => {
+            let prepared = table.prepare(&sys, work);
+            Child::Prepared(prepared, Stored::new(sys, None))
+        }
+        None => Child::Unkeyed(Stored::new(sys, None)),
     }
 }
 
-/// Applies `method` to the stored system and prepares its cases, keyed when
-/// `key_cases`; `None` when the method does not apply, which
+/// Applies `method` to the stored system and prepares its cases, for
+/// `cases_for` when given; `None` when the method does not apply, which
 /// `exec_proof_method` also answers, without trying the method, once the
-/// deadline has passed.
+/// deadline has passed. With `merge`, the method gets its [`MethodKey`].
 pub(crate) fn apply_method(
     ctx: &ProofContext,
     stored: &Stored,
     method: &ProofMethod,
     cut_children: bool,
-    key_cases: bool,
+    cases_for: Option<&CanonicalTable>,
+    merge: bool,
     work: &mut WorkStats,
 ) -> Result<Option<Applied>, ProveError> {
     work.execs += 1;
@@ -1216,8 +1345,13 @@ pub(crate) fn apply_method(
         return Ok(None);
     };
     cases.sort_by(|a, b| a.0.cmp(&b.0));
-    let method_fp = stored.labelling.as_ref().map(|labelling| {
-        fingerprint_proof_method(&canonicalize_proof_method(method, &stored.sys, labelling))
+    let method_key = merge.then(|| match &stored.labelling {
+        Some(labelling) => MethodKey::Fp(fingerprint_proof_method(&canonicalize_proof_method(
+            method,
+            &stored.sys,
+            labelling,
+        ))),
+        None => MethodKey::Pre(pre_canonical_proof_method(method, &stored.sys)),
     });
     let cases = cases
         .into_iter()
@@ -1225,14 +1359,14 @@ pub(crate) fn apply_method(
             let child = if cut_children {
                 Child::Cut
             } else {
-                classify(ctx, sys, key_cases, work)
+                classify(ctx, sys, cases_for, work)
             };
             (name, child)
         })
         .collect();
     Ok(Some(Applied {
         method: method.clone(),
-        method_fp,
+        method_key,
         cases,
     }))
 }
@@ -1281,6 +1415,11 @@ impl Resolved {
 /// settling method of each class again, starting from the root system.
 pub(crate) struct Materializer<'g, X> {
     pub(crate) graph: &'g SearchGraph<X>,
+    /// The search's canonical table, which finds a case's class (merging on).
+    pub(crate) table: &'g CanonicalTable,
+    /// The systems the search kept, from which the table canonicalizes a
+    /// pending class's representative when the proof needs it.
+    pub(crate) kept: &'g KeptSystems,
     pub(crate) merge: bool,
     pub(crate) bound: u32,
     pub(crate) end: End,
@@ -1367,9 +1506,12 @@ impl<X: Default + Sync> Materializer<'_, X> {
             let class = known.expect("merging off: the class of a case comes from the graph");
             return Resolved::Class(sys, None, class);
         }
-        let (key, labelling) = canonical_key(&sys, &mut WorkStats::default());
-        match self.graph.by_key.get(&key) {
-            Some(&class) => Resolved::Class(sys, Some(labelling), class),
+        let mut work = WorkStats::default();
+        let term = system_to_term(&sys);
+        let canon = crate::constraint::solver::canon_table::canon_of_term(&term, &mut work);
+        let rep_term = |c| self.kept.rep_term(c);
+        match self.table.class_of(&canon, || invariant(&term), rep_term, &mut work) {
+            Some(class) => Resolved::Class(sys, Some(canon.labelling), class),
             None if unkeyed_case => Resolved::Unkeyed(sys),
             None => {
                 panic!("materializing the proof: a case reaches a system the search never saw")
@@ -1496,6 +1638,29 @@ impl<X: Default + Sync> Materializer<'_, X> {
         }
     }
 
+    /// The fingerprint of a method of class `c` in the canonical form of
+    /// `c`'s representative: the one taken when it was applied, or, for a
+    /// method of a class that had no labelling then, through the labelling
+    /// the canonical table gives `c` now.
+    fn method_fp(&self, c: ClassId, key: &MethodKey) -> Fingerprint {
+        match key {
+            MethodKey::Fp(fp) => *fp,
+            MethodKey::Pre(pre) => {
+                let rep_term = |c| self.kept.rep_term(c);
+                let labelling = self
+                    .table
+                    .late_labelling(c, rep_term, &mut WorkStats::default())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "materializing the proof: class #{c} has a method without a \
+                             canonical form and no labelling to give it one"
+                        )
+                    });
+                fingerprint_proof_method(&pre.under(labelling))
+            }
+        }
+    }
+
     /// Among `sys`'s candidates, the method whose canonical form is `fp`:
     /// canonically equal systems offer the same methods up to renaming.
     fn matching_method(
@@ -1549,8 +1714,9 @@ impl<X: Default + Sync> Materializer<'_, X> {
             return Ok(sorry(ctx, sys, self.open_message(c)));
         };
         let and = &class.ands[a];
-        let method = match (&labelling, and.method_fp) {
-            (Some(labelling), Some(fp)) => {
+        let method = match (&labelling, &and.method_key) {
+            (Some(labelling), Some(key)) => {
+                let fp = self.method_fp(c, key);
                 self.matching_method(ctx, &sys, labelling, fp, depth, c)?
             }
             _ => and.method.clone(),
@@ -1723,6 +1889,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constraint::solver::canon_table::CanonMode;
 
     type Graph = SearchGraph<()>;
 
@@ -1810,9 +1977,13 @@ mod tests {
     #[test]
     fn a_class_keyed_late_merges_into_the_class_with_its_key() {
         let mut g = Graph::new();
+        let mut table = CanonicalTable::new(CanonMode::Off);
+        let mut work = WorkStats::default();
         let root = open(&mut g);
         let deep = g.add_class(Status::Open, 5);
-        assert_eq!(g.key(deep, key(1)), None);
+        let placed = table.intern(Prepared::with_key(key(1)), || deep, &mut work);
+        assert!(!placed.merged);
+        g.mark_keyed(deep);
         let contra = leaf_class(&mut g, Settled::Contradictory);
         and(&mut g, deep, &[contra]);
         assert_eq!(
@@ -1822,7 +1993,8 @@ mod tests {
         let case = g.add_class(Status::Open, 1);
         let a = and(&mut g, root, &[case, contra]);
         assert_eq!(g.class(root).status, Status::Open);
-        assert_eq!(g.key(case, key(1)), Some(deep));
+        let placed = table.intern(Prepared::with_key(key(1)), || case, &mut work);
+        assert_eq!((placed.class, placed.merged), (deep, true));
         g.merge_into(case, deep);
         assert_eq!(g.class(root).ands[a as usize].cases[0].1, deep);
         assert_eq!(g.class(deep).parents, vec![(root, a)]);
@@ -1912,8 +2084,12 @@ mod tests {
         and(&mut g, a, &[b]);
         and(&mut g, b, &[a, solved]);
         assert_eq!(g.class(a).status, Status::Settled(Settled::Solved));
+        let table = CanonicalTable::new(CanonMode::Off);
+        let kept = KeptSystems::new(Vec::new(), FastMap::default());
         let m = Materializer {
             graph: &g,
+            table: &table,
+            kept: &kept,
             merge: false,
             bound: DEPTH_CAP,
             end: End::Settled,
