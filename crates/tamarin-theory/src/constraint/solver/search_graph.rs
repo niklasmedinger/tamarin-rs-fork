@@ -566,7 +566,9 @@ pub(crate) fn kept_system<'s>(
 /// A search's kept systems ([`kept_system`]) behind a lock, for the proof
 /// materializer's workers: a `System` may move between threads but not be
 /// shared.
-pub(crate) struct KeptSystems(std::sync::Mutex<(Vec<Option<Stored>>, FastMap<ClassId, Box<System>>)>);
+pub(crate) struct KeptSystems(
+    std::sync::Mutex<(Vec<Option<Stored>>, FastMap<ClassId, Box<System>>)>,
+);
 
 impl KeptSystems {
     pub(crate) fn new(store: Vec<Option<Stored>>, retained: FastMap<ClassId, Box<System>>) -> Self {
@@ -777,10 +779,7 @@ pub(crate) struct Unfolding {
 /// [`Unfolding`] of `graph`, counting the classes `expanded` selects. One
 /// depth-first pass from the root, then one pass in topological order, so
 /// it is linear in the graph's size.
-pub(crate) fn unfold<X>(
-    graph: &SearchGraph<X>,
-    expanded: impl Fn(&Class<X>) -> bool,
-) -> Unfolding {
+pub(crate) fn unfold<X>(graph: &SearchGraph<X>, expanded: impl Fn(&Class<X>) -> bool) -> Unfolding {
     const UNSEEN: u32 = u32::MAX;
     const ON_STACK: u32 = u32::MAX - 1;
     let n = graph.classes.len();
@@ -1508,7 +1507,10 @@ impl<X: Default + Sync> Materializer<'_, X> {
         let term = system_to_term(&sys);
         let canon = crate::constraint::solver::canon_table::canon_of_term(&term, &mut work);
         let rep_term = |c| self.kept.rep_term(c);
-        match self.table.class_of(&canon, || invariant(&term), rep_term, &mut work) {
+        match self
+            .table
+            .class_of(&canon, || invariant(&term), rep_term, &mut work)
+        {
             Some(class) => Resolved::Class(sys, Some(canon.labelling), class),
             None if unkeyed_case => Resolved::Unkeyed(sys),
             None => {

@@ -75,19 +75,19 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
+use crate::canon_term_graph::system_to_term;
 use crate::constraint::solver::canon_table::{canon_mode_from_env, CanonicalTable};
 use crate::constraint::solver::context::ProofContext;
 use crate::constraint::solver::reduction::avoid_fresh_state;
 use crate::constraint::solver::search::{self, candidate_methods, ProofNode};
-use crate::canon_term_graph::system_to_term;
 use crate::constraint::solver::search_graph::{
-    self, apply_method, classify, kept_system, Applied, Child, ClassId, End, Interned,
-    KeptSystems, Materializer, MergeCounts, StatsReporter, Status, Stored, WorkStats, WorkerEnv,
-    DEPTH_CAP, ROOT,
+    self, apply_method, classify, kept_system, Applied, Child, ClassId, End, Interned, KeptSystems,
+    Materializer, MergeCounts, StatsReporter, Status, Stored, WorkStats, WorkerEnv, DEPTH_CAP,
+    ROOT,
 };
 use crate::constraint::system::System;
-use tamarin_utils::FastMap;
 use crate::prove::ProveError;
+use tamarin_utils::FastMap;
 
 // =============================================================================
 // Configuration
@@ -457,7 +457,12 @@ impl<'a> Engine<'a> {
         let child = if self.bound == 0 {
             Child::Cut
         } else {
-            classify(self.ctx, sys, self.config.merge.then_some(&self.table), &mut work)
+            classify(
+                self.ctx,
+                sys,
+                self.config.merge.then_some(&self.table),
+                &mut work,
+            )
         };
         self.stats.work.add(&work);
         let root = self.intern(child, 0);

@@ -1117,9 +1117,7 @@ pub fn abstract_vars(t: &STerm) -> STerm {
 fn abstract_counted(t: &STerm, counts: &Occurrences) -> STerm {
     match t {
         STerm::Var(v @ VarRef::Free(_)) => STerm::Var(VarRef::Free(placeholder(*v, counts))),
-        STerm::Var(v @ VarRef::Witness(_)) => {
-            STerm::Var(VarRef::Witness(placeholder(*v, counts)))
-        }
+        STerm::Var(v @ VarRef::Witness(_)) => STerm::Var(VarRef::Witness(placeholder(*v, counts))),
         STerm::Const(_) => t.clone(),
         STerm::App(op, args) => STerm::App(
             op.clone(),
@@ -1134,7 +1132,9 @@ fn abstract_counted(t: &STerm, counts: &Occurrences) -> STerm {
             };
             STerm::Exists(
                 *scope,
-                vars.iter().map(|v| placeholder(var_ref(*v), counts)).collect(),
+                vars.iter()
+                    .map(|v| placeholder(var_ref(*v), counts))
+                    .collect(),
                 Box::new(abstract_counted(body, counts)),
             )
         }

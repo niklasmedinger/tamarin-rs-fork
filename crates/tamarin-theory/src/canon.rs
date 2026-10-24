@@ -350,7 +350,9 @@ impl PreCanonicalProofMethod {
     /// labelling is `labelling`.
     pub fn under(&self, labelling: &CanonLabelling) -> CanonicalProofMethod {
         match &self.0 {
-            CanonicalProofMethod::Solve(goal) => CanonicalProofMethod::Solve(under(goal, labelling)),
+            CanonicalProofMethod::Solve(goal) => {
+                CanonicalProofMethod::Solve(under(goal, labelling))
+            }
             CanonicalProofMethod::SolveSplit(disj) => {
                 CanonicalProofMethod::SolveSplit(under(disj, labelling))
             }

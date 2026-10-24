@@ -171,13 +171,13 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
+use crate::canon_term_graph::system_to_term;
 use crate::constraint::solver::bm25;
 use crate::constraint::solver::canon_table::{canon_mode_from_env, CanonicalTable, Prepared};
 use crate::constraint::solver::context::ProofContext;
 use crate::constraint::solver::proof_method::ProofMethod;
 use crate::constraint::solver::reduction::avoid_fresh_state;
 use crate::constraint::solver::search::{self, candidate_methods, ProofNode};
-use crate::canon_term_graph::system_to_term;
 use crate::constraint::solver::search_graph::{
     self, apply_method, classify, kept_system, Applied, Child, ClassId, End, Interned, KeptSystems,
     Materializer, MergeCounts, StatsReporter, Status, Stored, WorkStats, WorkerEnv, DEPTH_CAP,
@@ -866,7 +866,9 @@ impl<'a> Engine<'a> {
             stored,
             stored_unkeyed,
             key_wall: self.stats.key_wall,
-            unfolding: Some(search_graph::unfold(&self.graph, |class| class.ext.expanded)),
+            unfolding: Some(search_graph::unfold(&self.graph, |class| {
+                class.ext.expanded
+            })),
             retained: self.retained.len() as u64,
             ..MergeCounts::default()
         }
@@ -905,7 +907,12 @@ impl<'a> Engine<'a> {
         let child = if self.bound == 0 {
             Child::Cut
         } else {
-            classify(self.ctx, sys, self.config.merge.then_some(&self.table), &mut work)
+            classify(
+                self.ctx,
+                sys,
+                self.config.merge.then_some(&self.table),
+                &mut work,
+            )
         };
         self.stats.work.add(&work);
         let root = self.intern(child, 0);
@@ -954,7 +961,12 @@ impl<'a> Engine<'a> {
     /// equal, `c` is a class of its own, and keeps the labelling for its
     /// methods if the table gave one. Otherwise `c` merges into that class,
     /// which is returned.
-    fn settle_key(&mut self, c: ClassId, mut stored: Stored, prepared: Prepared) -> Option<ClassId> {
+    fn settle_key(
+        &mut self,
+        c: ClassId,
+        mut stored: Stored,
+        prepared: Prepared,
+    ) -> Option<ClassId> {
         let placed = self.table.intern(prepared, || c, &mut self.stats.work);
         if !placed.merged {
             self.graph.mark_keyed(c);
@@ -1187,7 +1199,12 @@ impl<'a> Engine<'a> {
     /// Drops the set-aside systems of the classes the canonical tables keyed
     /// since: they need them no more.
     fn forget_keyed(&mut self) {
-        for c in self.table.take_keyed().into_iter().chain(self.shadow.take_keyed()) {
+        for c in self
+            .table
+            .take_keyed()
+            .into_iter()
+            .chain(self.shadow.take_keyed())
+        {
             self.retained.remove(&c);
         }
     }
@@ -1299,8 +1316,7 @@ impl<'a> Engine<'a> {
         let stored = self.store[c as usize]
             .as_ref()
             .expect("a class with a virtual method keeps its system");
-        let (applied, work) =
-            run_method(self.ctx, env, stored, &method, cut, self.keying());
+        let (applied, work) = run_method(self.ctx, env, stored, &method, cut, self.keying());
         self.stats.work.add(&work);
         self.graph.class_mut(c).ext.expand_s += work.busy.as_secs_f64();
         let outcome = match applied? {
@@ -1554,8 +1570,7 @@ fn expand_leaf(
         tasks
             .into_iter()
             .map(|(i, method)| {
-                let (applied, work) =
-                    run_method(ctx, env, &stored, &method, cut, keying);
+                let (applied, work) = run_method(ctx, env, &stored, &method, cut, keying);
                 (i, applied, work)
             })
             .collect()
@@ -1569,8 +1584,7 @@ fn expand_leaf(
         forked
             .into_par_iter()
             .map(|(i, method, stored)| {
-                let (applied, work) =
-                    run_method(ctx, env, &stored, &method, cut, keying);
+                let (applied, work) = run_method(ctx, env, &stored, &method, cut, keying);
                 (i, applied, work)
             })
             .collect()

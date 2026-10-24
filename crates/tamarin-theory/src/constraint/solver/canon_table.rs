@@ -57,7 +57,9 @@ use tamarin_utils::fingerprint::Fingerprint;
 use tamarin_utils::{FastMap, FastSet};
 
 use crate::canon_fingerprint::{fingerprint_constraint_system, CanonicalSystemFingerprint};
-use crate::canon_term_graph::{canonicalize_term, invariant, system_to_term, STerm, TermGraphOptions};
+use crate::canon_term_graph::{
+    canonicalize_term, invariant, system_to_term, STerm, TermGraphOptions,
+};
 use crate::constraint::solver::search_graph::{canonical_key, ClassId, WorkStats};
 use crate::constraint::system::System;
 
@@ -83,12 +85,14 @@ impl CanonMode {
 /// `TAM_RS_CANON_INVARIANT`, read once per process.
 pub(crate) fn canon_mode_from_env() -> CanonMode {
     static MODE: OnceLock<CanonMode> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("TAM_RS_CANON_INVARIANT").as_deref() {
-        Err(std::env::VarError::NotPresent) | Ok("on") => CanonMode::On,
-        Ok("off") => CanonMode::Off,
-        Ok("check") => CanonMode::Check,
-        other => panic!("TAM_RS_CANON_INVARIANT={other:?}: expected `off`, `on` or `check`"),
-    })
+    *MODE.get_or_init(
+        || match std::env::var("TAM_RS_CANON_INVARIANT").as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("on") => CanonMode::On,
+            Ok("off") => CanonMode::Off,
+            Ok("check") => CanonMode::Check,
+            other => panic!("TAM_RS_CANON_INVARIANT={other:?}: expected `off`, `on` or `check`"),
+        },
+    )
 }
 
 /// The term of a pending class's representative, built from the system the
@@ -280,7 +284,9 @@ impl CanonicalTable {
         let mut reps: Vec<ClassId> = Vec::new();
         let mut seen_reps: FastSet<ClassId> = FastSet::default();
         for (i, item) in items.iter().enumerate() {
-            let invariant = item.invariant.expect("on: every prepared system has an invariant");
+            let invariant = item
+                .invariant
+                .expect("on: every prepared system has an invariant");
             match self.by_invariant.get(&invariant) {
                 Some(Bucket::Pending(r)) => {
                     if self.pending[r].get().is_none() && seen_reps.insert(*r) {
@@ -323,29 +329,33 @@ impl CanonicalTable {
             .filter(|(_, needed)| *needed)
             .map(|(item, _)| &mut **item)
             .collect();
-        let (item_works, rep_canons): (Vec<WorkStats>, Vec<(ClassId, Canon, WorkStats)>) = rayon::join(
-            || {
-                targets
-                    .into_par_iter()
-                    .map(|item| {
-                        let mut w = WorkStats::default();
-                        let term = item.term.take().expect("on: an unkeyed system keeps its term");
-                        item.canon = Some(canon_of_term(&term, &mut w));
-                        w
-                    })
-                    .collect()
-            },
-            || {
-                rep_terms
-                    .into_par_iter()
-                    .map(|(r, term)| {
-                        let mut w = WorkStats::default();
-                        let canon = canon_of_term(&term, &mut w);
-                        (r, canon, w)
-                    })
-                    .collect()
-            },
-        );
+        let (item_works, rep_canons): (Vec<WorkStats>, Vec<(ClassId, Canon, WorkStats)>) =
+            rayon::join(
+                || {
+                    targets
+                        .into_par_iter()
+                        .map(|item| {
+                            let mut w = WorkStats::default();
+                            let term = item
+                                .term
+                                .take()
+                                .expect("on: an unkeyed system keeps its term");
+                            item.canon = Some(canon_of_term(&term, &mut w));
+                            w
+                        })
+                        .collect()
+                },
+                || {
+                    rep_terms
+                        .into_par_iter()
+                        .map(|(r, term)| {
+                            let mut w = WorkStats::default();
+                            let canon = canon_of_term(&term, &mut w);
+                            (r, canon, w)
+                        })
+                        .collect()
+                },
+            );
         for (r, canon, w) in rep_canons {
             work.add(&w);
             if self.pending[&r].set(canon).is_err() {
@@ -404,7 +414,10 @@ impl CanonicalTable {
             self.key_pending(r, invariant);
         }
         let canon = canon.unwrap_or_else(|| {
-            canon_of_term(term.as_ref().expect("on: an unkeyed system keeps its term"), work)
+            canon_of_term(
+                term.as_ref().expect("on: an unkeyed system keeps its term"),
+                work,
+            )
         });
         let placed = self.place_keyed(canon, Some(invariant), new_class);
         self.count(true, &placed);
@@ -505,7 +518,9 @@ impl CanonicalTable {
             return None;
         }
         match *self.by_invariant.get(&invariant())? {
-            Bucket::Pending(r) => (self.rep_canon(r, &rep_term, work).key == canon.key).then_some(r),
+            Bucket::Pending(r) => {
+                (self.rep_canon(r, &rep_term, work).key == canon.key).then_some(r)
+            }
             Bucket::Keyed => None,
         }
     }
@@ -670,7 +685,10 @@ mod tests {
             let mut table = CanonicalTable::new(mode);
             results.push(classes(&place_all(&mut table, &systems)));
         }
-        assert_eq!(results[0], vec![(0, false), (0, true), (1, false), (2, false)]);
+        assert_eq!(
+            results[0],
+            vec![(0, false), (0, true), (1, false), (2, false)]
+        );
         assert_eq!(results[1], results[0], "on");
         assert_eq!(results[2], results[0], "check");
     }
@@ -706,7 +724,11 @@ mod tests {
         let placed = table.intern(copy, || unreachable!("a renamed copy merges"), &mut work);
         assert_eq!((placed.class, placed.merged), (0, true));
         assert_eq!((table.pending(), table.keyed()), (1, 1));
-        assert_eq!(table.take_keyed(), vec![0], "the search may drop class 0's system");
+        assert_eq!(
+            table.take_keyed(),
+            vec![0],
+            "the search may drop class 0's system"
+        );
         assert!(table.take_keyed().is_empty());
         assert!(table.late_labelling(0, rep_terms(&[]), &mut work).is_some());
 
