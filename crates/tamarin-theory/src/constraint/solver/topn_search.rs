@@ -274,6 +274,18 @@ struct TopNExt {
     sleep: SleepSet,
 }
 
+impl search_graph::DumpExt for TopNExt {
+    fn class_fields(&self, row: &mut serde_json::Map<String, serde_json::Value>) {
+        row.insert("min_cost".into(), serde_json::json!(self.min_cost));
+    }
+
+    fn and_fields(&self, a: usize, row: &mut serde_json::Map<String, serde_json::Value>) {
+        // Methods are applied in the heuristic's order, the first that apply,
+        // so the method's index is its rank among the applicable ones.
+        row.insert("rank".into(), serde_json::json!(a));
+    }
+}
+
 type SearchGraph = search_graph::SearchGraph<TopNExt>;
 
 impl SearchGraph {
@@ -510,12 +522,20 @@ impl<'a> Engine<'a> {
     }
 
     fn merge_counts(&self) -> MergeCounts {
+        let (stored, stored_unkeyed) =
+            search_graph::stored_counts(&self.graph, &self.store, self.config.merge);
         MergeCounts {
             applied: self.stats.applied,
             leaves: self.stats.leaves,
             merges: self.stats.merges,
             skipped_asleep: self.stats.skipped_asleep,
             asleep: self.stats.asleep,
+            // Every merge happens when a case is created; whether a later
+            // step goes through it is not tracked here.
+            merges_used: self.stats.merges,
+            stored,
+            stored_unkeyed,
+            ..MergeCounts::default()
         }
     }
 

@@ -119,6 +119,9 @@ pub struct LoadOpts {
     pub defines: Vec<String>,
     /// `--auto-sources` (OR-ed with the theory's own `configuration:` block).
     pub auto_sources: bool,
+    /// Keep every proof node's system after the search: a tool that reads
+    /// the proof tree's systems needs it; `--prove` drops them.
+    pub keep_systems: bool,
 }
 
 /// A theory after [`try_load_theory_translated`]: SAPIC processes and
@@ -243,6 +246,11 @@ pub fn try_load_theory_for_proving(theory_path: &str, opts: &LoadOpts) -> Result
             ndc_cache: Some(ndc_cache),
             parameters,
             loop_breakers_prepared: true,
+            sys_retention: if opts.keep_systems {
+                tamarin_theory::constraint::solver::search::SysRetention::KeepAll
+            } else {
+                tamarin_theory::constraint::solver::search::SysRetention::DropAll
+            },
             ..Default::default()
         },
     )
