@@ -112,7 +112,7 @@ export CORPUS FLAGS_MAP CACHE_DIR DEPTH NODES TIMEOUT PY DIFF_DIR
 # The top-N search variables change what the solver does; a run that
 # inherits one from the caller's shell pins something other than it claims.
 for v in TAM_RS_TOP_METHODS TAM_RS_MERGE TAM_RS_TOPN_BATCH TAM_RS_SEARCH_ORDER \
-         TAM_RS_TOPN_ALT_COST TAM_RS_TOPN_STATS; do
+         TAM_RS_TOPN_STATS; do
     if [ -n "${!v+x}" ]; then
         echo "canon_pin: $v is set in the environment; unset it" >&2; exit 2
     fi

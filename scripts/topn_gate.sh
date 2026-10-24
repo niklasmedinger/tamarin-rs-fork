@@ -72,7 +72,7 @@ BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 
 # The variables that switch the top-N search on. A gate run that inherits one
 # of them from the caller's shell would test something other than it claims.
-TOPN_VARS=(TAM_RS_TOP_METHODS TAM_RS_MERGE TAM_RS_TOPN_BATCH TAM_RS_SEARCH_ORDER TAM_RS_TOPN_ALT_COST TAM_RS_TOPN_STATS)
+TOPN_VARS=(TAM_RS_TOP_METHODS TAM_RS_MERGE TAM_RS_TOPN_BATCH TAM_RS_SEARCH_ORDER TAM_RS_TOPN_STATS)
 for v in "${TOPN_VARS[@]}"; do
     if [ -n "${!v+x}" ]; then
         echo "topn_gate: $v is set in the environment; unset it (the gate sets what each run needs)" >&2

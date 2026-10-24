@@ -3,8 +3,8 @@
 //! it places each constraint system in a class of canonically equal ones,
 //! keyed by the system's canonical form ([`crate::canon`]).
 //!
-//! Canonicalizing a system costs a bliss subprocess. With
-//! `TAM_RS_CANON_INVARIANT=on` the table first computes the system's cheap
+//! Canonicalizing a system costs a bliss subprocess. Unless
+//! `TAM_RS_CANON_INVARIANT=off`, the table first computes the system's cheap
 //! invariant ([`invariant`]): equal canonical forms have equal invariants, so
 //! a system whose invariant no class has is a class of its own, and needs no
 //! canonicalization at all. Only a system whose invariant a class already has
@@ -41,8 +41,8 @@
 //! renames them through [`CanonicalTable::late_labelling`].
 //!
 //! **Modes** (`TAM_RS_CANON_INVARIANT`, read once):
-//! - unset or `off`: every system is canonicalized, in its worker;
-//! - `on`: the invariant first;
+//! - unset or `on`: the invariant first;
+//! - `off`: every system is canonicalized, in its worker;
 //! - `check`: places systems as `off` does, and computes every invariant too.
 //!   Two systems with one key and different invariants panic; the collision
 //!   counters are those `on` would see.
@@ -69,12 +69,23 @@ pub(crate) enum CanonMode {
     Check,
 }
 
+impl CanonMode {
+    /// The mode as `TAM_RS_CANON_INVARIANT` spells it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            CanonMode::Off => "off",
+            CanonMode::On => "on",
+            CanonMode::Check => "check",
+        }
+    }
+}
+
 /// `TAM_RS_CANON_INVARIANT`, read once per process.
 pub(crate) fn canon_mode_from_env() -> CanonMode {
     static MODE: OnceLock<CanonMode> = OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("TAM_RS_CANON_INVARIANT").as_deref() {
-        Err(std::env::VarError::NotPresent) | Ok("off") => CanonMode::Off,
-        Ok("on") => CanonMode::On,
+        Err(std::env::VarError::NotPresent) | Ok("on") => CanonMode::On,
+        Ok("off") => CanonMode::Off,
         Ok("check") => CanonMode::Check,
         other => panic!("TAM_RS_CANON_INVARIANT={other:?}: expected `off`, `on` or `check`"),
     })
@@ -534,6 +545,10 @@ impl CanonicalTable {
 
     pub(crate) fn invariant_of(&self, c: ClassId) -> Option<&Fingerprint> {
         self.invariants.get(&c)
+    }
+
+    pub(crate) fn mode(&self) -> CanonMode {
+        self.mode
     }
 
     pub(crate) fn keyed(&self) -> usize {

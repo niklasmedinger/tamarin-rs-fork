@@ -155,9 +155,9 @@
 //! - `TAM_RS_MCGS_SHADOW_KEYS` (presence): without merging, canonicalize
 //!   claimed systems and count the duplicates, without merging them;
 //! - `TAM_RS_CANON_INVARIANT=off|on|check`: how merging and shadow keys
-//!   canonicalize ([`super::canon_table`]): every system (`off`, the
-//!   default), only one whose cheap invariant another system has (`on`), or
-//!   every system, checked against its invariant (`check`); the decisions
+//!   canonicalize ([`super::canon_table`]): only a system whose cheap
+//!   invariant another system has (`on`, the default), every system (`off`),
+//!   or every system, checked against its invariant (`check`); the decisions
 //!   are the same;
 //! - `TAM_RS_MCGS_STATS` (presence): one summary line per search on stderr.
 //! - `TAM_RS_SEARCH_STATS=SECS`: `[search-stats]` lines on stderr, the merge
@@ -859,9 +859,6 @@ impl<'a> Engine<'a> {
             applied: self.stats.applied,
             leaves: self.stats.leaves,
             merges: self.stats.merges,
-            // No sleep sets.
-            skipped_asleep: 0,
-            asleep: 0,
             merges_used: self.stats.merges_used,
             merges_settled: self.stats.merges_settled,
             merges_on_path: self.stats.merges_on_path,
@@ -1785,6 +1782,7 @@ fn print_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constraint::solver::canon_table::CanonMode;
     use crate::constraint::solver::search::{run_proof_search, NodeStatus};
     use crate::constraint::solver::search_graph::test_support::{
         ctx, empty_disjunction, two_branch_disjunction, two_true_formulas, unproducible_action,
@@ -2106,15 +2104,25 @@ mod tests {
 
     // --- Rounds (maude) ----------------------------------------------------
 
-    /// An engine whose root, `two_branch_disjunction`, is expanded with one
-    /// applied method whose cases are `cases`, created unkeyed at depth 1.
+    /// An engine whose canonical tables decide in `mode`.
+    fn engine_in(ctx: &ProofContext, config: McgsConfig, mode: CanonMode) -> Engine<'_> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut engine = Engine::new(ctx, config, DEPTH_CAP, deadline);
+        engine.table = CanonicalTable::new(mode);
+        engine.shadow = CanonicalTable::new(mode);
+        engine
+    }
+
+    /// An engine in `mode` whose root, `two_branch_disjunction`, is expanded
+    /// with one applied method whose cases are `cases`, created unkeyed at
+    /// depth 1.
     fn engine_with_cases(
         ctx: &ProofContext,
         config: McgsConfig,
+        mode: CanonMode,
         cases: Vec<System>,
     ) -> (Engine<'_>, u16, Vec<ClassId>) {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut engine = Engine::new(ctx, config, DEPTH_CAP, deadline);
+        let mut engine = engine_in(ctx, config, mode);
         engine.add_root(two_branch_disjunction());
         let ext = &mut engine.graph.class_mut(ROOT).ext;
         ext.expanded = true;
@@ -2142,7 +2150,8 @@ mod tests {
             batch: 2,
             ..McgsConfig::with_budget(0)
         };
-        let (mut engine, _, cases) = engine_with_cases(&ctx, config, vec![unproducible_action()]);
+        let (mut engine, _, cases) =
+            engine_with_cases(&ctx, config, CanonMode::On, vec![unproducible_action()]);
         let env = WorkerEnv::capture(None);
         let mut first = Traversal::from_root();
         engine.select_from(&env, &mut first).expect("select");
@@ -2166,50 +2175,51 @@ mod tests {
         if !crate::bliss_proc::bliss_available() {
             return;
         }
-        let config = McgsConfig {
-            merge: true,
-            idf_weight: 0.0,
-            batch: 2,
-            ..McgsConfig::with_budget(0)
-        };
-        let (mut engine, a, cases) = engine_with_cases(
-            &ctx,
-            config,
-            vec![unproducible_action(), unproducible_action()],
-        );
-        assert_eq!(
-            engine.stats.work.canons, 1,
-            "only the root is keyed when created"
-        );
-        let env = WorkerEnv::capture(None);
-        let mut ts: Vec<Traversal> = (0..2)
-            .map(|_| {
-                let mut t = Traversal::from_root();
-                engine.select_from(&env, &mut t).expect("select");
-                t
-            })
-            .collect();
-        assert_eq!(
-            ts.iter().map(|t| t.end).collect::<Vec<_>>(),
-            vec![TraversalEnd::Leaf(cases[0]), TraversalEnd::Leaf(cases[1])]
-        );
+        // `off` keys the root when it is created, `on` only on a collision.
+        for (mode, at_creation, after) in [(CanonMode::Off, 1, 3), (CanonMode::On, 0, 2)] {
+            let config = McgsConfig {
+                merge: true,
+                idf_weight: 0.0,
+                batch: 2,
+                ..McgsConfig::with_budget(0)
+            };
+            let (mut engine, a, cases) = engine_with_cases(
+                &ctx,
+                config,
+                mode,
+                vec![unproducible_action(), unproducible_action()],
+            );
+            assert_eq!(engine.stats.work.canons, at_creation, "{mode:?}");
+            let env = WorkerEnv::capture(None);
+            let mut ts: Vec<Traversal> = (0..2)
+                .map(|_| {
+                    let mut t = Traversal::from_root();
+                    engine.select_from(&env, &mut t).expect("select");
+                    t
+                })
+                .collect();
+            assert_eq!(
+                ts.iter().map(|t| t.end).collect::<Vec<_>>(),
+                vec![TraversalEnd::Leaf(cases[0]), TraversalEnd::Leaf(cases[1])]
+            );
 
-        engine.key_leaves(&env, &mut ts).expect("key");
-        assert_eq!(ts[0].end, TraversalEnd::Leaf(cases[0]));
-        assert_eq!(ts[1].end, TraversalEnd::Done);
-        assert!(engine.graph.class(cases[0]).keyed);
-        assert!(engine.store[cases[0] as usize]
-            .as_ref()
-            .is_some_and(|stored| stored.labelling.is_some()));
-        assert!(engine.store[cases[1] as usize].is_none());
-        let targets: Vec<ClassId> = engine.graph.class(ROOT).ands[a as usize]
-            .cases
-            .iter()
-            .map(|&(_, d)| d)
-            .collect();
-        assert_eq!(targets, vec![cases[0], cases[0]]);
-        assert_eq!(engine.stats.merges, 1);
-        assert_eq!(engine.stats.work.canons, 3);
+            engine.key_leaves(&env, &mut ts).expect("key");
+            assert_eq!(ts[0].end, TraversalEnd::Leaf(cases[0]));
+            assert_eq!(ts[1].end, TraversalEnd::Done);
+            assert!(engine.graph.class(cases[0]).keyed);
+            assert!(engine.store[cases[0] as usize]
+                .as_ref()
+                .is_some_and(|stored| stored.labelling.is_some()));
+            assert!(engine.store[cases[1] as usize].is_none());
+            let targets: Vec<ClassId> = engine.graph.class(ROOT).ands[a as usize]
+                .cases
+                .iter()
+                .map(|&(_, d)| d)
+                .collect();
+            assert_eq!(targets, vec![cases[0], cases[0]]);
+            assert_eq!(engine.stats.merges, 1);
+            assert_eq!(engine.stats.work.canons, after, "{mode:?}");
+        }
     }
 
     /// A traversal whose case merges into an expanded class goes on from it
@@ -2222,49 +2232,52 @@ mod tests {
         if !crate::bliss_proc::bliss_available() {
             return;
         }
-        let config = McgsConfig {
-            merge: true,
-            idf_weight: 0.0,
-            ..McgsConfig::with_budget(0)
-        };
-        let (mut engine, a, cases) = engine_with_cases(&ctx, config, vec![unproducible_action()]);
-        // An expanded class with the case's key, and one unkeyed case below.
-        let existing = engine.intern(Child::Unkeyed(Stored::new(unproducible_action(), None)), 3);
-        let prepared = engine
-            .table
-            .prepare(&unproducible_action(), &mut WorkStats::default());
-        let placed = engine
-            .table
-            .intern(prepared, || existing, &mut WorkStats::default());
-        assert!(!placed.merged);
-        engine.graph.mark_keyed(existing);
-        let ext = &mut engine.graph.class_mut(existing).ext;
-        ext.expanded = true;
-        ext.actions = vec![Action {
-            prior: 1.0,
-            state: ActionState::Virtual,
-        }];
-        let below = engine.intern(Child::Unkeyed(Stored::new(two_true_formulas(), None)), 4);
-        apply(&mut engine.graph, existing, 0, &[below]);
+        // `off`: the root, the case and the claim below; `on`: the case and
+        // the class it merges into, whose invariant it shares.
+        for (mode, canons) in [(CanonMode::Off, 3), (CanonMode::On, 2)] {
+            let config = McgsConfig {
+                merge: true,
+                idf_weight: 0.0,
+                ..McgsConfig::with_budget(0)
+            };
+            let (mut engine, a, cases) =
+                engine_with_cases(&ctx, config, mode, vec![unproducible_action()]);
+            // An expanded class with the case's key, and one unkeyed case below.
+            let existing =
+                engine.intern(Child::Unkeyed(Stored::new(unproducible_action(), None)), 3);
+            let prepared = engine
+                .table
+                .prepare(&unproducible_action(), &mut WorkStats::default());
+            let placed = engine
+                .table
+                .intern(prepared, || existing, &mut WorkStats::default());
+            assert!(!placed.merged);
+            engine.graph.mark_keyed(existing);
+            let ext = &mut engine.graph.class_mut(existing).ext;
+            ext.expanded = true;
+            ext.actions = vec![Action {
+                prior: 1.0,
+                state: ActionState::Virtual,
+            }];
+            let below = engine.intern(Child::Unkeyed(Stored::new(two_true_formulas(), None)), 4);
+            apply(&mut engine.graph, existing, 0, &[below]);
 
-        let env = WorkerEnv::capture(None);
-        let mut ts = vec![Traversal::from_root()];
-        engine.select_from(&env, &mut ts[0]).expect("select");
-        assert_eq!(ts[0].end, TraversalEnd::Leaf(cases[0]));
-        engine.key_leaves(&env, &mut ts).expect("key");
-        assert_eq!(ts[0].end, TraversalEnd::Leaf(below));
-        assert_eq!(ts[0].path, vec![(ROOT, a), (existing, 0)]);
-        assert_eq!(engine.graph.class(cases[0]).ext.merged_into, Some(existing));
-        assert_eq!(
-            engine.graph.class(ROOT).ands[a as usize].cases[0].1,
-            existing
-        );
-        assert!(engine.graph.class(below).keyed);
-        assert_eq!(engine.stats.merges, 1);
-        assert_eq!(
-            engine.stats.work.canons, 3,
-            "the root, the case, the claim below"
-        );
+            let env = WorkerEnv::capture(None);
+            let mut ts = vec![Traversal::from_root()];
+            engine.select_from(&env, &mut ts[0]).expect("select");
+            assert_eq!(ts[0].end, TraversalEnd::Leaf(cases[0]));
+            engine.key_leaves(&env, &mut ts).expect("key");
+            assert_eq!(ts[0].end, TraversalEnd::Leaf(below));
+            assert_eq!(ts[0].path, vec![(ROOT, a), (existing, 0)]);
+            assert_eq!(engine.graph.class(cases[0]).ext.merged_into, Some(existing));
+            assert_eq!(
+                engine.graph.class(ROOT).ands[a as usize].cases[0].1,
+                existing
+            );
+            assert!(engine.graph.class(below).keyed);
+            assert_eq!(engine.stats.merges, 1);
+            assert_eq!(engine.stats.work.canons, canons, "{mode:?}");
+        }
     }
 
     /// Eager keying canonicalizes a case when its method is applied: a
@@ -2279,73 +2292,81 @@ mod tests {
         if !crate::bliss_proc::bliss_available() {
             return;
         }
-        let config = McgsConfig {
-            merge: true,
-            keying: Keying::Eager,
-            idf_weight: 0.0,
-            ..McgsConfig::with_budget(0)
-        };
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut engine = Engine::new(&ctx, config, DEPTH_CAP, deadline);
-        engine.add_root(two_branch_disjunction());
-        let ext = &mut engine.graph.class_mut(ROOT).ext;
-        ext.expanded = true;
-        ext.actions = vec![Action {
-            prior: 1.0,
-            state: ActionState::Virtual,
-        }];
-        let mut work = WorkStats::default();
-        let cases: Vec<(String, Child)> = (0..2)
-            .map(|i| {
-                let child = classify(&ctx, unproducible_action(), Some(&engine.table), &mut work);
-                (format!("case_{i}"), child)
-            })
-            .collect();
-        let a = engine.integrate(
-            ROOT,
-            0,
-            Applied {
-                method: ProofMethod::Simplify,
-                method_key: None,
-                cases,
-            },
-        );
-        let targets: Vec<ClassId> = engine.graph.class(ROOT).ands[a as usize]
-            .cases
-            .iter()
-            .map(|&(_, d)| d)
-            .collect();
-        assert_eq!(
-            targets[0], targets[1],
-            "the second case merged into the first"
-        );
-        assert_eq!(engine.stats.merges, 1);
-        assert_eq!(
-            engine.stats.merges_used, 0,
-            "no traversal went through it yet"
-        );
-        assert_eq!(engine.graph.class(targets[0]).ext.merged_into, None);
-        assert_eq!(
-            engine.store.len(),
-            engine.graph.classes.len(),
-            "the merged case made no class"
-        );
-        let counts = engine.merge_counts();
-        assert_eq!(counts.stored_unkeyed, 0);
-        assert_eq!(counts.stored, 2, "the root and the one case class");
+        for mode in [CanonMode::Off, CanonMode::On] {
+            let config = McgsConfig {
+                merge: true,
+                keying: Keying::Eager,
+                idf_weight: 0.0,
+                ..McgsConfig::with_budget(0)
+            };
+            let mut engine = engine_in(&ctx, config, mode);
+            engine.add_root(two_branch_disjunction());
+            let ext = &mut engine.graph.class_mut(ROOT).ext;
+            ext.expanded = true;
+            ext.actions = vec![Action {
+                prior: 1.0,
+                state: ActionState::Virtual,
+            }];
+            let mut work = WorkStats::default();
+            let mut cases: Vec<(String, Child)> = (0..2)
+                .map(|i| {
+                    let child =
+                        classify(&ctx, unproducible_action(), Some(&engine.table), &mut work);
+                    (format!("case_{i}"), child)
+                })
+                .collect();
+            // What no worker could key, as `integrate_expansion` does first.
+            engine.table.precompute(
+                Child::prepared_mut(&mut cases),
+                |r| kept_system(&engine.store, &engine.retained, r).map(system_to_term),
+                &mut work,
+            );
+            let a = engine.integrate(
+                ROOT,
+                0,
+                Applied {
+                    method: ProofMethod::Simplify,
+                    method_key: None,
+                    cases,
+                },
+            );
+            let targets: Vec<ClassId> = engine.graph.class(ROOT).ands[a as usize]
+                .cases
+                .iter()
+                .map(|&(_, d)| d)
+                .collect();
+            assert_eq!(
+                targets[0], targets[1],
+                "the second case merged into the first"
+            );
+            assert_eq!(engine.stats.merges, 1);
+            assert_eq!(
+                engine.stats.merges_used, 0,
+                "no traversal went through it yet"
+            );
+            assert_eq!(engine.graph.class(targets[0]).ext.merged_into, None);
+            assert_eq!(
+                engine.store.len(),
+                engine.graph.classes.len(),
+                "the merged case made no class"
+            );
+            let counts = engine.merge_counts();
+            assert_eq!(counts.stored_unkeyed, 0);
+            assert_eq!(counts.stored, 2, "the root and the one case class");
 
-        let env = WorkerEnv::capture(None);
-        for _ in 0..2 {
-            let mut t = Traversal::from_root();
-            engine.select_from(&env, &mut t).expect("select");
-            if let TraversalEnd::Leaf(c) = t.end {
-                engine.graph.class_mut(c).ext.in_flight = false;
+            let env = WorkerEnv::capture(None);
+            for _ in 0..2 {
+                let mut t = Traversal::from_root();
+                engine.select_from(&env, &mut t).expect("select");
+                if let TraversalEnd::Leaf(c) = t.end {
+                    engine.graph.class_mut(c).ext.in_flight = false;
+                }
             }
+            assert_eq!(
+                engine.stats.merges_used, 1,
+                "the second traversal goes through the merged case"
+            );
         }
-        assert_eq!(
-            engine.stats.merges_used, 1,
-            "the second traversal goes through the merged case"
-        );
     }
 
     /// Shadow keys find a duplicate among claimed systems without merging
@@ -2358,45 +2379,48 @@ mod tests {
         if !crate::bliss_proc::bliss_available() {
             return;
         }
-        let config = McgsConfig {
-            shadow_keys: true,
-            idf_weight: 0.0,
-            batch: 2,
-            ..McgsConfig::with_budget(0)
-        };
-        let (mut engine, a, cases) = engine_with_cases(
-            &ctx,
-            config,
-            vec![unproducible_action(), unproducible_action()],
-        );
-        let env = WorkerEnv::capture(None);
-        let mut ts: Vec<Traversal> = (0..2)
-            .map(|_| {
-                let mut t = Traversal::from_root();
-                engine.select_from(&env, &mut t).expect("select");
-                t
-            })
-            .collect();
-        engine.key_leaves(&env, &mut ts).expect("key");
-        assert_eq!(
-            ts.iter().map(|t| t.end).collect::<Vec<_>>(),
-            vec![TraversalEnd::Leaf(cases[0]), TraversalEnd::Leaf(cases[1])],
-            "nothing merged"
-        );
-        assert_eq!(engine.graph.class(cases[1]).ext.dup_of, Some(cases[0]));
-        assert_eq!(engine.graph.class(cases[0]).ext.dup_of, None);
-        assert_eq!(engine.stats.shadow_dups, 1);
-        assert_eq!(engine.stats.merges, 0);
-        assert!(engine.store[cases[0] as usize].is_some());
-        assert!(engine.store[cases[1] as usize].is_some());
-        assert_eq!(
-            engine.graph.class(ROOT).ands[a as usize]
-                .cases
-                .iter()
-                .map(|&(_, d)| d)
-                .collect::<Vec<_>>(),
-            cases
-        );
+        for mode in [CanonMode::Off, CanonMode::On] {
+            let config = McgsConfig {
+                shadow_keys: true,
+                idf_weight: 0.0,
+                batch: 2,
+                ..McgsConfig::with_budget(0)
+            };
+            let (mut engine, a, cases) = engine_with_cases(
+                &ctx,
+                config,
+                mode,
+                vec![unproducible_action(), unproducible_action()],
+            );
+            let env = WorkerEnv::capture(None);
+            let mut ts: Vec<Traversal> = (0..2)
+                .map(|_| {
+                    let mut t = Traversal::from_root();
+                    engine.select_from(&env, &mut t).expect("select");
+                    t
+                })
+                .collect();
+            engine.key_leaves(&env, &mut ts).expect("key");
+            assert_eq!(
+                ts.iter().map(|t| t.end).collect::<Vec<_>>(),
+                vec![TraversalEnd::Leaf(cases[0]), TraversalEnd::Leaf(cases[1])],
+                "nothing merged"
+            );
+            assert_eq!(engine.graph.class(cases[1]).ext.dup_of, Some(cases[0]));
+            assert_eq!(engine.graph.class(cases[0]).ext.dup_of, None);
+            assert_eq!(engine.stats.shadow_dups, 1);
+            assert_eq!(engine.stats.merges, 0);
+            assert!(engine.store[cases[0] as usize].is_some());
+            assert!(engine.store[cases[1] as usize].is_some());
+            assert_eq!(
+                engine.graph.class(ROOT).ands[a as usize]
+                    .cases
+                    .iter()
+                    .map(|&(_, d)| d)
+                    .collect::<Vec<_>>(),
+                cases
+            );
+        }
     }
 
     /// A case no traversal entered has no key; the proof shows it open.

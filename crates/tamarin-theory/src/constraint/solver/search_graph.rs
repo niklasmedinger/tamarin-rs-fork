@@ -38,7 +38,7 @@ use crate::canon_fingerprint::{
     fingerprint_constraint_system, fingerprint_proof_method, CanonicalSystemFingerprint,
 };
 use crate::canon_term_graph::{invariant, system_to_term, STerm};
-use crate::constraint::solver::canon_table::{CanonicalTable, Prepared};
+use crate::constraint::solver::canon_table::{CanonMode, CanonicalTable, Prepared};
 use crate::constraint::solver::context::ProofContext;
 use crate::constraint::solver::proof_method::{
     exec_proof_method, is_finished, ProofMethod, Result as MethodResult,
@@ -698,12 +698,6 @@ pub(crate) struct MergeCounts {
     pub(crate) leaves: u64,
     /// Cases that reached a class created before.
     pub(crate) merges: u64,
-    /// With sleep sets (top-N only): ranked methods skipped because their
-    /// goal slept.
-    pub(crate) skipped_asleep: u64,
-    /// With sleep sets: open classes left without a method because every
-    /// remaining one slept.
-    pub(crate) asleep: u64,
     /// Merges that changed what the search did: a merge into a class
     /// already settled, or one a traversal went on through. Under MCGS's
     /// just-in-time keying every merge is one, since it happens when a
@@ -741,6 +735,10 @@ pub(crate) struct MergeCounts {
     /// Systems of pending classes the search set aside: it was done with
     /// them, but the canonical table may still need them.
     pub(crate) retained: u64,
+    /// The canonical table's mode (`TAM_RS_CANON_INVARIANT`), so that the
+    /// statistics record how the search canonicalized, whatever a run's
+    /// recorded environment says.
+    pub(crate) canon_mode: Option<CanonMode>,
 }
 
 impl MergeCounts {
@@ -752,6 +750,7 @@ impl MergeCounts {
             inv_hits: stats.inv_hits,
             inv_false: stats.inv_false,
             pending: table.pending() as u64,
+            canon_mode: Some(table.mode()),
             ..self
         }
     }
@@ -1039,12 +1038,12 @@ impl StatsReporter {
         };
         eprintln!(
             "[search-stats] search={} lemma={} final={} end={} root={} classes={} leaves={} \
-             merges={} shared={} asleep={} skipped_asleep={} applied={} execs={} canons={} \
+             merges={} shared={} applied={} execs={} canons={} \
              canon_s={:.3} canon_min_s={:.6} canon_max_s={:.6} busy_s={:.3} elapsed_s={:.3} \
              max_depth={} max_applied_depth={} keyed={} merges_used={} merges_settled={} \
              merges_on_path={} shadow_dups={} stored={} stored_unkeyed={} key_wall_s={:.3} \
              rss_mb={} peak_rss_mb={} expanded={} unfolded={} unfold_loops={} invariants={} \
-             inv_s={:.3} inv_hits={} inv_false={} pending={} retained={}",
+             inv_s={:.3} inv_hits={} inv_false={} pending={} retained={} canon_mode={}",
             self.search,
             lemma,
             u8::from(end.is_some()),
@@ -1054,8 +1053,6 @@ impl StatsReporter {
             counts.leaves,
             counts.merges,
             shared,
-            counts.asleep,
-            counts.skipped_asleep,
             counts.applied,
             work.execs,
             work.canons,
@@ -1086,6 +1083,7 @@ impl StatsReporter {
             counts.inv_false,
             counts.pending,
             counts.retained,
+            counts.canon_mode.map_or("-", CanonMode::name),
         );
     }
 }

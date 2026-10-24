@@ -107,9 +107,7 @@
 //! check)), `peak_rss_mib`, `canonicalize` (`failures` and up to 20
 //! `examples`, each with its `kind` -- `panic` or `error` --, `path` and
 //! `message`), `panic` (null, or where expanding a node panicked: `node`,
-//! `path`, `activity`, `message`), `sleep` (`--sleep-sets`, else null:
-//! `skipped_methods`, the candidates skipped because they were asleep, and
-//! `asleep_nodes`), `invariant_violations` (see "Three
+//! `path`, `activity`, `message`), `invariant_violations` (see "Three
 //! sizes"; expected only after a `panic` stop), `sizes` (the three totals plus
 //! `graph_by_min_depth`, `graph_distinct_at_depth`, `processed_by_depth`,
 //! `tree_by_depth`; counts above `u64::MAX` are strings), `status_counts`,
@@ -119,19 +117,18 @@
 //! methods only on either side), `canon` (see "What canonicalization did"), `methods` (interned method text, including
 //! candidate methods that were never applied) and `nodes`: per OR node its `depth`
 //! (min depth), `status` (`expanded`, `finished` + `result`, `depth_limit`,
-//! `unexpanded`, `asleep`, `canon_panic`, `exec_panic`), `canon_err` (canonicalization returned an
+//! `unexpanded`, `canon_panic`, `exec_panic`), `canon_err` (canonicalization returned an
 //! error: expanded normally but never merged into), `fingerprint` (a hex
 //! digest of the canonical form the node was created under, null when
 //! canonicalization failed or with `--no-canon`), `first_parent`
 //! (`[parent, and_index, case_index]` of the occurrence that created it),
 //! `inapplicable`, `untried` (candidates skipped by `--top-methods`),
-//! `asleep` (candidates skipped by `--sleep-sets`),
 //! `canon_secs`/`methods_secs`/`exec_secs` (canonicalizing the occurrence
 //! that created it, ranking its methods, executing them), and
 //! `and` (`method` index, `kind`, `cases` as
 //! `[name, child_id]` pairs).
 //!
-//! Usage: `cargo run --example explore_canonical_matches -- <theory.spthy> <lemma> [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--no-canon] [--sleep-sets] [--top-methods N] [--time-budget SECS] [--max-rss-gb GB] [--setup-timeout SECS] [--heartbeat SECS] [--trace] [-D=FLAG ...] [--auto-sources]`
+//! Usage: `cargo run --example explore_canonical_matches -- <theory.spthy> <lemma> [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--no-canon] [--top-methods N] [--time-budget SECS] [--max-rss-gb GB] [--setup-timeout SECS] [--heartbeat SECS] [--trace] [-D=FLAG ...] [--auto-sources]`
 //! or `... -- --list-lemmas <theory.spthy> [-D=FLAG ...] [--auto-sources]`.
 //!
 //! The theory is loaded as `tamarin-rs --prove` loads it
@@ -151,21 +148,6 @@
 //! - `--no-canon`: don't canonicalize: every occurrence is a node of its
 //!   own, as with `--no-merge`, but without paying for canonical forms,
 //!   fingerprints or the merge check. No `bliss` needed.
-//! - `--sleep-sets`: skip method orders already explored. Each queued node
-//!   carries a sleep set of goal numbers (`GoalStatus::nr`, which a goal
-//!   keeps through the substitutions that instantiate it, so it names "the
-//!   same goal" in the descendants; see `goal_nr` for the one exception,
-//!   which only wakes a goal up). Expanding a node skips the candidate
-//!   methods whose goal is asleep (recorded as `asleep`), then applies the
-//!   first applicable ones as usual (up to `--top-methods`). The children of
-//!   the k-th applied method get the node's sleep set plus the goals of the
-//!   methods applied before it: a path that solves goal B and then A is
-//!   then not explored once the path solving A and then B has been. A node
-//!   with nothing left to apply but asleep methods -- every candidate is
-//!   asleep, or the awake ones don't apply (typically `simplify`, ranked
-//!   last) -- gets status `asleep`.
-//!   Needs `--no-merge` or `--no-canon`: a sleep set belongs to a path, and
-//!   a merged node is reached along several.
 //! - `--top-methods N`: at each node, apply only the first N candidate
 //!   methods whose `exec_proof_method` succeeds, in `candidate_methods`'
 //!   (heuristic) order; inapplicable candidates don't count, the rest are
@@ -516,10 +498,6 @@ enum Status {
     /// `candidate_methods` offered only `Finished` with this result.
     Finished(&'static str),
     DepthLimit,
-    /// `--sleep-sets`: nothing was left to apply but asleep methods (every
-    /// candidate was asleep, or the awake ones didn't apply) -- the paths
-    /// through it are explored elsewhere.
-    Asleep,
     /// Canonicalization panicked: never merged into, never expanded.
     CanonPanic,
     /// Expanding the node panicked (outside canonicalization, e.g. in
@@ -535,7 +513,6 @@ impl Status {
             Status::Expanded => "expanded",
             Status::Finished(_) => "finished",
             Status::DepthLimit => "depth_limit",
-            Status::Asleep => "asleep",
             Status::CanonPanic => "canon_panic",
             Status::ExecPanic => "exec_panic",
         }
@@ -570,9 +547,6 @@ struct OrNode {
     /// Candidate methods never tried because `--top-methods` were already
     /// applied.
     untried: u32,
-    /// Candidate methods skipped because their goal was asleep
-    /// (`--sleep-sets`).
-    asleep: u32,
     /// Seconds spent canonicalizing (and fingerprinting) the occurrence
     /// that created the node, ranking its candidate methods, and executing
     /// the methods applied to it -- the latter two are what a search that
@@ -684,7 +658,6 @@ impl Graph {
             first_parent,
             inapplicable: 0,
             untried: 0,
-            asleep: 0,
             canon_secs: 0.0,
             methods_secs: 0.0,
             exec_secs: 0.0,
@@ -769,24 +742,6 @@ fn method_kind(m: &ProofMethod) -> &'static str {
         ProofMethod::Finished(_) => "finished",
         ProofMethod::Invalidated => "invalidated",
     }
-}
-
-/// The `nr` of the goal `method` solves, or `None` if it solves none of
-/// `sys`'s goals. Substitution rewrites a goal in place and keeps its
-/// status, and of two goals it makes equal the older `nr` survives, so the
-/// number names the same goal in the descendants of `sys`. The exception is
-/// a `KU` goal on a message variable, product or union whose term changes:
-/// substitution re-inserts it (decomposing it) under new numbers, so a
-/// sleeping one wakes up -- safe, it only prunes less. New goals never reuse
-/// a number.
-fn goal_nr(sys: &System, method: &ProofMethod) -> Option<u64> {
-    let ProofMethod::SolveGoal(goal) = method else {
-        return None;
-    };
-    sys.goals
-        .iter()
-        .find(|(g, _)| g == goal)
-        .map(|(_, status)| status.nr)
 }
 
 fn result_name(r: &FinishedResult) -> &'static str {
@@ -1150,17 +1105,12 @@ struct Flags {
     term_graph_check: bool,
 }
 
-/// The goals asleep at a node, by `GoalStatus::nr` (see `--sleep-sets`).
-type SleepSet = BTreeSet<u64>;
-
-/// A node awaiting expansion: the `System` only it still carries, its
-/// candidate methods if already computed (for the method check), and its
-/// sleep set (empty without `--sleep-sets`).
+/// A node awaiting expansion: the `System` only it still carries, and its
+/// candidate methods if already computed (for the method check).
 struct Queued {
     id: OrId,
     sys: System,
     methods: Option<Vec<ProofMethod>>,
-    sleep: SleepSet,
 }
 
 struct Explorer<'a> {
@@ -1172,15 +1122,11 @@ struct Explorer<'a> {
     no_merge: bool,
     /// `--no-canon`: never canonicalize (implies `no_merge`).
     no_canon: bool,
-    /// `--sleep-sets`: skip method orders already explored.
-    sleep_sets: bool,
     /// `--top-methods`: apply only this many candidate methods per node.
     top_methods: Option<usize>,
     graph: Graph,
     by_fingerprint: FastMap<CanonicalSystemFingerprint, OrId>,
     queue: VecDeque<Queued>,
-    /// Candidate methods skipped because their goal was asleep.
-    sleep_skipped: u64,
     processed: u64,
     canonicalize_failures: usize,
     method_check: MethodCheck,
@@ -1256,13 +1202,7 @@ impl Explorer<'_> {
     /// (`None` for the root), and returns its OR node: an existing one if
     /// `sys` is canonically equal to an already-seen system, otherwise a new
     /// one -- queued for expansion unless canonicalization panicked.
-    fn visit(
-        &mut self,
-        sys: System,
-        depth: usize,
-        edge: Option<(OrId, u32, u32)>,
-        sleep: SleepSet,
-    ) -> OrId {
+    fn visit(&mut self, sys: System, depth: usize, edge: Option<(OrId, u32, u32)>) -> OrId {
         let ctx = self.ctx;
         self.processed += 1;
         if self.graph.processed_by_depth.len() <= depth {
@@ -1303,7 +1243,6 @@ impl Explorer<'_> {
                 id,
                 sys,
                 methods: None,
-                sleep,
             });
             return id;
         }
@@ -1394,12 +1333,7 @@ impl Explorer<'_> {
         if let (Some(fp), false) = (fingerprint, self.no_merge) {
             self.by_fingerprint.insert(fp, id);
         }
-        self.queue.push_back(Queued {
-            id,
-            sys,
-            methods,
-            sleep,
-        });
+        self.queue.push_back(Queued { id, sys, methods });
         id
     }
 
@@ -1606,14 +1540,8 @@ impl Explorer<'_> {
                 self.queue.push_front(queued);
                 return stop;
             }
-            let Queued {
-                id,
-                sys,
-                methods,
-                sleep,
-            } = queued;
-            let expanded =
-                catch_unwind(AssertUnwindSafe(|| self.expand(id, &sys, methods, &sleep)));
+            let Queued { id, sys, methods } = queued;
+            let expanded = catch_unwind(AssertUnwindSafe(|| self.expand(id, &sys, methods)));
             if let Err(payload) = expanded {
                 self.record_expand_panic(id, panic_message(&*payload).to_string());
                 return StopReason::Panic;
@@ -1649,15 +1577,8 @@ impl Explorer<'_> {
     }
 
     /// `methods` are `sys`'s candidate methods if `visit` already computed
-    /// them (every node except `canon_err` ones and with `--no-canon`);
-    /// `sleep` is the node's sleep set.
-    fn expand(
-        &mut self,
-        id: OrId,
-        sys: &System,
-        methods: Option<Vec<ProofMethod>>,
-        sleep: &SleepSet,
-    ) {
+    /// them (every node except `canon_err` ones and with `--no-canon`).
+    fn expand(&mut self, id: OrId, sys: &System, methods: Option<Vec<ProofMethod>>) {
         let ctx = self.ctx;
         let depth = self.graph.node(id).depth as usize;
         if depth >= self.max_depth {
@@ -1684,26 +1605,6 @@ impl Explorer<'_> {
             }
             return;
         }
-        let methods = if self.sleep_sets {
-            let candidates = methods.len();
-            let awake: Vec<ProofMethod> = methods
-                .into_iter()
-                .filter(|m| !goal_nr(sys, m).is_some_and(|nr| sleep.contains(&nr)))
-                .collect();
-            let skipped = candidates - awake.len();
-            self.graph.node_mut(id).asleep = skipped as u32;
-            self.sleep_skipped += skipped as u64;
-            if awake.is_empty() && skipped > 0 {
-                self.graph.node_mut(id).status = Status::Asleep;
-                if self.flags.trace {
-                    log!("asleep #{id} depth={depth}: all {skipped} candidate(s) asleep");
-                }
-                return;
-            }
-            awake
-        } else {
-            methods
-        };
         if self.flags.trace {
             log!(
                 "expand #{id} depth={depth} methods={} processed={} graph={} queue={}",
@@ -1716,9 +1617,6 @@ impl Explorer<'_> {
         self.graph.node_mut(id).status = Status::Expanded;
         let method_count = methods.len();
         let mut applied = 0usize;
-        // The goals of the methods applied here so far: asleep in the
-        // children of every later one.
-        let mut explored = SleepSet::new();
         for (k, method) in methods.into_iter().enumerate() {
             // `candidate_methods` is in heuristic order, so this keeps the
             // best-ranked applicable methods -- `--top-methods 1` follows
@@ -1753,7 +1651,6 @@ impl Explorer<'_> {
             if self.flags.trace {
                 log!("    -> {} case(s)", cases.len());
             }
-            let child_sleep: SleepSet = sleep.union(&explored).copied().collect();
             for (case_name, child_sys) in cases {
                 set_activity(format!("visit case [{case_name}] of {step}"));
                 // Pushed with a placeholder target first, so the child's own
@@ -1762,27 +1659,8 @@ impl Explorer<'_> {
                 let slots = &mut self.graph.node_mut(id).and[and_idx as usize].cases;
                 let case_idx = slots.len() as u32;
                 slots.push((case_name, OrId::MAX));
-                let child = self.visit(
-                    child_sys,
-                    depth + 1,
-                    Some((id, and_idx, case_idx)),
-                    child_sleep.clone(),
-                );
+                let child = self.visit(child_sys, depth + 1, Some((id, and_idx, case_idx)));
                 self.graph.node_mut(id).and[and_idx as usize].cases[case_idx as usize].1 = child;
-            }
-            if self.sleep_sets
-                && let Some(nr) = goal_nr(sys, &method)
-            {
-                explored.insert(nr);
-            }
-        }
-        // The awake candidates didn't apply (typically `simplify`, ranked
-        // last, on a system that is already simplified): nothing is left to
-        // explore here but asleep methods.
-        if applied == 0 && self.graph.node(id).asleep > 0 {
-            self.graph.node_mut(id).status = Status::Asleep;
-            if self.flags.trace {
-                log!("asleep #{id} depth={depth}: no awake candidate applies");
             }
         }
     }
@@ -1906,7 +1784,6 @@ fn summarize(graph: &Graph, max_depth: usize) -> Summary {
         "finished",
         "depth_limit",
         "unexpanded",
-        "asleep",
         "canon_panic",
         "exec_panic",
         "canon_err",
@@ -1982,7 +1859,6 @@ fn node_json(id: usize, n: &OrNode) -> Value {
         "first_parent": n.first_parent.map(|(p, a, c)| json!([p, a, c])),
         "inapplicable": n.inapplicable,
         "untried": n.untried,
-        "asleep": n.asleep,
         "canon_secs": micros(n.canon_secs),
         "methods_secs": micros(n.methods_secs),
         "exec_secs": micros(n.exec_secs),
@@ -2011,8 +1887,6 @@ struct Args {
     no_merge: bool,
     /// `--no-canon`: never canonicalize; implies `no_merge`.
     no_canon: bool,
-    /// `--sleep-sets`: skip method orders already explored.
-    sleep_sets: bool,
     /// `--top-methods N`: apply only the N best-ranked applicable candidate
     /// methods per node (default: all).
     top_methods: Option<usize>,
@@ -2040,9 +1914,9 @@ enum Mode {
 }
 
 const USAGE: &str = "usage: explore_canonical_matches <theory.spthy> <lemma> \
-     [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--no-canon] [--sleep-sets] \
-     [--top-methods N] [--time-budget SECS] [--max-rss-gb GB] [--setup-timeout SECS] \
-     [--heartbeat SECS] [--trace] [-D=FLAG ...] [--auto-sources]\n       \
+     [--max-depth N] [--max-nodes N] [--out PATH] [--no-merge] [--no-canon] [--top-methods N] \
+     [--time-budget SECS] [--max-rss-gb GB] [--setup-timeout SECS] [--heartbeat SECS] \
+     [--trace] [-D=FLAG ...] [--auto-sources]\n       \
      explore_canonical_matches --list-lemmas <theory.spthy> [-D=FLAG ...] [--auto-sources]";
 
 fn usage_error(message: &str) -> ! {
@@ -2093,7 +1967,6 @@ fn parse_args(raw: &[String]) -> Mode {
         out: None,
         no_merge: false,
         no_canon: false,
-        sleep_sets: false,
         top_methods: None,
         time_budget: None,
         max_rss_gb: None,
@@ -2126,7 +1999,6 @@ fn parse_args(raw: &[String]) -> Mode {
                 args.no_canon = true;
                 args.no_merge = true;
             }
-            "--sleep-sets" => args.sleep_sets = true,
             "--top-methods" => {
                 let n = number(value());
                 if n < 1.0 || n.fract() != 0.0 {
@@ -2137,20 +2009,11 @@ fn parse_args(raw: &[String]) -> Mode {
             "--trace" => args.trace = true,
             other => usage_error(&format!("unrecognized argument: {other}")),
         }
-        i += if matches!(
-            flag,
-            "--no-merge" | "--no-canon" | "--sleep-sets" | "--trace"
-        ) {
+        i += if matches!(flag, "--no-merge" | "--no-canon" | "--trace") {
             1
         } else {
             2
         };
-    }
-    if args.sleep_sets && !args.no_merge {
-        usage_error(
-            "--sleep-sets needs --no-merge or --no-canon: a sleep set belongs to a path, \
-             and a merged node is reached along several",
-        );
     }
     Mode::Explore(args)
 }
@@ -2390,12 +2253,10 @@ fn main() {
         max_depth: args.max_depth,
         no_merge: args.no_merge,
         no_canon: args.no_canon,
-        sleep_sets: args.sleep_sets,
         top_methods: args.top_methods,
         graph: Graph::default(),
         by_fingerprint: FastMap::default(),
         queue: VecDeque::new(),
-        sleep_skipped: 0,
         processed: 0,
         canonicalize_failures: 0,
         method_check: MethodCheck::default(),
@@ -2408,9 +2269,7 @@ fn main() {
     };
     // The root's own visit runs outside `run`'s per-expansion panic capture;
     // with no node to attach a partial result to, a panic there only logs.
-    match catch_unwind(AssertUnwindSafe(|| {
-        explorer.visit(initial_sys, 0, None, SleepSet::new())
-    })) {
+    match catch_unwind(AssertUnwindSafe(|| explorer.visit(initial_sys, 0, None))) {
         Ok(root) => assert_eq!(root, 0, "the root is the first OR node"),
         Err(payload) => {
             log!("visiting the root PANICKED: {}", panic_message(&*payload));
@@ -2449,7 +2308,6 @@ fn main() {
             "max_nodes": args.max_nodes,
             "no_merge": args.no_merge,
             "no_canon": args.no_canon,
-            "sleep_sets": args.sleep_sets,
             "top_methods": args.top_methods,
             "time_budget": args.time_budget,
             "max_rss_gb": args.max_rss_gb,
@@ -2483,10 +2341,6 @@ fn main() {
         },
         "canon": explorer.canon_summary.json(),
         "panic": explorer.panic,
-        "sleep": args.sleep_sets.then(|| json!({
-            "skipped_methods": explorer.sleep_skipped,
-            "asleep_nodes": summary.status_counts["asleep"],
-        })),
         "invariant_violations": summary.violations,
         "methods": explorer.graph.methods,
         "nodes": nodes,
@@ -2526,12 +2380,6 @@ fn main() {
             ""
         }
     );
-    if args.sleep_sets {
-        println!(
-            "sleep sets: {} candidate method(s) skipped, {} node(s) asleep",
-            explorer.sleep_skipped, summary.status_counts["asleep"]
-        );
-    }
     if !args.no_canon {
         println!("  canon: {}", explorer.canon_summary.line());
     }
