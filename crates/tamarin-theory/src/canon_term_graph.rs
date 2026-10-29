@@ -119,13 +119,18 @@
 //! - a binder is a vertex with an edge to each of its variables' vertices and
 //!   one to its body.
 //!
+//! A vertex per occurrence, with an edge from its variable's vertex, is the
+//! paper's own construction (its Cases 2 and 4). Sharing one vertex per
+//! variable instead, with an edge to it from each parent, would make the AC
+//! terms `f(x, x, y)` and `f(x, y, y)` the same edge set, since bliss drops
+//! duplicate edges.
+//!
 //! Departures from the paper, each keeping the encoding faithful:
 //! - Edge labels (argument positions) are folded into the child's key: bliss
-//!   colors vertices only, and every vertex but a variable vertex has exactly
-//!   one parent, so "my i-th child" and "my child at position i" coincide.
-//! - Every occurrence gets its own vertex. Pointing the parents at one vertex
-//!   per variable would make the AC terms `f(x, x, y)` and `f(x, y, y)` the
-//!   same edge set, since bliss drops duplicate edges.
+//!   colors vertices only, and every vertex but the root has exactly one
+//!   parent, so "my i-th child" and "my child at position i" coincide. An
+//!   occurrence's other incoming edge, from its variable's vertex, carries no
+//!   label in the paper either.
 //! - Sorts are part of the variable and occurrence labels, so a renaming that
 //!   an isomorphism induces is sort-respecting.
 //!
