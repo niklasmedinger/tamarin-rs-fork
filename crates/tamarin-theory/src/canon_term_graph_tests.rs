@@ -983,22 +983,150 @@ fn a_formulas_free_variables_are_renamed_with_the_system() {
     assert_ne!(original, formula_form("z = z & Ex x #i. G(x)@i"));
 }
 
-/// Bound variables are de Bruijn indices and are never permuted, so the
-/// order of the binders in one block counts: `∀ x y` and `∀ y x` over the
-/// same body give different forms. A missed merge, never a wrong one.
+/// A quantifier block is a commutative binder: neither the names nor the
+/// order of its variables count, in a formula with free variables and in a
+/// closed one.
 #[test]
-fn the_binder_order_inside_a_block_counts() {
+fn the_binder_order_inside_a_block_does_not_count() {
     if !bliss_available() {
         return;
     }
-    assert_ne!(
-        formula_form("All x y #i. P(x, y) @ #i ==> F"),
-        formula_form("All y x #i. P(x, y) @ #i ==> F")
-    );
+    for (a, b) in [
+        (
+            "All x y #i. P(x, y, z) @ #i ==> F",
+            "All y x #i. P(x, y, z) @ #i ==> F",
+        ),
+        (
+            "All x y #i. P(x, y) @ #i ==> F",
+            "All y x #i. P(x, y) @ #i ==> F",
+        ),
+        (
+            "All x y #i. P(x, y) @ #i ==> F",
+            "All #j a b. P(a, b) @ #j ==> F",
+        ),
+        // Equal only up to swapping `x` and `y`, which de Bruijn indices
+        // cannot do: `P` takes the outer variable on one side, the inner
+        // one on the other.
+        (
+            "All x y #i #j. P(x, z) @ #i & Q(y) @ #j ==> F",
+            "All x y #i #j. P(y, z) @ #i & Q(x) @ #j ==> F",
+        ),
+        (
+            "All x y #i #j. P(x) @ #i & Q(y) @ #j ==> F",
+            "All x y #i #j. P(y) @ #i & Q(x) @ #j ==> F",
+        ),
+    ] {
+        assert_eq!(formula_form(a), formula_form(b), "{a} vs {b}");
+    }
+}
+
+/// Which variable of a block is which still counts, and so does which block
+/// a variable belongs to.
+#[test]
+fn which_bound_variable_occurs_where_counts() {
+    if !bliss_available() {
+        return;
+    }
+    for (a, b) in [
+        (
+            "All x y #i. P(x, y) @ #i & Q(x) @ #i ==> F",
+            "All x y #i. P(x, y) @ #i & Q(y) @ #i ==> F",
+        ),
+        (
+            "All x #i. P(x) @ #i ==> Ex y #j. Q(x, y) @ #j",
+            "All x #i. P(x) @ #i ==> Ex y #j. Q(y, x) @ #j",
+        ),
+        (
+            "All x #i. P(x, z) @ #i ==> F",
+            "All x #i. P(z, x) @ #i ==> F",
+        ),
+        (
+            "All x #i. P(x) @ #i ==> Q(x) @ #i",
+            "Ex x #i. P(x) @ #i & Q(x) @ #i",
+        ),
+    ] {
+        assert_ne!(formula_form(a), formula_form(b), "{a} vs {b}");
+    }
+}
+
+/// A block whose body is symmetric in two of its variables: bliss reports
+/// their swap, and it is a symmetry of the system (`canon` checks it).
+#[test]
+fn a_symmetric_block_has_a_genuine_generator() {
+    if !bliss_available() {
+        return;
+    }
+    let mut sys = System::empty();
+    sys.formulas_mut().push(Arc::new(g(
+        "All x y #i #j. P(x, z) @ #i & P(y, z) @ #j ==> F",
+    )));
+    let (_, labelling, stats) = canon(&sys);
+    assert!(stats.generators_moving_vars >= 1);
+    assert!(stats
+        .generator_moves
+        .contains_key("Binder(Quantifier) > BoundVar(Quantifier,Msg)"));
     assert_eq!(
-        formula_form("All x y #i. P(x, y) @ #i ==> F"),
-        formula_form("All a b #j. P(a, b) @ #j ==> F")
+        labelling.theta().len(),
+        5,
+        "z, and the block's x, y, #i, #j"
     );
+}
+
+/// A formula without free variables but with a quantifier is in the graph,
+/// so bliss runs for it.
+#[test]
+fn a_closed_quantified_formula_runs_bliss() {
+    if !bliss_available() {
+        return;
+    }
+    let mut sys = System::empty();
+    sys.formulas_mut()
+        .push(Arc::new(g("All x #i. P(x) @ #i ==> F")));
+    let (_, labelling, stats) = canon(&sys);
+    assert!(stats.bliss_ran);
+    assert_eq!(stats.free_vars, 0);
+    assert_eq!(labelling.theta().len(), 2);
+}
+
+/// The invariant does not see the order of a block either.
+#[test]
+fn permuted_blocks_have_the_same_invariant() {
+    let with = |f: &str| {
+        let mut sys = System::empty();
+        sys.formulas_mut().push(Arc::new(g(f)));
+        system_invariant(&sys)
+    };
+    assert_eq!(
+        with("All x y #i #j. P(x, z) @ #i & Q(y) @ #j ==> F"),
+        with("All y x #j #i. P(y, z) @ #i & Q(x) @ #j ==> F")
+    );
+}
+
+/// A bound variable occurrence outside its binder is a translation bug.
+#[test]
+#[should_panic(expected = "no binder binds")]
+fn a_bound_variable_outside_its_binder_panics() {
+    term_to_graph(&STerm::Binder(
+        Scope::Quantifier,
+        vec![msg("x", 0)],
+        Box::new(STerm::App(
+            Op::GConj,
+            vec![STerm::Var(VarRef::Bound(msg("y", 0)))],
+        )),
+    ));
+}
+
+/// A de Bruijn index that no enclosing block binds: a formula of a system
+/// is never open.
+#[test]
+#[should_panic(expected = "de Bruijn index 0 under 0 bound variable(s)")]
+fn a_dangling_de_bruijn_index_panics() {
+    let mut sys = System::empty();
+    sys.formulas_mut()
+        .push(Arc::new(Guarded::Atom(ProtoAtom::Last(var_term(
+            BVar::Bound(0),
+        )))));
+    system_to_term(&sys);
 }
 
 // -- The equation store, continued -------------------------------------------
@@ -1209,7 +1337,7 @@ fn witnesses_of_different_alternatives_are_independent() {
 /// A witness's name starts with a NUL, which no variable of a theory or of
 /// the solver has; a free variable that did would be confused with one.
 #[test]
-#[should_panic(expected = "named like a witness")]
+#[should_panic(expected = "named like a witness or a bound variable")]
 fn a_free_variable_named_like_a_witness_panics() {
     let sys = ku_goal_system(vec![v(LVar::new("\0w0.0", LSort::Msg, 0))]);
     system_to_term(&sys);

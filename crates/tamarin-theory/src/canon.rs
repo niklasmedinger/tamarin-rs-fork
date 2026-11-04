@@ -97,11 +97,13 @@ pub fn rule_id(ru: &RuleACInst) -> RuleId {
 // deduplicated (`gconj`/`gdisj`) and sorted, the sides of `=` ordered, a
 // quantifier's guards sorted, terms rebuilt by the smart constructors (AC
 // operands flattened and sorted, `em`'s arguments sorted), binder display
-// names and fact annotations erased. Bound variables are de Bruijn indices, so
-// only their position counts, and the order inside a binder block stays
-// significant. A formula without free variables becomes one constant of the
-// system term; the free variables of the others are renamed with the rest of
-// the system term, which sorts the AC parts again afterwards.
+// names and fact annotations erased. Bound variables are still de Bruijn
+// indices here; the system term makes each quantifier block a commutative
+// binder over variables of its own (`canon_term_graph`), so neither the names
+// nor the order of a block's variables count there. A part of a formula
+// without any variable or binder becomes one constant of the system term; the
+// variables of the rest, free and bound, are renamed with the rest of the
+// system term, which sorts the AC parts again afterwards.
 
 use crate::atom::{Atom, ProtoAtom};
 use crate::fact::Fact;
@@ -162,8 +164,8 @@ fn sort_items(g: Guarded) -> Guarded {
 /// a quantifier's guards sorted, and `Conj`/`Disj` children flattened,
 /// deduplicated ([`guarded::gconj`]/[`guarded::gdisj`]) and sorted, all by
 /// the derived (Haskell) order on formulas. Every quantifier's binder list
-/// also has its display names erased: only a binder's de Bruijn position
-/// means anything (see the section docs).
+/// also has its display names erased: they are printing hints (see the
+/// section docs).
 pub fn ac_normalize_guarded(g: &Guarded) -> Guarded {
     match g {
         Guarded::Atom(a) => Guarded::Atom(normalize_atom(a)),
@@ -390,9 +392,20 @@ pub fn pre_canonical_proof_method(method: &ProofMethod, sys: &System) -> PreCano
                 .unwrap_or_else(|| panic!("split goal {id:?} names no EqDisj in eq_store.conj"));
             CanonicalProofMethod::SolveSplit(eq_disj_term(&sys.eq_store().conj[index], index))
         }
-        ProofMethod::SolveGoal(goal) => CanonicalProofMethod::Solve(
-            goal_term(goal).expect("only Goal::Split has no goal term, handled above"),
-        ),
+        ProofMethod::SolveGoal(goal) => {
+            // A disjunction's bound variables are named by where it stands
+            // among the goals (`canon_term_graph::goal_term`); the goals hold
+            // each goal once.
+            let index = matches!(goal, Goal::Disj(_)).then(|| {
+                sys.goals
+                    .iter()
+                    .position(|(g, _)| g == goal)
+                    .unwrap_or_else(|| panic!("disjunction goal {goal:?} is not among the goals"))
+            });
+            CanonicalProofMethod::Solve(
+                goal_term(goal, index).expect("only Goal::Split has no goal term, handled above"),
+            )
+        }
         ProofMethod::Invalidated => {
             panic!("{method:?} is display-only and never a candidate proof method")
         }
@@ -805,6 +818,54 @@ mod tests {
     fn a_split_method_naming_no_disjunction_panics() {
         let _ = canonicalize_proof_method(
             &ProofMethod::SolveGoal(Goal::Split(SplitId(9))),
+            &System::empty(),
+            &CanonLabelling::empty(),
+        );
+    }
+
+    /// A disjunction goal's bound variables are named by where the goal
+    /// stands among the goals, so its method is renamed like its system:
+    /// two systems whose disjunction goals stand elsewhere, order a block
+    /// differently and name their variables differently have equal forms
+    /// and equal methods.
+    #[test]
+    fn disjunction_goals_with_permuted_blocks_canonicalize_equally() {
+        if !bliss_available() {
+            return;
+        }
+        use crate::constraint::constraints::Disj;
+        let solve = |disj_first: bool, alternatives: [&str; 2]| {
+            let disj = Goal::Disj(Disj(alternatives.iter().map(|f| g(f)).collect()));
+            let action = Goal::Action(node(3), crate::fact::ku_fact(zero_ary_fun_term("m")));
+            let mut goals = vec![
+                (action, GoalStatus::default()),
+                (disj.clone(), GoalStatus::default()),
+            ];
+            if disj_first {
+                goals.reverse();
+            }
+            let mut sys = System::empty();
+            sys.content_mut().goals = Arc::new(goals);
+            let (canon, labelling) =
+                canonicalize_constraint_system_with_labelling(&sys).expect("canonicalize");
+            let method = canonicalize_proof_method(&ProofMethod::SolveGoal(disj), &sys, &labelling);
+            (canon, method)
+        };
+        let a = solve(
+            false,
+            ["All x y #i. P(x, y, z.1) @ #i ==> F", "Q(z.1) @ #k"],
+        );
+        let b = solve(true, ["All y x #j. P(x, y, w.4) @ #j ==> F", "Q(w.4) @ #l"]);
+        assert!(matches!(a.1, CanonicalProofMethod::Solve(_)));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not among the goals")]
+    fn a_disjunction_method_naming_no_goal_panics() {
+        let disj = Goal::Disj(crate::constraint::constraints::Disj(vec![g("Q(z.1) @ #k")]));
+        let _ = canonicalize_proof_method(
+            &ProofMethod::SolveGoal(disj),
             &System::empty(),
             &CanonLabelling::empty(),
         );

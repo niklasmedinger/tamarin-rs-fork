@@ -40,7 +40,7 @@
 //! [`STerm`] is a term over a signature of [`Op`]s, each free (ordered
 //! arguments), AC (a multiset of arguments, nested applications flattened)
 //! or C (two unordered arguments), plus commutative binders
-//! ([`STerm::Exists`]). `LNTerm` cannot hold it: it has no binders, and its
+//! ([`STerm::Binder`]). `LNTerm` cannot hold it: it has no binders, and its
 //! AC symbols belong to the theory.
 //!
 //! ```text
@@ -55,7 +55,8 @@
 //! witness binder every range variable of the equation store's
 //! alternatives, each renamed apart as a witness of its own alternative
 //! ([`Scope`] says why binding them at the top is the same as binding them
-//! in their alternative).
+//! in their alternative). Inside formulas, each quantifier block is a binder
+//! of its own, where it stands ([`Scope::Quantifier`]).
 //!
 //! **Collections.** A field that is a `Vec` in `System` is a multiset: an AC
 //! operator keeps duplicates as separate arguments, because the solver
@@ -69,8 +70,7 @@
 //! `ac_normalize_guarded` deduplicates). Deduplicating modulo AC before
 //! renaming equals deduplicating after it, since the renaming is a bijection.
 //! Sequences stay ordered: a rule's premises/actions/conclusions (edges and
-//! goals refer to their indices), arguments of free symbols, and a
-//! quantifier's binders (de Bruijn indices refer to their positions).
+//! goals refer to their indices) and arguments of free symbols.
 //!
 //! **Field audit** (CONVENTIONS rule 3; PLAN.md's field audit):
 //!
@@ -90,20 +90,27 @@
 //! | `source_kind`, `side` | `System`'s label |
 //! | `next_goal_nr`, caches | excluded (PLAN.md's field audit) |
 //!
-//! Formulas keep their de Bruijn indices as constants, so a quantifier
-//! block's binder order stays significant: two formulas differing only in it
-//! get different forms, a missed merge.
+//! A quantifier block `∀ x̄. guards ⇒ body` (or `∃ x̄. guards ∧ body`) is
+//! `λ x̄. All(Guards{…}, body)` (or `Ex`): a commutative binder over the
+//! block's variables, where the block stands, so neither the names nor the
+//! order of a block's variables count, as for the logic's quantifiers. A
+//! formula arrives with de Bruijn indices; each index becomes an occurrence
+//! of the variable it refers to ([`VarRef::Bound`]), raw-named by where the
+//! formula stands ([`Site`]) and renamed by θ like the free variables. A
+//! block without variables gets no binder.
 //! `Conj`/`Disj` and a quantifier's guards are AC and `=` is C. A formula's
 //! terms and facts are written like the system's (`Fun(f)`, `Fact[tag]`), with
-//! a free variable as the same variable and a bound one as its de Bruijn
-//! index.
+//! a free variable as the same variable.
 //!
-//! **Closed subterms** (an `LNTerm`, fact, formula, atom or formula term
-//! without a free variable) become one constant keyed by the fingerprint of
-//! their AC normal form (for the formula parts: of their translation,
-//! normalized): two of them are equal modulo AC iff their normal forms are,
-//! and no renaming touches them. This keeps lemmas and ground terms down to
-//! one vertex each.
+//! **Closed subterms** (an `LNTerm` or fact without a variable; a formula,
+//! atom, formula fact or formula term whose translation has no variable and
+//! no binder) become one constant keyed by the fingerprint of their AC
+//! normal form (for the formula parts: of their translation, normalized):
+//! two of them are equal modulo AC iff their normal forms are, and no
+//! renaming touches them. This keeps ground terms down to one vertex each. A
+//! formula with a quantifier block is never closed in this sense, even
+//! without free variables: its binder's variable vertices need their edges
+//! to their occurrences, and a fingerprint would fix the order of the block.
 //!
 //! # Step 2: the term as a colored digraph
 //!
@@ -140,13 +147,15 @@
 //!
 //! # Step 3: the names and the form
 //!
-//! bliss's canonical labeling orders the graph's vertices. The free variables
-//! and the witnesses (the two binders' variable vertices) are named per sort
-//! in that order (`mv0`, `fv0`, `tv0`, …): that is θ. The form is the system
-//! term without its two binders, renamed by θ ([`rename`]) and normalized
-//! ([`normalize`]): AC operators flattened and their arguments sorted, C
-//! arguments sorted, duplicates kept. A witness stays a `VarRef::Witness` in
-//! the form.
+//! bliss's canonical labeling orders the graph's vertices. The free
+//! variables, the witnesses and the quantifiers' bound variables (the
+//! binders' variable vertices) are named per sort in that order (`mv0`,
+//! `fv0`, `tv0`, …): that is θ. The form is the system term without its two
+//! top binders, renamed by θ ([`rename`]) and normalized ([`normalize`]): AC
+//! operators flattened and their arguments sorted, C arguments sorted, a
+//! binder's variables sorted, duplicates kept. A witness stays a
+//! `VarRef::Witness` in the form, and a bound variable a `VarRef::Bound`
+//! under its binder.
 //!
 //! Any other canonical labeling is this one composed with an automorphism of
 //! the graph. Under a faithful encoding every automorphism is a symmetry of
@@ -155,11 +164,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tamarin_term::alpha_eq_ac::{rename_var, CanonLabelling};
 use tamarin_term::fingerprint::fingerprint_term;
 use tamarin_term::function_symbols::FunSym;
+use tamarin_term::intern::intern_str;
 use tamarin_term::lterm::{BVar, HasFrees, LNTerm, LSort, LVar, Name};
 use tamarin_term::term::Term;
 use tamarin_term::vterm::Lit;
@@ -191,22 +202,26 @@ pub enum STerm {
     App(Op, Vec<STerm>),
     Var(VarRef),
     Const(ConstKey),
-    /// A commutative binder `∃ x1 … xn. body`.
-    Exists(Scope, Vec<LVar>, Box<STerm>),
+    /// A commutative binder over `x1 … xn`: the order of the variables does
+    /// not count. Which binder it is, and so what it binds, is its [`Scope`].
+    Binder(Scope, Vec<LVar>, Box<STerm>),
 }
 
-/// A variable occurrence: a free variable of the system, or a witness, a
-/// range variable of an equation-store alternative renamed apart from every
-/// other variable ([`witness`]). Both are bound at the top of the system
-/// term, by different binders ([`Scope`]).
+/// A variable occurrence: a free variable of the system; a witness, a range
+/// variable of an equation-store alternative renamed apart from every other
+/// variable ([`witness`]); or a variable of a formula's quantifier block,
+/// raw-named by where the formula stands ([`Site`]). Each is bound by its
+/// own kind of binder ([`Scope`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VarRef {
     Free(LVar),
     Witness(LVar),
+    Bound(LVar),
 }
 
-/// Which binder an [`STerm::Exists`] is. Both sit at the top of the system
-/// term, the witness binder directly under the root binder.
+/// Which binder an [`STerm::Binder`] is. The root and witness binders sit at
+/// the top of the system term, the witness binder directly under the root
+/// binder; a quantifier binder sits where its block is.
 ///
 /// A range variable of an equation-store alternative exists only in that
 /// alternative. Renamed apart ([`witness`]), it occurs only in its
@@ -223,21 +238,49 @@ pub enum Scope {
     Root,
     /// Binds every witness of the equation store.
     Witnesses,
+    /// Binds the variables of one quantifier block of a formula.
+    Quantifier,
 }
 
-/// The first character of a witness's name ([`witness`]). No variable of a
-/// theory or of the solver contains a NUL, so no witness can coincide with
-/// one ([`Translator::free_var`] checks it).
-const WITNESS_MARK: char = '\0';
+/// The first character of a witness's raw name ([`witness`]) and of a bound
+/// variable's ([`Site::name`]). No variable of a theory or of the solver
+/// contains a NUL, so neither can coincide with one
+/// ([`Translator::free_var`] checks it).
+const LOCAL_MARK: char = '\0';
 
 /// The witness for the `k`-th range variable `v` (in raw order) of
 /// alternative `a` of the equation store's disjunction `d`: `v`'s sort and a
 /// name determined by `(d, a, k)` alone. Distinct for every alternative and
 /// every variable in it, and the same whenever the disjunction is translated,
-/// so a disjunction translated on its own ([`canonical_eq_disj`]) gets the
+/// so a disjunction translated on its own ([`eq_disj_term`]) gets the
 /// witnesses it has in its system's term.
 fn witness(d: usize, a: usize, k: usize, v: LVar) -> LVar {
-    LVar::new(format!("{WITNESS_MARK}w{d}.{a}"), v.sort, k as u64)
+    LVar::new(format!("{LOCAL_MARK}w{d}.{a}"), v.sort, k as u64)
+}
+
+/// Where a formula stands in the system term, which names its quantifiers'
+/// bound variables: the `k`-th variable the formula's blocks bind, in
+/// translation order, is named [`Site::name`], with its sort and index `k`.
+/// Distinct for every binder of the system term, and the same whenever the
+/// formula is translated, so a disjunction goal translated on its own
+/// ([`goal_term`]) gets the bound variables it has in its system's term.
+#[derive(Debug, Clone, Copy)]
+enum Site {
+    /// Entry `i` of a formula section.
+    Formula(Section, usize),
+    /// Alternative `a` of the disjunction goal at index `g` of the goals.
+    Goal(usize, usize),
+}
+
+impl Site {
+    /// The raw name of the bound variables of the formula here.
+    fn name(self) -> &'static str {
+        let name = match self {
+            Site::Formula(section, i) => format!("{LOCAL_MARK}b{section:?}.{i}"),
+            Site::Goal(g, a) => format!("{LOCAL_MARK}b{:?}.{g}.{a}", Section::Goals),
+        };
+        intern_str(&name)
+    }
 }
 
 /// How an operator treats its arguments.
@@ -307,11 +350,10 @@ pub enum Op {
     // Formulas (`Guarded`) ...
     GConj,
     GDisj,
-    /// A quantifier block: existential or not, and the sorts of its binders
-    /// in order.
+    /// A quantifier block, existential or not, under the binder of its
+    /// variables (their sorts are the binder's).
     GQuant {
         ex: bool,
-        sorts: Vec<LSort>,
     },
     GGuards,
     GEq,
@@ -345,6 +387,7 @@ pub enum ClosedKind {
     Fact,
     Formula,
     Atom,
+    FormulaFact,
     FormulaTerm,
 }
 
@@ -354,8 +397,6 @@ pub enum ConstKey {
     /// A name (`'a'`, `~'n'`, `%'n'`), in a system term or a formula: names
     /// are constants.
     Name(Name),
-    /// A de Bruijn index: a bound occurrence in a formula.
-    DeBruijn(u64),
     NoLast,
     /// A subterm without free variables, by the fingerprint of its AC normal
     /// form (see the module docs).
@@ -422,10 +463,7 @@ pub fn system_to_term(sys: &System) -> STerm {
 
     let mut free: BTreeSet<LVar> = BTreeSet::new();
     let mut witnesses: BTreeSet<LVar> = BTreeSet::new();
-    let mut tr = Translator {
-        free: &mut free,
-        witnesses: &mut witnesses,
-    };
+    let mut tr = Translator::new(&mut free, &mut witnesses);
 
     let nodes = nodes
         .iter()
@@ -457,9 +495,15 @@ pub fn system_to_term(sys: &System) -> STerm {
         Some(nid) => STerm::App(Op::Last, vec![tr.free_var(nid)]),
         None => STerm::Const(ConstKey::NoLast),
     };
-    let formulas = formulas.iter().map(|f| tr.formula(f)).collect();
-    let solved_formulas = solved_formulas.iter().map(|f| tr.formula(f)).collect();
-    let lemmas = lemmas.iter().map(|f| tr.formula(f)).collect();
+    let section_formulas = |tr: &mut Translator, s: Section, fs: &[Arc<Guarded>]| {
+        fs.iter()
+            .enumerate()
+            .map(|(i, f)| tr.formula(f, Site::Formula(s, i)))
+            .collect()
+    };
+    let formulas = section_formulas(&mut tr, Section::Formulas, formulas);
+    let solved_formulas = section_formulas(&mut tr, Section::SolvedFormulas, solved_formulas);
+    let lemmas = section_formulas(&mut tr, Section::Lemmas, lemmas);
 
     let eq_subst = subst
         .iter()
@@ -497,17 +541,21 @@ pub fn system_to_term(sys: &System) -> STerm {
 
     let goals = goals
         .iter()
+        .enumerate()
         .filter_map(
             |(
-                goal,
-                GoalStatus {
-                    solved,
-                    // Heuristic and path-dependent bookkeeping.
-                    looping: _,
-                    nr: _,
-                },
+                index,
+                (
+                    goal,
+                    GoalStatus {
+                        solved,
+                        // Heuristic and path-dependent bookkeeping.
+                        looping: _,
+                        nr: _,
+                    },
+                ),
             )| {
-                tr.goal(goal)
+                tr.goal(goal, Some(index))
                     .map(|payload| STerm::App(Op::Goal { solved: *solved }, vec![payload]))
             },
         )
@@ -537,12 +585,12 @@ pub fn system_to_term(sys: &System) -> STerm {
             section(Section::Goals, goals),
         ],
     );
-    let body = STerm::Exists(
+    let body = STerm::Binder(
         Scope::Witnesses,
         witnesses.into_iter().collect(),
         Box::new(body),
     );
-    STerm::Exists(Scope::Root, free.into_iter().collect(), Box::new(body))
+    STerm::Binder(Scope::Root, free.into_iter().collect(), Box::new(body))
 }
 
 /// The AC normal form of `t` (the smart constructors re-sort AC arguments
@@ -555,13 +603,28 @@ fn ac_normal(t: &LNTerm) -> LNTerm {
 struct Translator<'a> {
     free: &'a mut BTreeSet<LVar>,
     witnesses: &'a mut BTreeSet<LVar>,
+    /// In a formula: the raw name of its bound variables ([`Site`]) and how
+    /// many it has bound so far.
+    site: Option<(&'static str, u64)>,
+    /// The variables of the enclosing quantifier blocks, innermost last: de
+    /// Bruijn index `i` refers to `bound[bound.len() - 1 - i]`.
+    bound: Vec<LVar>,
 }
 
-impl Translator<'_> {
+impl<'a> Translator<'a> {
+    fn new(free: &'a mut BTreeSet<LVar>, witnesses: &'a mut BTreeSet<LVar>) -> Self {
+        Translator {
+            free,
+            witnesses,
+            site: None,
+            bound: Vec::new(),
+        }
+    }
+
     fn free_var(&mut self, v: LVar) -> STerm {
         assert!(
-            !v.name.starts_with(WITNESS_MARK),
-            "a free variable of the system is named like a witness: {v:?}"
+            !v.name.starts_with(LOCAL_MARK),
+            "a free variable of the system is named like a witness or a bound variable: {v:?}"
         );
         self.free.insert(v);
         STerm::Var(VarRef::Free(v))
@@ -629,17 +692,18 @@ impl Translator<'_> {
         }
     }
 
-    /// One formula, translated in the form `ac_normalize_guarded` gives it
-    /// (deduplicated conjunctions and disjunctions, binder names erased).
-    fn formula(&mut self, g: &Guarded) -> STerm {
-        self.guarded(&crate::canon::ac_normalize_guarded(g))
+    /// One formula, standing at `site`, translated in the form
+    /// `ac_normalize_guarded` gives it (deduplicated conjunctions and
+    /// disjunctions, binder names erased).
+    fn formula(&mut self, g: &Guarded, site: Site) -> STerm {
+        self.site = Some((site.name(), 0));
+        let t = self.guarded(&crate::canon::ac_normalize_guarded(g));
+        self.site = None;
+        t
     }
 
     fn guarded(&mut self, g: &Guarded) -> STerm {
-        if !has_free(g) {
-            return closed(ClosedKind::Formula, self.guarded_parts(g));
-        }
-        self.guarded_parts(g)
+        closed_if_ground(ClosedKind::Formula, self.guarded_parts(g))
     }
 
     fn guarded_parts(&mut self, g: &Guarded) -> STerm {
@@ -657,23 +721,57 @@ impl Translator<'_> {
                 guards,
                 body,
             } => {
-                let op = Op::GQuant {
-                    ex: matches!(qua, Quantifier::Ex),
-                    // Binder names are display hints; bound occurrences
-                    // are de Bruijn indices.
-                    sorts: vars.iter().map(|(_, sort)| *sort).collect(),
-                };
+                // Binder names are display hints: each variable of the block
+                // gets the next raw name of the formula's site.
+                let block: Vec<LVar> = vars.iter().map(|(_, sort)| self.bind_next(*sort)).collect();
+                self.bound.extend(&block);
                 let guards = STerm::App(Op::GGuards, guards.iter().map(|a| self.atom(a)).collect());
-                STerm::App(op, vec![guards, self.guarded(body)])
+                let quantified = STerm::App(
+                    Op::GQuant {
+                        ex: matches!(qua, Quantifier::Ex),
+                    },
+                    vec![guards, self.guarded(body)],
+                );
+                self.bound.truncate(self.bound.len() - block.len());
+                if block.is_empty() {
+                    quantified
+                } else {
+                    STerm::Binder(Scope::Quantifier, block, Box::new(quantified))
+                }
             }
         }
     }
 
+    /// A new bound variable of `sort` for the formula being translated.
+    fn bind_next(&mut self, sort: LSort) -> LVar {
+        let (name, next) = self
+            .site
+            .as_mut()
+            .expect("a quantifier block outside a formula");
+        let v = LVar {
+            name,
+            sort,
+            idx: *next,
+        };
+        *next += 1;
+        v
+    }
+
+    /// The variable de Bruijn index `i` refers to. An index past the
+    /// enclosing blocks panics: a formula of the system is never open.
+    fn bound_var(&self, i: u64) -> LVar {
+        let depth = self.bound.len();
+        usize::try_from(i)
+            .ok()
+            .and_then(|i| depth.checked_sub(i + 1))
+            .map(|j| self.bound[j])
+            .unwrap_or_else(|| {
+                panic!("de Bruijn index {i} under {depth} bound variable(s): an open formula")
+            })
+    }
+
     fn atom(&mut self, a: &Atom<BLNTerm>) -> STerm {
-        if !has_free(a) {
-            return closed(ClosedKind::Atom, self.atom_parts(a));
-        }
-        self.atom_parts(a)
+        closed_if_ground(ClosedKind::Atom, self.atom_parts(a))
     }
 
     fn atom_parts(&mut self, a: &Atom<BLNTerm>) -> STerm {
@@ -698,30 +796,21 @@ impl Translator<'_> {
     /// are left out (see the module docs).
     fn formula_fact(&mut self, fact: &Fact<BLNTerm>) -> STerm {
         let (tag, terms) = fact.canon_parts();
-        STerm::App(
-            Op::Fact(*tag),
-            terms.iter().map(|t| self.formula_term(t)).collect(),
-        )
+        let args = terms.iter().map(|t| self.formula_term(t)).collect();
+        closed_if_ground(ClosedKind::FormulaFact, STerm::App(Op::Fact(*tag), args))
     }
 
     /// A term of a formula, written like a term of the system, with a bound
-    /// variable as its de Bruijn index.
+    /// variable as the variable of its block.
     fn formula_term(&mut self, t: &BLNTerm) -> STerm {
-        if matches!(t, Term::App(..)) && !has_free(t) {
-            return closed(ClosedKind::FormulaTerm, self.formula_term_parts(t));
-        }
-        self.formula_term_parts(t)
-    }
-
-    fn formula_term_parts(&mut self, t: &BLNTerm) -> STerm {
         match t {
             Term::Lit(Lit::Var(BVar::Free(v))) => self.free_var(*v),
-            Term::Lit(Lit::Var(BVar::Bound(i))) => STerm::Const(ConstKey::DeBruijn(*i)),
+            Term::Lit(Lit::Var(BVar::Bound(i))) => STerm::Var(VarRef::Bound(self.bound_var(*i))),
             Term::Lit(Lit::Con(n)) => STerm::Const(ConstKey::Name(*n)),
-            Term::App(sym, args) => STerm::App(
-                Op::Fun(*sym),
-                args.iter().map(|a| self.formula_term(a)).collect(),
-            ),
+            Term::App(sym, args) => {
+                let args = args.iter().map(|a| self.formula_term(a)).collect();
+                closed_if_ground(ClosedKind::FormulaTerm, STerm::App(Op::Fun(*sym), args))
+            }
         }
     }
 
@@ -766,7 +855,10 @@ impl Translator<'_> {
     }
 
     /// One goal's payload; `None` for a `Split` goal (see the module docs).
-    fn goal(&mut self, goal: &Goal) -> Option<STerm> {
+    /// `index` is the goal's position among its system's goals, which names
+    /// a disjunction's bound variables ([`Site::Goal`]); a disjunction goal
+    /// without it panics.
+    fn goal(&mut self, goal: &Goal, index: Option<usize>) -> Option<STerm> {
         Some(match goal {
             Goal::Split(_) => return None,
             Goal::Action(nid, fact) => {
@@ -781,10 +873,18 @@ impl Translator<'_> {
                 let args = vec![self.free_var(*nid), self.fact(fact)];
                 STerm::App(Op::GoalPremise(prem.0), args)
             }
-            Goal::Disj(disj) => STerm::App(
-                Op::GoalDisj,
-                disj.0.iter().map(|g| self.formula(g)).collect(),
-            ),
+            Goal::Disj(disj) => {
+                let index = index.unwrap_or_else(|| {
+                    panic!("a disjunction goal translated without its index among the goals")
+                });
+                let alternatives = disj
+                    .0
+                    .iter()
+                    .enumerate()
+                    .map(|(a, g)| self.formula(g, Site::Goal(index, a)))
+                    .collect();
+                STerm::App(Op::GoalDisj, alternatives)
+            }
             Goal::Subterm((small, big)) => {
                 let args = vec![self.term(small, None), self.term(big, None)];
                 STerm::App(Op::GoalSubterm, args)
@@ -801,17 +901,24 @@ fn is_ground(t: &LNTerm) -> bool {
     }
 }
 
-/// Whether `x` (a formula, atom or formula term) has a free variable.
-fn has_free<T: HasFrees>(x: &T) -> bool {
-    let mut any = false;
-    x.for_each_free(&mut |_| any = true);
-    any
+/// Whether `t` has no variable and no binder: then no renaming touches it.
+fn is_ground_sterm(t: &STerm) -> bool {
+    match t {
+        STerm::Const(_) => true,
+        STerm::Var(_) | STerm::Binder(..) => false,
+        STerm::App(_, args) => args.iter().all(is_ground_sterm),
+    }
 }
 
-/// The constant for a subterm without free variables: the fingerprint of its
-/// translation, normalized (see the module docs).
-fn closed(kind: ClosedKind, t: STerm) -> STerm {
-    STerm::Const(ConstKey::Closed(kind, fingerprint_sterm(&normalize(t))))
+/// `t`, the translation of a part of a formula, or, if it has no variable
+/// and no binder, the constant for it: the fingerprint of `t`, normalized
+/// (see the module docs).
+fn closed_if_ground(kind: ClosedKind, t: STerm) -> STerm {
+    if is_ground_sterm(&t) {
+        STerm::Const(ConstKey::Closed(kind, fingerprint_sterm(&normalize(t))))
+    } else {
+        t
+    }
 }
 
 // =============================================================================
@@ -847,6 +954,9 @@ pub struct TermGraph {
     /// The witness binder's variable vertices: the equation store's
     /// witnesses.
     pub witness_vars: Vec<(usize, LVar)>,
+    /// The quantifier binders' variable vertices: the formulas' bound
+    /// variables.
+    pub bound_vars: Vec<(usize, LVar)>,
     /// Each vertex's parent in the term (a variable vertex's is its binder,
     /// an occurrence's the application it is an argument of); `None` for the
     /// root.
@@ -905,13 +1015,15 @@ impl GraphBuilder {
                 let (v, scope) = match r {
                     VarRef::Free(v) => (v, Scope::Root),
                     VarRef::Witness(v) => (v, Scope::Witnesses),
+                    VarRef::Bound(v) => (v, Scope::Quantifier),
                 };
+                // The innermost enclosing binder of its kind that binds it.
                 let w = self
                     .scopes
                     .iter()
                     .rev()
-                    .find(|(s, _)| *s == scope)
-                    .and_then(|(_, vars)| vars.get(v))
+                    .filter(|(s, _)| *s == scope)
+                    .find_map(|(_, vars)| vars.get(v))
                     .copied();
                 let w = w.unwrap_or_else(|| {
                     panic!("term_to_graph: no binder binds {r:?} -- system_to_term missed {v}")
@@ -946,7 +1058,7 @@ impl GraphBuilder {
                 }
                 me
             }
-            STerm::Exists(scope, vars, body) => {
+            STerm::Binder(scope, vars, body) => {
                 let me = self.vertex(Label::Binder(*scope), pos);
                 let mut bound = BTreeMap::new();
                 for v in vars {
@@ -956,6 +1068,7 @@ impl GraphBuilder {
                     match scope {
                         Scope::Root => self.graph.free_vars.push((w, *v)),
                         Scope::Witnesses => self.graph.witness_vars.push((w, *v)),
+                        Scope::Quantifier => self.graph.bound_vars.push((w, *v)),
                     }
                 }
                 self.scopes.push((*scope, bound));
@@ -987,17 +1100,15 @@ fn flatten<'t>(op: &Op, args: &'t [STerm], out: &mut Vec<&'t STerm>) {
 // the whole normalized modulo the AC and C operators: the canonical form.
 
 /// θ from a labeling that puts vertex `w` at canonical position
-/// `position(w)`: the free variables and the witnesses, named per sort
-/// (`mv0`, `fv0`, `tv0`, …) in the order of their vertices' positions.
+/// `position(w)`: the free variables, the witnesses and the bound variables,
+/// named per sort (`mv0`, `fv0`, `tv0`, …) in the order of their vertices'
+/// positions.
 fn labelling_from_positions(
     graph: &TermGraph,
     position: impl Fn(usize) -> usize,
 ) -> CanonLabelling {
-    let mut vars: Vec<(usize, LVar)> = graph
-        .free_vars
-        .iter()
-        .chain(&graph.witness_vars)
-        .map(|&(w, v)| (position(w), v))
+    let mut vars: Vec<(usize, LVar)> = variable_vertices(graph)
+        .map(|(w, v)| (position(w), v))
         .collect();
     vars.sort();
     let mut labelling = CanonLabelling::empty();
@@ -1007,18 +1118,30 @@ fn labelling_from_positions(
     labelling
 }
 
-/// `t` with every variable, free or witness, renamed by `theta`. A variable
-/// `theta` does not cover panics ([`rename_var`]): the labelling names every
-/// variable of the system term, so a miss is a translation bug.
+/// Every binder's variable vertices with their variables: the free
+/// variables, the witnesses and the bound variables.
+fn variable_vertices(graph: &TermGraph) -> impl Iterator<Item = (usize, LVar)> + '_ {
+    graph
+        .free_vars
+        .iter()
+        .chain(&graph.witness_vars)
+        .chain(&graph.bound_vars)
+        .copied()
+}
+
+/// `t` with every variable, free, witness or bound, renamed by `theta`. A
+/// variable `theta` does not cover panics ([`rename_var`]): the labelling
+/// names every variable of the system term, so a miss is a translation bug.
 pub fn rename(t: &STerm, theta: &BTreeMap<LVar, LVar>) -> STerm {
     match t {
         STerm::Var(VarRef::Free(v)) => STerm::Var(VarRef::Free(rename_var(theta, *v))),
         STerm::Var(VarRef::Witness(v)) => STerm::Var(VarRef::Witness(rename_var(theta, *v))),
+        STerm::Var(VarRef::Bound(v)) => STerm::Var(VarRef::Bound(rename_var(theta, *v))),
         STerm::Const(_) => t.clone(),
         STerm::App(op, args) => {
             STerm::App(op.clone(), args.iter().map(|a| rename(a, theta)).collect())
         }
-        STerm::Exists(scope, vars, body) => STerm::Exists(
+        STerm::Binder(scope, vars, body) => STerm::Binder(
             *scope,
             vars.iter().map(|v| rename_var(theta, *v)).collect(),
             Box::new(rename(body, theta)),
@@ -1056,9 +1179,9 @@ pub fn normalize(t: STerm) -> STerm {
                 }
             }
         }
-        STerm::Exists(scope, mut vars, body) => {
+        STerm::Binder(scope, mut vars, body) => {
             vars.sort();
-            STerm::Exists(scope, vars, Box::new(normalize(*body)))
+            STerm::Binder(scope, vars, Box::new(normalize(*body)))
         }
         t @ (STerm::Var(_) | STerm::Const(_)) => t,
     }
@@ -1079,12 +1202,12 @@ pub fn fingerprint_sterm(t: &STerm) -> Fingerprint {
 // =============================================================================
 
 /// The name every variable takes in [`abstract_vars`]. It starts with a NUL,
-/// like a witness ([`WITNESS_MARK`]), so it names no variable of a theory or
+/// like a witness ([`LOCAL_MARK`]), so it names no variable of a theory or
 /// of the solver; it only ever meets other placeholders, in a hash.
 const PLACEHOLDER: &str = "\0sort";
 
-/// How often each variable, free or witness, occurs in a term; a binder's
-/// variables are not occurrences.
+/// How often each variable, free, witness or bound, occurs in a term; a
+/// binder's variables are not occurrences.
 type Occurrences = FastMap<VarRef, u64>;
 
 fn count_occurrences(t: &STerm, counts: &mut Occurrences) {
@@ -1092,14 +1215,14 @@ fn count_occurrences(t: &STerm, counts: &mut Occurrences) {
         STerm::Var(v) => *counts.entry(*v).or_insert(0) += 1,
         STerm::Const(_) => {}
         STerm::App(_, args) => args.iter().for_each(|a| count_occurrences(a, counts)),
-        STerm::Exists(_, _, body) => count_occurrences(body, counts),
+        STerm::Binder(_, _, body) => count_occurrences(body, counts),
     }
 }
 
 /// The placeholder of `v`: its sort, and in place of an index, how often `v`
 /// occurs.
 fn placeholder(v: VarRef, counts: &Occurrences) -> LVar {
-    let (VarRef::Free(x) | VarRef::Witness(x)) = v;
+    let (VarRef::Free(x) | VarRef::Witness(x) | VarRef::Bound(x)) = v;
     LVar {
         name: PLACEHOLDER,
         sort: x.sort,
@@ -1107,12 +1230,13 @@ fn placeholder(v: VarRef, counts: &Occurrences) -> LVar {
     }
 }
 
-/// `t` with every variable, free or witness, and every binder's variables
-/// replaced by its placeholder: one per sort and number of occurrences in
-/// `t`. A free variable stays a `VarRef::Free` and a witness a
-/// `VarRef::Witness`, as renaming keeps them. Names, de Bruijn indices and
-/// closed subterms are constants and stay. Counts first, in a pass of its
-/// own: a placeholder needs its variable's count before anything sorts it.
+/// `t` with every variable, free, witness or bound, and every binder's
+/// variables replaced by its placeholder: one per sort and number of
+/// occurrences in `t`. A free variable stays a `VarRef::Free`, a witness a
+/// `VarRef::Witness` and a bound variable a `VarRef::Bound`, as renaming
+/// keeps them. Names and closed subterms are constants and stay. Counts
+/// first, in a pass of its own: a placeholder needs its variable's count
+/// before anything sorts it.
 pub fn abstract_vars(t: &STerm) -> STerm {
     let mut counts = Occurrences::default();
     count_occurrences(t, &mut counts);
@@ -1123,19 +1247,21 @@ fn abstract_counted(t: &STerm, counts: &Occurrences) -> STerm {
     match t {
         STerm::Var(v @ VarRef::Free(_)) => STerm::Var(VarRef::Free(placeholder(*v, counts))),
         STerm::Var(v @ VarRef::Witness(_)) => STerm::Var(VarRef::Witness(placeholder(*v, counts))),
+        STerm::Var(v @ VarRef::Bound(_)) => STerm::Var(VarRef::Bound(placeholder(*v, counts))),
         STerm::Const(_) => t.clone(),
         STerm::App(op, args) => STerm::App(
             op.clone(),
             args.iter().map(|a| abstract_counted(a, counts)).collect(),
         ),
-        STerm::Exists(scope, vars, body) => {
-            // The root binder binds the free variables, the other the
-            // witnesses.
+        STerm::Binder(scope, vars, body) => {
+            // The root binder binds the free variables, the witness binder
+            // the witnesses, a quantifier binder bound variables.
             let var_ref = |v: LVar| match scope {
                 Scope::Root => VarRef::Free(v),
                 Scope::Witnesses => VarRef::Witness(v),
+                Scope::Quantifier => VarRef::Bound(v),
             };
-            STerm::Exists(
+            STerm::Binder(
                 *scope,
                 vars.iter()
                     .map(|v| placeholder(var_ref(*v), counts))
@@ -1156,7 +1282,7 @@ fn abstract_counted(t: &STerm, counts: &Occurrences) -> STerm {
 /// the question to bliss. The argument rests on the form alone, not on the
 /// faithfulness claims (A) and (B) of the module docs: a form is
 /// `normalize(rename(body, θ))` for a θ that keeps sorts and keeps free
-/// variables free and witnesses witnesses, so
+/// variables free, witnesses witnesses and bound variables bound, so
 ///
 /// - renaming by θ does not change the abstraction: a variable and its image
 ///   have the same sort and occur equally often, so they get the same
@@ -1166,14 +1292,15 @@ fn abstract_counted(t: &STerm, counts: &Occurrences) -> STerm {
 ///   abstraction is then a substitution, under which equality modulo AC and
 ///   C is preserved, and `normalize` is a normal form for that equality, so
 ///   normalizing before abstracting does not change the result;
-/// - the binders bind exactly the variables of the body, which θ maps one to
-///   one, so their abstracted lists, sorted, agree too.
+/// - θ maps every binder's variables one to one, so their abstracted lists,
+///   sorted, agree too.
 ///
 /// Normalizing after abstracting is what makes it an invariant: `x = 'a'` and
 /// `'a' = x` (`=` is C), or an AC section whose entries are ordered by their
 /// variables' names, abstract to terms that are equal only modulo AC and C.
-/// Witnesses are abstracted for the same reason: their names come from raw
-/// positions in the equation store ([`witness`]).
+/// Witnesses and bound variables are abstracted for the same reason: their
+/// names come from raw positions in the equation store ([`witness`]) and in
+/// the system ([`Site`]).
 ///
 /// Coarser than the form: systems that differ only in how variables that
 /// occur equally often are linked share it: `<x, y>` next to `<'a', <y, x>>`,
@@ -1219,8 +1346,8 @@ pub struct TermGraphStats {
     pub vertices: usize,
     pub edges: usize,
     pub free_vars: usize,
-    /// Whether bliss ran: it is skipped when the system has no free variable
-    /// and no certificate was asked for.
+    /// Whether bliss ran: it is skipped when the system term has no
+    /// variable (free, witness or bound) and no certificate was asked for.
     pub bliss_ran: bool,
     /// `|Aut|` of the term graph, as bliss prints it.
     pub aut_size: Option<String>,
@@ -1228,10 +1355,10 @@ pub struct TermGraphStats {
     pub generators: usize,
     /// Generators that move at least one free-variable vertex.
     pub generators_moving_free_vars: usize,
-    /// Generators that move at least one variable vertex, a free variable's
-    /// or a witness's: the ones that can change θ, and so the ones the
-    /// generator check checks. The others only permute the inside of the
-    /// term (identical AC arguments).
+    /// Generators that move at least one variable vertex, a free variable's,
+    /// a witness's or a bound variable's: the ones that can change θ, and so
+    /// the ones the generator check checks. The others only permute the
+    /// inside of the term (identical AC arguments).
     pub generators_moving_vars: usize,
     /// Generators under which the canonical form changes: each one is a
     /// symmetry of the graph that is not one of the system, i.e. the
@@ -1264,9 +1391,9 @@ pub struct TermGraphStats {
 /// measurements.
 ///
 /// The steps: the term and its graph; bliss's canonical labeling of the
-/// graph; θ names the free variables and the witnesses, per sort, in the
-/// order of their vertices' canonical positions; the form is the term
-/// renamed by θ and normalized.
+/// graph; θ names the free variables, the witnesses and the bound
+/// variables, per sort, in the order of their vertices' canonical positions;
+/// the form is the term renamed by θ and normalized.
 pub fn canonicalize_constraint_system_via_term_graph_with_labelling(
     sys: &System,
     options: TermGraphOptions,
@@ -1296,7 +1423,7 @@ pub fn canonicalize_term(
     stats.free_vars = graph.free_vars.len();
     stats.time_graph = start.elapsed();
 
-    let has_vars = !graph.free_vars.is_empty() || !graph.witness_vars.is_empty();
+    let has_vars = variable_vertices(&graph).next().is_some();
     let mut labeling: Option<Permutation> = None;
     let mut generators: Vec<Permutation> = Vec::new();
     if has_vars || options.certificate {
@@ -1330,12 +1457,7 @@ pub fn canonicalize_term(
     // automorphism: under a symmetry of the system it names the variables
     // differently but gives the same form.
     let start = Instant::now();
-    let variable_vertices: Vec<usize> = graph
-        .free_vars
-        .iter()
-        .chain(&graph.witness_vars)
-        .map(|&(w, _)| w)
-        .collect();
+    let variable_vertices: Vec<usize> = variable_vertices(&graph).map(|(w, _)| w).collect();
     for g in &generators {
         let moves = generator_moves(&graph, g);
         for moved in &moves {
@@ -1420,10 +1542,10 @@ fn label_name(key: &VKey) -> String {
 /// `System[…]` body renamed and normalized. A variable `labelling` does not
 /// name panics.
 fn content_under(term: &STerm, labelling: &CanonLabelling) -> CanonicalSystem {
-    let STerm::Exists(Scope::Root, _, witnesses) = term else {
+    let STerm::Binder(Scope::Root, _, witnesses) = term else {
         panic!("system_to_term built a term without the root binder: {term}")
     };
-    let STerm::Exists(Scope::Witnesses, _, body) = &**witnesses else {
+    let STerm::Binder(Scope::Witnesses, _, body) = &**witnesses else {
         panic!("system_to_term built a term without the witness binder: {term}")
     };
     CanonicalSystem::new(normalize(rename(body, labelling.theta())))
@@ -1432,14 +1554,12 @@ fn content_under(term: &STerm, labelling: &CanonLabelling) -> CanonicalSystem {
 /// `goal` translated like a goal of the system term, without its solved flag,
 /// not renamed yet: [`under`] its system's labelling, it is the goal as the
 /// system's canonical form writes it. `None` for a `Split` goal, which the
-/// form leaves out.
-pub(crate) fn goal_term(goal: &Goal) -> Option<STerm> {
+/// form leaves out. `index` is the goal's position among its system's goals:
+/// a disjunction's bound variables are named by it ([`Site::Goal`]), and a
+/// disjunction goal without it panics; no other goal has bound variables.
+pub(crate) fn goal_term(goal: &Goal, index: Option<usize>) -> Option<STerm> {
     let (mut free, mut witnesses) = (BTreeSet::new(), BTreeSet::new());
-    let mut tr = Translator {
-        free: &mut free,
-        witnesses: &mut witnesses,
-    };
-    tr.goal(goal)
+    Translator::new(&mut free, &mut witnesses).goal(goal, index)
 }
 
 /// `disj`, the equation store's disjunction number `conj_index`, translated
@@ -1448,11 +1568,7 @@ pub(crate) fn goal_term(goal: &Goal) -> Option<STerm> {
 /// system's canonical form writes it.
 pub(crate) fn eq_disj_term(disj: &EqDisj, conj_index: usize) -> STerm {
     let (mut free, mut witnesses) = (BTreeSet::new(), BTreeSet::new());
-    let mut tr = Translator {
-        free: &mut free,
-        witnesses: &mut witnesses,
-    };
-    tr.eq_disj(conj_index, disj)
+    Translator::new(&mut free, &mut witnesses).eq_disj(conj_index, disj)
 }
 
 /// A part of a system's term (a goal, a disjunction) as the system's
@@ -1500,15 +1616,19 @@ impl fmt::Display for STerm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             STerm::Var(VarRef::Free(v)) => write!(f, "{v}"),
-            // A raw witness's name starts with a NUL.
-            STerm::Var(VarRef::Witness(v)) => {
-                write!(f, "{}", v.to_string().replace(WITNESS_MARK, "?"))
+            // A raw witness's or bound variable's name starts with a NUL.
+            STerm::Var(VarRef::Witness(v) | VarRef::Bound(v)) => {
+                write!(f, "{}", v.to_string().replace(LOCAL_MARK, "?"))
             }
             STerm::Const(c) => write!(f, "⟨{c}⟩"),
-            STerm::Exists(scope, vars, body) => {
-                write!(f, "∃_{scope:?}")?;
+            STerm::Binder(scope, vars, body) => {
+                match scope {
+                    // The block's quantifier is the `All`/`Ex` under it.
+                    Scope::Quantifier => write!(f, "λ")?,
+                    Scope::Root | Scope::Witnesses => write!(f, "∃_{scope:?}")?,
+                }
                 for v in vars {
-                    write!(f, " {}", v.to_string().replace(WITNESS_MARK, "?"))?;
+                    write!(f, " {}", v.to_string().replace(LOCAL_MARK, "?"))?;
                 }
                 write!(f, ". {body}")
             }
@@ -1551,10 +1671,7 @@ impl fmt::Display for Op {
             Op::GoalChain(c, p) => write!(f, "ChainG[{c},{p}]"),
             Op::GoalPremise(p) => write!(f, "PremiseG[{p}]"),
             Op::Goal { solved } => write!(f, "Goal[{}]", if *solved { "solved" } else { "open" }),
-            Op::GQuant { ex, sorts } => {
-                let sorts: Vec<String> = sorts.iter().map(|s| format!("{s:?}")).collect();
-                write!(f, "{}[{}]", if *ex { "Ex" } else { "All" }, sorts.join(","))
-            }
+            Op::GQuant { ex } => write!(f, "{}", if *ex { "Ex" } else { "All" }),
             other => write!(f, "{other:?}"),
         }
     }
@@ -1564,7 +1681,6 @@ impl fmt::Display for ConstKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConstKey::Name(n) => write!(f, "{}", LNTerm::Lit(Lit::Con(*n))),
-            ConstKey::DeBruijn(i) => write!(f, "db{i}"),
             ConstKey::NoLast => write!(f, "NoLast"),
             ConstKey::Closed(kind, fp) => {
                 write!(f, "{kind:?}:")?;
