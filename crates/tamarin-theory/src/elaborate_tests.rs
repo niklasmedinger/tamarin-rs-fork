@@ -221,6 +221,39 @@ fn hardcoded_unary_builtins_fold_surplus_arguments() {
     }
 }
 
+/// A name on that list that the theory declares with a different arity
+/// keeps all its arguments: HS `naryOpApp` folds by the arity the signature
+/// declares, not by name.  tamarin-prover prints `A( h(~a, ~b) ), B( pk(~a,
+/// ~b) )` for this rule.  Folding `h(~a, ~b)` into `h(<~a, ~b>)` sends
+/// `tamXCFUh(tamXCFUpair(..))` to Maude, where `tamXCFUh` is declared
+/// `Msg Msg -> Msg`, so Maude rejects every command with the term ("no
+/// parse for command").
+#[test]
+fn user_binary_h_and_pk_keep_both_arguments_in_rules() {
+    let src = r#"theory T begin
+            functions: h/2, pk/2
+            rule R: [Fr(~a), Fr(~b)] --[A(h(~a, ~b)), B(pk(~a, ~b))]-> []
+        end"#;
+    let t = elaborate(&parse_theory(src, &[]).unwrap()).unwrap();
+    let rules: Vec<_> = t.rules().collect();
+    assert_eq!(rules.len(), 1);
+    let a = tamarin_term::vterm::var_term(LVar::new("a", LSort::Fresh, 0));
+    let b = tamarin_term::vterm::var_term(LVar::new("b", LSort::Fresh, 0));
+    for (i, name) in ["h", "pk"].into_iter().enumerate() {
+        let sym = NoEqSym::new(
+            name.as_bytes().to_vec(),
+            2,
+            Privacy::Public,
+            Constructability::Constructor,
+        );
+        assert_eq!(
+            rules[0].rule.actions[i].terms.to_vec(),
+            vec![f_app_no_eq(sym, vec![a.clone(), b.clone()])],
+            "{name} must stay binary"
+        );
+    }
+}
+
 /// `diff(a, b)` (reachable with the `diff` flag set) lowers to the
 /// PRIVATE `diffSym`, not a public symbol that merely shares the name.
 ///

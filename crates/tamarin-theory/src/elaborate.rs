@@ -1279,11 +1279,15 @@ where
             // plus `getMessage` (revealing-signing) and `get_rep` /
             // `report` (locations-report), Term/Builtin/Signature.hs.
             // Widening the list to the whole signature regresses the
-            // corpus, so it stays written out.
-            let unary_builtin = matches!(
-                name.as_str(),
-                "h" | "fst" | "snd" | "inv" | "pk" | "getMessage" | "get_rep" | "report"
-            ) || is_arity1_no_eq(sig, name);
+            // corpus, so it stays written out.  It applies only to names
+            // the signature does not declare: a theory's own
+            // `functions: h/2` keeps both arguments, as in HS.
+            let unary_builtin = is_arity1_no_eq(sig, name)
+                || (sig.fun_sym_named(name.as_bytes()).is_none()
+                    && matches!(
+                        name.as_str(),
+                        "h" | "fst" | "snd" | "inv" | "pk" | "getMessage" | "get_rep" | "report"
+                    ));
             let new_args: Option<Vec<_>> =
                 args.iter().map(|a| term_to_vterm(a, sig, mk_var)).collect();
             let mut new_args = new_args?;
