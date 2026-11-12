@@ -171,11 +171,11 @@ fn the_worked_example_has_one_automorphism_and_it_fixes_every_free_variable() {
     let term = system_to_term(&sys);
     let shown = term.to_string();
     for part in [
-        "∃_Root",
+        "∃_Root[Fresh] ~k. ∃_Root[Msg] x. ∃_Root[Node] #i #i.1. \
+         ∃_Witnesses[Msg] ?w0.0 ?w0.1 ?w0.1.1. System",
         "Nodes{RuleInst[R1](",
         "Edges{Edge[0,0](",
         "LessAtoms{}, ⟨NoLast⟩",
-        "∃_Witnesses ?w0.0 ?w0.1 ?w0.1.1. System",
         "EqConj{EqDisj{EqAlt{",
     ] {
         assert!(shown.contains(part), "{part:?} not in {shown}");
@@ -195,13 +195,12 @@ fn the_worked_example_has_one_automorphism_and_it_fixes_every_free_variable() {
     );
     assert_eq!(
         stats.generator_moves.keys().collect::<Vec<_>>(),
-        [
-            "Binder(Witnesses) > BoundVar(Witnesses,Msg)",
-            "Fun(Ac(Xor)) > Occ(Msg)"
-        ]
+        ["Binder(Witnesses,Msg) > BoundVar", "Fun(Ac(Xor)) > Occ"]
     );
+    // Which index each variable gets is bliss's order; `x` shares its sort
+    // with the three witnesses, `~k` is the only fresh variable.
     let theta = labelling.theta();
-    assert_eq!(theta[&msg("x", 0)], LVar::new("mv", LSort::Msg, 0));
+    assert_eq!(theta[&msg("x", 0)].name, "mv");
     assert_eq!(theta[&fresh("k", 0)], LVar::new("fv", LSort::Fresh, 0));
     assert_ne!(theta[&node(0)], theta[&node(1)]);
 }
@@ -239,6 +238,117 @@ fn moving_the_edge_changes_the_form() {
         tgt: (node(0), PremIdx(0)),
     };
     assert_ne!(form(&a), form(&b));
+}
+
+// -- Sorts are the binders' ---------------------------------------------------
+
+/// The binders at the top of `term`, outermost first, and the body under
+/// them.
+fn binders(term: &STerm) -> (Vec<(Binder, Vec<LVar>)>, &STerm) {
+    let mut found = Vec::new();
+    let mut body = term;
+    while let STerm::Exists(binder, vars, inner) = body {
+        found.push((*binder, vars.clone()));
+        body = inner;
+    }
+    (found, body)
+}
+
+/// One binder per scope and sort that has variables, root before witnesses,
+/// sorts in `LSort`'s order; each binds exactly its scope's variables of its
+/// sort.
+#[test]
+fn each_scope_and_sort_has_a_binder_of_its_own() {
+    let term = system_to_term(&worked());
+    let (found, body) = binders(&term);
+    let binder = |scope, sort| Binder { scope, sort };
+    // The witnesses of the one disjunction's alternatives 0 and 1.
+    let w = |a, k| witness(0, a, k, msg("_", 0));
+    assert_eq!(
+        found,
+        [
+            (binder(Scope::Root, LSort::Fresh), vec![fresh("k", 0)]),
+            (binder(Scope::Root, LSort::Msg), vec![msg("x", 0)]),
+            (binder(Scope::Root, LSort::Node), vec![node(0), node(1)]),
+            (
+                binder(Scope::Witnesses, LSort::Msg),
+                vec![w(0, 0), w(1, 0), w(1, 1)]
+            ),
+        ]
+    );
+    assert!(matches!(body, STerm::App(Op::System { .. }, _)));
+}
+
+/// In the graph, a variable vertex carries neither sort nor scope: it hangs
+/// off the one binder vertex of its scope and sort.
+#[test]
+fn a_variable_vertex_hangs_off_the_binder_of_its_sort() {
+    let graph = term_to_graph(&system_to_term(&worked()));
+    let scoped = graph
+        .free_vars
+        .iter()
+        .map(|&(w, v)| (w, v, Scope::Root))
+        .chain(
+            graph
+                .witness_vars
+                .iter()
+                .map(|&(w, v)| (w, v, Scope::Witnesses)),
+        );
+    for (w, v, scope) in scoped {
+        assert_eq!(graph.keys[w].label, Label::BoundVar);
+        let parent = graph.parents[w].expect("a variable vertex has its binder as parent");
+        assert_eq!(
+            graph.keys[parent].label,
+            Label::Binder(Binder {
+                scope,
+                sort: v.sort
+            }),
+            "{v}"
+        );
+    }
+    let binder_labels: Vec<&Label> = graph
+        .keys
+        .iter()
+        .map(|k| &k.label)
+        .filter(|l| matches!(l, Label::Binder(_)))
+        .collect();
+    let distinct: BTreeSet<&Label> = binder_labels.iter().copied().collect();
+    assert_eq!(binder_labels.len(), 4);
+    assert_eq!(distinct.len(), 4, "one binder vertex per label");
+}
+
+/// Two variables in symmetric places, under an AC symbol: of one sort, the
+/// graph swaps them; of two sorts, nothing does, although neither the
+/// variable vertices nor the occurrences carry a sort.
+#[test]
+fn an_automorphism_never_swaps_variables_of_different_sorts() {
+    if !bliss_available() {
+        return;
+    }
+    let same = ku_goal_system(vec![union(v(msg("x", 0)), v(msg("y", 0)))]);
+    let (_, _, stats) = canon(&same);
+    assert_eq!(stats.aut_size.as_deref(), Some("2"));
+    assert_eq!(stats.generators_moving_free_vars, 1);
+
+    let mixed = ku_goal_system(vec![union(v(msg("x", 0)), v(fresh("k", 0)))]);
+    let (_, _, stats) = canon(&mixed);
+    assert_eq!(stats.aut_size.as_deref(), Some("1"));
+    assert_eq!(stats.generators_moving_free_vars, 0);
+}
+
+#[test]
+#[should_panic(expected = "of another sort")]
+fn a_binder_binding_a_variable_of_another_sort_panics() {
+    let k = fresh("k", 0);
+    let term = STerm::Exists(
+        Binder {
+            scope: Scope::Root,
+            sort: LSort::Msg,
+        },
+        vec![k],
+        Box::new(free(k)),
+    );
+    term_to_graph(&term);
 }
 
 // -- Faithfulness of the encoding ---------------------------------------------

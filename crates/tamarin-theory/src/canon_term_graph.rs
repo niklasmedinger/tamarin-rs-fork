@@ -44,18 +44,26 @@
 //! AC symbols belong to the theory.
 //!
 //! ```text
-//! ∃_Root x̄. ∃_Witnesses w̄. System[source_kind, side, contradictory](
+//! ∃_Root[s1] x̄1. … ∃_Root[sk] x̄k. ∃_Witnesses[s1] w̄1. … ∃_Witnesses[sm] w̄m.
+//!   System[source_kind, side, contradictory](
 //!     Nodes{…}, Edges{…}, LessAtoms{…}, Last(#i) | ⟨NoLast⟩,
 //!     Formulas{…}, SolvedFormulas{…}, Lemmas{…},
 //!     EqSubst{…}, EqConj{…}, Subterms{…}, SolvedSubterms{…}, NegSubterms{…}, Goals{…} )
 //! ```
 //!
 //! Each `Name{…}` is an AC section operator with one argument per entry of
-//! its field. The root binder binds every free variable of the system, the
-//! witness binder every range variable of the equation store's
-//! alternatives, each renamed apart as a witness of its own alternative
-//! ([`Scope`] says why binding them at the top is the same as binding them
-//! in their alternative).
+//! its field. The binders at the top bind every variable of the term, one
+//! binder per scope and sort ([`Binder`]): `∃_Root[s]` binds the system's
+//! free variables of sort `s`, `∃_Witnesses[s]` the range variables of sort
+//! `s` of the equation store's alternatives, each renamed apart as a witness
+//! of its own alternative ([`Scope`] says why binding them at the top is the
+//! same as binding them in their alternative). A binder binds variables of
+//! its own sort only, so the term needs nothing else to keep renamings
+//! sort-respecting: equality modulo AC never turns one binder into another,
+//! so a renaming between two such terms maps the variables of `∃_Root[s]`
+//! onto those of `∃_Root[s]`. The binders are nested in a fixed order (root
+//! before witnesses, sorts in `LSort`'s order), and a scope and sort without
+//! variables gets no binder.
 //!
 //! **Collections.** A field that is a `Vec` in `System` is a multiset: an AC
 //! operator keeps duplicates as separate arguments, because the solver
@@ -114,10 +122,10 @@
 //! - a constant is one vertex;
 //! - an application is one vertex with an edge to each argument (an AC
 //!   operator's nested applications of itself are flattened into it);
-//! - a variable occurrence is a NEW vertex `Occ(sort)`, with an edge from the
-//!   vertex of the variable, `BoundVar(scope, sort)`;
-//! - a binder is a vertex with an edge to each of its variables' vertices and
-//!   one to its body.
+//! - a variable occurrence is a NEW vertex `Occ`, with an edge from the
+//!   vertex of the variable, `BoundVar`;
+//! - a binder is a vertex `Binder(binder)` with an edge to each of its
+//!   variables' vertices and one to its body.
 //!
 //! A vertex per occurrence, with an edge from its variable's vertex, is the
 //! paper's own construction (its Cases 2 and 4). Sharing one vertex per
@@ -125,14 +133,22 @@
 //! terms `f(x, x, y)` and `f(x, y, y)` the same edge set, since bliss drops
 //! duplicate edges.
 //!
-//! Departures from the paper, each keeping the encoding faithful:
-//! - Edge labels (argument positions) are folded into the child's key: bliss
-//!   colors vertices only, and every vertex but the root has exactly one
-//!   parent, so "my i-th child" and "my child at position i" coincide. An
-//!   occurrence's other incoming edge, from its variable's vertex, carries no
-//!   label in the paper either.
-//! - Sorts are part of the variable and occurrence labels, so a renaming that
-//!   an isomorphism induces is sort-respecting.
+//! One departure from the paper, keeping the encoding faithful: edge labels
+//! (argument positions) are folded into the child's key. bliss colors
+//! vertices only, and every vertex but the root has exactly one parent, so
+//! "my i-th child" and "my child at position i" coincide. An occurrence's
+//! other incoming edge, from its variable's vertex, carries no label in the
+//! paper either.
+//!
+//! A variable's sort and scope are in its binder's label only, as in the
+//! term: every variable vertex has the same label, and so has every
+//! occurrence. That is enough for an isomorphism between two system terms'
+//! graphs to induce a sort-respecting renaming that maps free variables to
+//! free variables: a system term has one binder per label, so the
+//! isomorphism maps the binder `∃_Root[s]` to the other's `∃_Root[s]`, its
+//! variable vertices (its children but the body, whose label differs) to
+//! that binder's, and each occurrence (whose one edge from a variable vertex
+//! is from its variable's) to an occurrence of the image variable.
 //!
 //! A vertex's color is the RANK of its key among the keys of the graph: an
 //! isomorphism between two systems' graphs maps keys to equal keys, so both
@@ -141,9 +157,9 @@
 //! # Step 3: the names and the form
 //!
 //! bliss's canonical labeling orders the graph's vertices. The free variables
-//! and the witnesses (the two binders' variable vertices) are named per sort
-//! in that order (`mv0`, `fv0`, `tv0`, …): that is θ. The form is the system
-//! term without its two binders, renamed by θ ([`rename`]) and normalized
+//! and the witnesses (the binders' variable vertices) are named per sort in
+//! that order (`mv0`, `fv0`, `tv0`, …): that is θ. The form is the system
+//! term without its binders, renamed by θ ([`rename`]) and normalized
 //! ([`normalize`]): AC operators flattened and their arguments sorted, C
 //! arguments sorted, duplicates kept. A witness stays a `VarRef::Witness` in
 //! the form.
@@ -191,38 +207,61 @@ pub enum STerm {
     App(Op, Vec<STerm>),
     Var(VarRef),
     Const(ConstKey),
-    /// A commutative binder `∃ x1 … xn. body`.
-    Exists(Scope, Vec<LVar>, Box<STerm>),
+    /// A commutative binder `∃_binder x1 … xn. body`; every `xi` has the
+    /// binder's sort ([`Binder`]).
+    Exists(Binder, Vec<LVar>, Box<STerm>),
 }
 
 /// A variable occurrence: a free variable of the system, or a witness, a
 /// range variable of an equation-store alternative renamed apart from every
 /// other variable ([`witness`]). Both are bound at the top of the system
-/// term, by different binders ([`Scope`]).
+/// term, by binders of different scopes ([`Scope`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VarRef {
     Free(LVar),
     Witness(LVar),
 }
 
-/// Which binder an [`STerm::Exists`] is. Both sit at the top of the system
-/// term, the witness binder directly under the root binder.
+/// What a binder of the system term binds. Both kinds sit at the top of the
+/// system term, the witnesses' binders under the root's.
 ///
 /// A range variable of an equation-store alternative exists only in that
 /// alternative. Renamed apart ([`witness`]), it occurs only in its
 /// alternative's range terms, so binding it at the top is the same as
 /// binding it in the alternative: a renaming of the whole term maps the
 /// witnesses of one alternative onto those of another, and free variables
-/// onto free variables. A binder of their own gives the witnesses' variable
-/// vertices a label of their own, so bliss's first partition already
-/// separates them from the free variables; being a witness is part of the
-/// system, so the finer partition costs no merge.
+/// onto free variables. Binders of their own keep the witnesses apart from
+/// the free variables in the graph too; being a witness is part of the
+/// system, so keeping them apart costs no merge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
-    /// Binds every free variable of the system.
+    /// Binds free variables of the system.
     Root,
-    /// Binds every witness of the equation store.
+    /// Binds witnesses of the equation store.
     Witnesses,
+}
+
+/// The binder symbol of an [`STerm::Exists`]: its scope and the one sort of
+/// the variables it binds. A binder binds variables of its sort only, so a
+/// renaming between two terms, which maps a binder's variables onto those of
+/// a binder with the same symbol, keeps sorts (see the module docs). The
+/// system term has at most one binder per symbol ([`system_to_term`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Binder {
+    pub scope: Scope,
+    pub sort: LSort,
+}
+
+/// `body` under one binder of `scope` per sort of `vars`, outermost first in
+/// `LSort`'s order. A sort without variables gets no binder.
+fn bind(scope: Scope, vars: BTreeSet<LVar>, body: STerm) -> STerm {
+    let mut by_sort: BTreeMap<LSort, Vec<LVar>> = BTreeMap::new();
+    for v in vars {
+        by_sort.entry(v.sort).or_default().push(v);
+    }
+    by_sort.into_iter().rev().fold(body, |body, (sort, vars)| {
+        STerm::Exists(Binder { scope, sort }, vars, Box::new(body))
+    })
 }
 
 /// The first character of a witness's name ([`witness`]). No variable of a
@@ -537,12 +576,7 @@ pub fn system_to_term(sys: &System) -> STerm {
             section(Section::Goals, goals),
         ],
     );
-    let body = STerm::Exists(
-        Scope::Witnesses,
-        witnesses.into_iter().collect(),
-        Box::new(body),
-    );
-    STerm::Exists(Scope::Root, free.into_iter().collect(), Box::new(body))
+    bind(Scope::Root, free, bind(Scope::Witnesses, witnesses, body))
 }
 
 /// The AC normal form of `t` (the smart constructors re-sort AC arguments
@@ -818,14 +852,15 @@ fn closed(kind: ClosedKind, t: STerm) -> STerm {
 // Step 2: STerm -> colored digraph
 // =============================================================================
 
-/// What a vertex stands for (see the module docs).
+/// What a vertex stands for (see the module docs). A variable's sort and
+/// scope are its binder's: a variable vertex and an occurrence carry neither.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Label {
     Op(Op),
     Const(ConstKey),
-    Binder(Scope),
-    BoundVar(Scope, LSort),
-    Occ(LSort),
+    Binder(Binder),
+    BoundVar,
+    Occ,
 }
 
 /// A vertex's key: its label and its argument position under a free parent.
@@ -842,9 +877,9 @@ pub struct TermGraph {
     /// `colors[v]`: the rank of `keys[v]` among the distinct keys.
     pub colors: Vec<Color>,
     pub edges: Vec<(usize, usize)>,
-    /// The root binder's variable vertices: the system's free variables.
+    /// The root binders' variable vertices: the system's free variables.
     pub free_vars: Vec<(usize, LVar)>,
-    /// The witness binder's variable vertices: the equation store's
+    /// The witness binders' variable vertices: the equation store's
     /// witnesses.
     pub witness_vars: Vec<(usize, LVar)>,
     /// Each vertex's parent in the term (a variable vertex's is its binder,
@@ -854,8 +889,8 @@ pub struct TermGraph {
 }
 
 /// The colored digraph of `t` (see the module docs). Panics on a variable
-/// occurrence no enclosing binder binds: a translation bug, never a case to
-/// pass over.
+/// occurrence no enclosing binder binds, and on a binder that binds a
+/// variable of another sort: translation bugs, never cases to pass over.
 pub fn term_to_graph(t: &STerm) -> TermGraph {
     let mut b = GraphBuilder {
         graph: TermGraph::default(),
@@ -876,9 +911,8 @@ pub fn term_to_graph(t: &STerm) -> TermGraph {
 
 struct GraphBuilder {
     graph: TermGraph,
-    /// The enclosing binders, innermost last: their scope and variable
-    /// vertices.
-    scopes: Vec<(Scope, BTreeMap<LVar, usize>)>,
+    /// The enclosing binders, innermost last, with their variable vertices.
+    scopes: Vec<(Binder, BTreeMap<LVar, usize>)>,
 }
 
 impl GraphBuilder {
@@ -906,17 +940,21 @@ impl GraphBuilder {
                     VarRef::Free(v) => (v, Scope::Root),
                     VarRef::Witness(v) => (v, Scope::Witnesses),
                 };
+                let binder = Binder {
+                    scope,
+                    sort: v.sort,
+                };
                 let w = self
                     .scopes
                     .iter()
                     .rev()
-                    .find(|(s, _)| *s == scope)
+                    .find(|(b, _)| *b == binder)
                     .and_then(|(_, vars)| vars.get(v))
                     .copied();
                 let w = w.unwrap_or_else(|| {
                     panic!("term_to_graph: no binder binds {r:?} -- system_to_term missed {v}")
                 });
-                let occ = self.vertex(Label::Occ(v.sort), pos);
+                let occ = self.vertex(Label::Occ, pos);
                 self.edge(w, occ);
                 occ
             }
@@ -946,19 +984,25 @@ impl GraphBuilder {
                 }
                 me
             }
-            STerm::Exists(scope, vars, body) => {
-                let me = self.vertex(Label::Binder(*scope), pos);
+            STerm::Exists(binder, vars, body) => {
+                let me = self.vertex(Label::Binder(*binder), pos);
                 let mut bound = BTreeMap::new();
                 for v in vars {
-                    let w = self.vertex(Label::BoundVar(*scope, v.sort), None);
+                    // The vertex has no sort of its own: a variable of another
+                    // sort would be renamable to one of the binder's sort.
+                    assert_eq!(
+                        v.sort, binder.sort,
+                        "term_to_graph: the binder {binder:?} binds {v}, of another sort"
+                    );
+                    let w = self.vertex(Label::BoundVar, None);
                     self.child_edge(me, w);
                     bound.insert(*v, w);
-                    match scope {
+                    match binder.scope {
                         Scope::Root => self.graph.free_vars.push((w, *v)),
                         Scope::Witnesses => self.graph.witness_vars.push((w, *v)),
                     }
                 }
-                self.scopes.push((*scope, bound));
+                self.scopes.push((*binder, bound));
                 let child = self.build(body, None);
                 self.scopes.pop();
                 self.child_edge(me, child);
@@ -1018,8 +1062,8 @@ pub fn rename(t: &STerm, theta: &BTreeMap<LVar, LVar>) -> STerm {
         STerm::App(op, args) => {
             STerm::App(op.clone(), args.iter().map(|a| rename(a, theta)).collect())
         }
-        STerm::Exists(scope, vars, body) => STerm::Exists(
-            *scope,
+        STerm::Exists(binder, vars, body) => STerm::Exists(
+            *binder,
             vars.iter().map(|v| rename_var(theta, *v)).collect(),
             Box::new(rename(body, theta)),
         ),
@@ -1056,9 +1100,9 @@ pub fn normalize(t: STerm) -> STerm {
                 }
             }
         }
-        STerm::Exists(scope, mut vars, body) => {
+        STerm::Exists(binder, mut vars, body) => {
             vars.sort();
-            STerm::Exists(scope, vars, Box::new(normalize(*body)))
+            STerm::Exists(binder, vars, Box::new(normalize(*body)))
         }
         t @ (STerm::Var(_) | STerm::Const(_)) => t,
     }
@@ -1128,15 +1172,15 @@ fn abstract_counted(t: &STerm, counts: &Occurrences) -> STerm {
             op.clone(),
             args.iter().map(|a| abstract_counted(a, counts)).collect(),
         ),
-        STerm::Exists(scope, vars, body) => {
-            // The root binder binds the free variables, the other the
+        STerm::Exists(binder, vars, body) => {
+            // The root binders bind the free variables, the others the
             // witnesses.
-            let var_ref = |v: LVar| match scope {
+            let var_ref = |v: LVar| match binder.scope {
                 Scope::Root => VarRef::Free(v),
                 Scope::Witnesses => VarRef::Witness(v),
             };
             STerm::Exists(
-                *scope,
+                *binder,
                 vars.iter()
                     .map(|v| placeholder(var_ref(*v), counts))
                     .collect(),
@@ -1377,7 +1421,7 @@ pub fn canonicalize_term(
 /// The distinct `parent > subtree` label pairs of the subtrees `g` moves
 /// whose parent it fixes: what a symmetry of the term graph swaps, e.g.
 /// `EqDisj > EqAlt` (two alpha-equivalent alternatives) or
-/// `Binder(Witnesses) > BoundVar(Witnesses, Msg)` (two witnesses).
+/// `Binder(Witnesses,Msg) > BoundVar` (two witnesses).
 pub fn generator_moves(graph: &TermGraph, g: &Permutation) -> BTreeSet<String> {
     (0..graph.keys.len())
         .filter(|&v| g.image_of(v) != v)
@@ -1410,22 +1454,21 @@ fn label_name(key: &VKey) -> String {
             ConstKey::Closed(kind, _) => format!("Closed({kind:?})"),
             _ => "Const".into(),
         },
-        Label::Binder(scope) => format!("Binder({scope:?})"),
-        Label::BoundVar(scope, sort) => format!("BoundVar({scope:?},{sort:?})"),
-        Label::Occ(sort) => format!("Occ({sort:?})"),
+        Label::Binder(Binder { scope, sort }) => format!("Binder({scope:?},{sort:?})"),
+        Label::BoundVar => "BoundVar".into(),
+        Label::Occ => "Occ".into(),
     }
 }
 
 /// The canonical form of the system term `term` under `labelling`: its
-/// `System[…]` body renamed and normalized. A variable `labelling` does not
-/// name panics.
+/// `System[…]` body, under the binders, renamed and normalized. A variable
+/// `labelling` does not name panics, and so does a body that is not a
+/// `System[…]` term ([`CanonicalSystem::new`]).
 fn content_under(term: &STerm, labelling: &CanonLabelling) -> CanonicalSystem {
-    let STerm::Exists(Scope::Root, _, witnesses) = term else {
-        panic!("system_to_term built a term without the root binder: {term}")
-    };
-    let STerm::Exists(Scope::Witnesses, _, body) = &**witnesses else {
-        panic!("system_to_term built a term without the witness binder: {term}")
-    };
+    let mut body = term;
+    while let STerm::Exists(_, _, inner) = body {
+        body = inner;
+    }
     CanonicalSystem::new(normalize(rename(body, labelling.theta())))
 }
 
@@ -1505,8 +1548,8 @@ impl fmt::Display for STerm {
                 write!(f, "{}", v.to_string().replace(WITNESS_MARK, "?"))
             }
             STerm::Const(c) => write!(f, "⟨{c}⟩"),
-            STerm::Exists(scope, vars, body) => {
-                write!(f, "∃_{scope:?}")?;
+            STerm::Exists(Binder { scope, sort }, vars, body) => {
+                write!(f, "∃_{scope:?}[{sort:?}]")?;
                 for v in vars {
                     write!(f, " {}", v.to_string().replace(WITNESS_MARK, "?"))?;
                 }

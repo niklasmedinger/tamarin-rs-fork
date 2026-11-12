@@ -207,7 +207,7 @@ use crate::constraint::system::{Side, SourceKind, System};
 use tamarin_term::alpha_eq_ac::CanonLabelling;
 
 /// The canonical form of a constraint `System`: its system term
-/// (`canon_term_graph::system_to_term`) without the root binder, every
+/// (`canon_term_graph::system_to_term`) without its binders, every
 /// variable renamed by the canonical labelling and the whole normalized modulo
 /// its AC and C operators (`canon_term_graph::normalize`). Two systems have
 /// equal forms iff they are equal up to a sort-respecting renaming of their
