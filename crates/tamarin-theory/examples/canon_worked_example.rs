@@ -214,22 +214,29 @@ pub struct Run {
     pub generator_forms: Vec<(CanonLabelling, STerm)>,
 }
 
-/// The term under all its binders.
+/// The term under its top binders, the root's and the witnesses'. A
+/// quantifier block's binders stay: they are part of the form.
 fn body(term: &STerm) -> &STerm {
     match term {
-        STerm::Exists(_, _, inner) => body(inner),
+        STerm::Binder(
+            Binder {
+                scope: Scope::Root | Scope::Witnesses,
+                ..
+            },
+            _,
+            inner,
+        ) => body(inner),
         t => t,
     }
 }
 
 /// The renaming from a labeling that puts vertex `w` at `position(w)`: the
-/// variables named per sort, in the order of their vertices' positions.
+/// variables (free, witnesses and bound) named per sort, in the order of
+/// their vertices' positions.
 fn name_variables(graph: &TermGraph, position: impl Fn(usize) -> usize) -> CanonLabelling {
-    let mut vars: Vec<(usize, LVar)> = graph
-        .free_vars
-        .iter()
-        .chain(&graph.witness_vars)
-        .map(|&(w, x)| (position(w), x))
+    let mut vars: Vec<(usize, LVar)> = variable_vertices(graph)
+        .into_iter()
+        .map(|(w, x)| (position(w), x))
         .collect();
     vars.sort();
     let mut sigma = CanonLabelling::empty();
@@ -295,7 +302,7 @@ pub fn run(term: &STerm) -> Result<Run, BlissError> {
 pub fn thesis_term(term: &STerm) -> STerm {
     let mut binders: Vec<(Binder, Vec<LVar>)> = Vec::new();
     let mut system = term;
-    while let STerm::Exists(binder, vars, inner) = system {
+    while let STerm::Binder(binder, vars, inner) = system {
         assert_eq!(
             binder.scope,
             Scope::Root,
@@ -327,7 +334,7 @@ pub fn thesis_term(term: &STerm) -> STerm {
         .into_iter()
         .rev()
         .fold(STerm::App(sys, constraints), |body, (binder, vars)| {
-            STerm::Exists(binder, vars, Box::new(body))
+            STerm::Binder(binder, vars, Box::new(body))
         })
 }
 
@@ -391,12 +398,14 @@ fn occurrences(graph: &TermGraph) -> BTreeMap<usize, LVar> {
         .collect()
 }
 
-/// The variable of each variable vertex.
+/// The variable of each variable vertex: the free variables, the witnesses
+/// and the bound variables.
 fn variable_vertices(graph: &TermGraph) -> BTreeMap<usize, LVar> {
     graph
         .free_vars
         .iter()
         .chain(&graph.witness_vars)
+        .chain(&graph.bound_vars)
         .copied()
         .collect()
 }
@@ -665,12 +674,14 @@ fn latex_sort(sort: LSort) -> &'static str {
     }
 }
 
-/// A typed binder's symbol: `∃` subscripted with its sort, and marked `wit`
-/// when it binds witnesses.
+/// A typed binder's symbol, subscripted with its sort: `∃` at the top,
+/// marked `wit` when it binds witnesses, and `λ` for a quantifier block,
+/// whose `∀` or `∃` is the operator under its binders.
 fn latex_binder(Binder { scope, sort }: Binder) -> String {
     match scope {
         Scope::Root => format!(r"\exists_{{{}}}", latex_sort(sort)),
         Scope::Witnesses => format!(r"\exists^{{\mathsf{{wit}}}}_{{{}}}", latex_sort(sort)),
+        Scope::Quantifier => format!(r"\lambda_{{{}}}", latex_sort(sort)),
     }
 }
 
@@ -685,9 +696,9 @@ fn latex_list(args: &[STerm], notation: Notation, separator: &str) -> String {
 /// running example has none at the thesis level.
 pub fn latex(t: &STerm, notation: Notation) -> String {
     match t {
-        STerm::Var(VarRef::Free(x) | VarRef::Witness(x)) => latex_var(*x),
+        STerm::Var(VarRef::Free(x) | VarRef::Witness(x) | VarRef::Bound(x)) => latex_var(*x),
         STerm::Const(c) => format!(r"\langle\mathtt{{{c}}}\rangle"),
-        STerm::Exists(binder, vars, inner) => {
+        STerm::Binder(binder, vars, inner) => {
             let vars: Vec<String> = vars.iter().map(|x| latex_var(*x)).collect();
             format!(
                 r"{}\ {}.\ {}",
